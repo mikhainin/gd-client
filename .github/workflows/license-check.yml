@@ -1,0 +1,60 @@
+name: License compliance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (dependency licenses, advisories, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  scancode:
+    name: ScanCode Toolkit (embedded license/copyright text in our own source)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Run ScanCode scan
+        run: ./scripts/scancode-scan.sh
+      - name: Fail if any license/copyright text was detected in our own source
+        run: |
+          python3 - <<'PY'
+          import json, sys
+
+          with open(".scancode/scancode-report.json") as f:
+              data = json.load(f)
+
+          # ScanCode's own bundled fixtures (in the venv it creates) are not
+          # part of this project and are excluded from the scan already via
+          # --ignore, but double-check here in case that ever changes.
+          hits = [
+              f["path"]
+              for f in data["files"]
+              if f["type"] == "file"
+              and ".venv-scancode/" not in f["path"]
+              and (f.get("detected_license_expression") not in (None, "mit or apache-2.0")
+                   or f.get("copyrights"))
+          ]
+
+          if hits:
+              print("Unexpected license/copyright text found in:")
+              for path in hits:
+                  print(f"  - {path}")
+              sys.exit(1)
+
+          print("No unexpected embedded license/copyright text found.")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scancode-report
+          path: .scancode/scancode-report.json
