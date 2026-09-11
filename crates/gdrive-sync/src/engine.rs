@@ -29,11 +29,25 @@ use crate::state_db::{FileStateEntry, StateDb};
 /// layer in `gdrived` to report state to the Qt UI.
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
-    FolderStarted { folder_id: Uuid },
-    InitialSyncComplete { folder_id: Uuid, files_synced: usize },
-    LocalChangeUploaded { folder_id: Uuid, path: PathBuf },
-    RemoteChangeApplied { folder_id: Uuid, path: PathBuf },
-    Error { folder_id: Option<Uuid>, message: String },
+    FolderStarted {
+        folder_id: Uuid,
+    },
+    InitialSyncComplete {
+        folder_id: Uuid,
+        files_synced: usize,
+    },
+    LocalChangeUploaded {
+        folder_id: Uuid,
+        path: PathBuf,
+    },
+    RemoteChangeApplied {
+        folder_id: Uuid,
+        path: PathBuf,
+    },
+    Error {
+        folder_id: Option<Uuid>,
+        message: String,
+    },
 }
 
 /// A running or completed sync engine, cloneable/shareable across the D-Bus
@@ -65,6 +79,25 @@ impl SyncEngine {
         self.events.subscribe()
     }
 
+    /// Replaces the Drive API access token used by all future (and already
+    /// running) requests, e.g. after a fresh sign-in via the D-Bus `SignIn`
+    /// call. Does not by itself start any folders - call [`Self::start_all`]
+    /// afterwards for those that are enabled but not yet running.
+    pub fn set_access_token(&self, access_token: impl Into<String>) {
+        self.drive.set_access_token(access_token);
+    }
+
+    /// Lists the direct sub-folders of a Drive folder (`folder_id = "root"`
+    /// for "My Drive"'s top level), for the "browse Drive folder" picker in
+    /// the UI. Returns `(id, name)` pairs.
+    pub async fn list_child_folders(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(String, String)>, SyncError> {
+        let folders = self.drive.list_child_folders(folder_id).await?;
+        Ok(folders.into_iter().map(|f| (f.id, f.name)).collect())
+    }
+
     /// Starts (or restarts) synchronisation for a single folder, spawning a
     /// background task that runs until [`Self::stop_folder`] is called or the
     /// task fails fatally. Restarting an already-running folder first aborts
@@ -80,7 +113,15 @@ impl SyncEngine {
         let folder_id = folder.id;
 
         let handle = tokio::spawn(async move {
-            if let Err(err) = run_folder(folder.clone(), state_db, drive, events.clone(), poll_interval).await {
+            if let Err(err) = run_folder(
+                folder.clone(),
+                state_db,
+                drive,
+                events.clone(),
+                poll_interval,
+            )
+            .await
+            {
                 let _ = events.send(SyncEvent::Error {
                     folder_id: Some(folder.id),
                     message: err.to_string(),
@@ -121,15 +162,29 @@ async fn run_folder(
     events: broadcast::Sender<SyncEvent>,
     poll_interval: Duration,
 ) -> Result<(), SyncError> {
-    let _ = events.send(SyncEvent::FolderStarted { folder_id: folder.id });
+    let _ = events.send(SyncEvent::FolderStarted {
+        folder_id: folder.id,
+    });
 
     tokio::fs::create_dir_all(&folder.local_path).await?;
     let (owner_uid, owner_gid) = resolve_owner(&folder.owner_user, &folder.owner_group);
 
-    let root_folder_id = folder.drive_folder_id.clone().unwrap_or_else(|| "root".to_string());
+    let root_folder_id = folder
+        .drive_folder_id
+        .clone()
+        .unwrap_or_else(|| "root".to_string());
 
     // 1. Initial recursive pull so both sides start in a known-consistent state.
-    let synced = initial_pull(&folder, &drive, &state_db, &root_folder_id, "", owner_uid, owner_gid).await?;
+    let synced = initial_pull(
+        &folder,
+        &drive,
+        &state_db,
+        &root_folder_id,
+        "",
+        owner_uid,
+        owner_gid,
+    )
+    .await?;
     let _ = events.send(SyncEvent::InitialSyncComplete {
         folder_id: folder.id,
         files_synced: synced,
@@ -191,7 +246,10 @@ async fn initial_pull(
             tokio::fs::create_dir_all(&local_path).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, true)?;
-            synced += Box::pin(initial_pull(folder, drive, state_db, &child.id, &rel_path, owner_uid, owner_gid)).await?;
+            synced += Box::pin(initial_pull(
+                folder, drive, state_db, &child.id, &rel_path, owner_uid, owner_gid,
+            ))
+            .await?;
         } else {
             if !needs_download(state_db, folder.id, &rel_path, &child)? {
                 continue;
@@ -273,10 +331,14 @@ async fn handle_local_change(
             };
 
             if metadata.is_dir() {
-                let parent_drive_id = parent_drive_folder_id(folder, state_db, root_folder_id, rel_path)?;
+                let parent_drive_id =
+                    parent_drive_folder_id(folder, state_db, root_folder_id, rel_path)?;
                 let existing = find_local_state(state_db, folder.id, &rel_path_str)?;
                 if existing.is_none() {
-                    let name = rel_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let name = rel_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     let created = drive.create_folder(&name, &parent_drive_id).await?;
                     record_state(folder.id, state_db, &rel_path_str, &created, true)?;
                 }
@@ -287,11 +349,20 @@ async fn handle_local_change(
             apply_ownership(&change.path, owner_uid, owner_gid)?;
 
             let existing = find_local_state(state_db, folder.id, &rel_path_str)?;
-            let name = rel_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let parent_drive_id = parent_drive_folder_id(folder, state_db, root_folder_id, rel_path)?;
+            let name = rel_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let parent_drive_id =
+                parent_drive_folder_id(folder, state_db, root_folder_id, rel_path)?;
 
             let uploaded = drive
-                .upload_file(existing.as_ref().and_then(|e| e.drive_file_id.as_deref()), &name, &parent_drive_id, content)
+                .upload_file(
+                    existing.as_ref().and_then(|e| e.drive_file_id.as_deref()),
+                    &name,
+                    &parent_drive_id,
+                    content,
+                )
                 .await?;
             record_state(folder.id, state_db, &rel_path_str, &uploaded, false)?;
         }
@@ -300,7 +371,11 @@ async fn handle_local_change(
     Ok(())
 }
 
-fn find_local_state(state_db: &StateDb, folder_id: Uuid, rel_path: &str) -> Result<Option<FileStateEntry>, SyncError> {
+fn find_local_state(
+    state_db: &StateDb,
+    folder_id: Uuid,
+    rel_path: &str,
+) -> Result<Option<FileStateEntry>, SyncError> {
     // The state db is keyed by (folder, rel_path) as its primary key; reuse
     // find_by_drive_id's row mapping via a direct lookup would need a new
     // query, so we scan through the drive-id index lookup helper instead is
@@ -373,8 +448,17 @@ async fn poll_remote_changes(
             let content = drive.download_file(&remote_file.id).await?;
             tokio::fs::write(&local_path, &content).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
-            record_state(folder.id, state_db, &existing.local_rel_path, &remote_file, existing.is_folder)?;
-            let _ = events.send(SyncEvent::RemoteChangeApplied { folder_id: folder.id, path: local_path });
+            record_state(
+                folder.id,
+                state_db,
+                &existing.local_rel_path,
+                &remote_file,
+                existing.is_folder,
+            )?;
+            let _ = events.send(SyncEvent::RemoteChangeApplied {
+                folder_id: folder.id,
+                path: local_path,
+            });
         }
     }
 

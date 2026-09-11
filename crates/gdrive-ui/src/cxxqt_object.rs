@@ -28,6 +28,14 @@ struct SyncFolderView {
     running: bool,
 }
 
+/// One row of `listDriveFolders`'s return JSON: a Google Drive folder id and
+/// display name, for the remote folder-browse dialog.
+#[derive(Serialize)]
+struct DriveFolderView {
+    id: String,
+    name: String,
+}
+
 #[cxx_qt::bridge]
 pub mod qobject {
     unsafe extern "C++" {
@@ -46,6 +54,7 @@ pub mod qobject {
         #[qproperty(QString, folders_json)]
         #[qproperty(QString, status_message)]
         #[qproperty(bool, connected)]
+        #[qproperty(bool, authenticated)]
         type SyncManager = super::SyncManagerRust;
 
         /// Re-fetches the list of sync folders from `gdrived` over D-Bus.
@@ -74,6 +83,49 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setFolderEnabled"]
         fn set_folder_enabled(self: Pin<&mut Self>, id: &QString, enabled: bool);
+
+        /// Starts the interactive Google sign-in flow (opens the browser)
+        /// and returns immediately; poll `authenticated` (e.g. via `refresh`
+        /// on a timer) to detect when it completes.
+        #[qinvokable]
+        #[cxx_name = "signIn"]
+        fn sign_in(self: Pin<&mut Self>);
+
+        /// Signs out, forgetting the cached token and stopping all sync
+        /// folders, then refreshes.
+        #[qinvokable]
+        #[cxx_name = "signOut"]
+        fn sign_out(self: Pin<&mut Self>);
+
+        /// Lists the direct sub-folders of a Google Drive folder (empty
+        /// string for "My Drive"'s top level) as a JSON array of
+        /// `{id, name}` objects, for the remote folder-browse dialog.
+        #[qinvokable]
+        #[cxx_name = "listDriveFolders"]
+        fn list_drive_folders(self: Pin<&mut Self>, parent_id: &QString) -> QString;
+
+        /// Creates a new local sub-folder named `name` directly inside
+        /// `parent_path`, for the "New folder" button in the local folder
+        /// browser. Returns whether it succeeded (sets `statusMessage` with
+        /// the reason on failure).
+        #[qinvokable]
+        #[cxx_name = "createLocalFolder"]
+        fn create_local_folder(self: Pin<&mut Self>, parent_path: &QString, name: &QString)
+            -> bool;
+
+        /// Whether a native folder-picker command (`kdialog`) is available,
+        /// so QML can prefer it over the built-in browser dialog.
+        #[qinvokable]
+        #[cxx_name = "nativeFolderPickerAvailable"]
+        fn native_folder_picker_available(self: Pin<&mut Self>) -> bool;
+
+        /// Runs `kdialog --getexistingdirectory` starting at `start_path`
+        /// and returns the chosen path, or an empty string if the user
+        /// cancelled. Only call this after checking
+        /// [`Self::native_folder_picker_available`].
+        #[qinvokable]
+        #[cxx_name = "pickLocalFolderNative"]
+        fn pick_local_folder_native(self: Pin<&mut Self>, start_path: &QString) -> QString;
     }
 }
 
@@ -86,6 +138,7 @@ pub struct SyncManagerRust {
     folders_json: QString,
     status_message: QString,
     connected: bool,
+    authenticated: bool,
 }
 
 impl qobject::SyncManager {
@@ -94,20 +147,34 @@ impl qobject::SyncManager {
             Ok(rows) => {
                 let folders: Vec<SyncFolderView> = rows
                     .into_iter()
-                    .map(|(id, display_name, drive_folder_id, local_path, owner_user, owner_group, enabled, running)| SyncFolderView {
-                        id,
-                        display_name,
-                        drive_folder_id,
-                        local_path,
-                        owner_user,
-                        owner_group,
-                        enabled,
-                        running,
-                    })
+                    .map(
+                        |(
+                            id,
+                            display_name,
+                            drive_folder_id,
+                            local_path,
+                            owner_user,
+                            owner_group,
+                            enabled,
+                            running,
+                        )| SyncFolderView {
+                            id,
+                            display_name,
+                            drive_folder_id,
+                            local_path,
+                            owner_user,
+                            owner_group,
+                            enabled,
+                            running,
+                        },
+                    )
                     .collect();
                 let json = serde_json::to_string(&folders).unwrap_or_else(|_| "[]".to_string());
                 self.as_mut().set_folders_json(QString::from(&json));
-                self.as_mut().set_status_message(QString::from(&format!("{} sync folder(s)", folders.len())));
+                self.as_mut().set_status_message(QString::from(&format!(
+                    "{} sync folder(s)",
+                    folders.len()
+                )));
                 self.as_mut().set_connected(true);
             }
             Err(message) => {
@@ -116,6 +183,10 @@ impl qobject::SyncManager {
                 self.as_mut().set_connected(false);
             }
         }
+
+        let authenticated =
+            dbus_client::with_proxy(|proxy| proxy.is_authenticated()).unwrap_or(false);
+        self.as_mut().set_authenticated(authenticated);
     }
 
     pub fn add_folder(
@@ -134,7 +205,14 @@ impl qobject::SyncManager {
         let owner_group = owner_group.to_string();
 
         let result = dbus_client::with_proxy(|proxy| {
-            proxy.add_sync_folder(&display_name, &drive_folder_id, &local_path, &owner_user, &owner_group, enabled)
+            proxy.add_sync_folder(
+                &display_name,
+                &drive_folder_id,
+                &local_path,
+                &owner_user,
+                &owner_group,
+                enabled,
+            )
         });
         if let Err(message) = result {
             self.as_mut().set_status_message(QString::from(&message));
@@ -158,5 +236,114 @@ impl qobject::SyncManager {
             self.as_mut().set_status_message(QString::from(&message));
         }
         self.refresh();
+    }
+
+    pub fn sign_in(mut self: Pin<&mut Self>) {
+        let result = dbus_client::with_proxy(|proxy| proxy.sign_in());
+        match result {
+            Ok(()) => self.as_mut().set_status_message(QString::from(
+                "opened browser for Google sign-in; waiting for you to finish...",
+            )),
+            Err(message) => self.as_mut().set_status_message(QString::from(&message)),
+        }
+        self.refresh();
+    }
+
+    pub fn sign_out(mut self: Pin<&mut Self>) {
+        let result = dbus_client::with_proxy(|proxy| proxy.sign_out());
+        if let Err(message) = result {
+            self.as_mut().set_status_message(QString::from(&message));
+        }
+        self.refresh();
+    }
+
+    pub fn list_drive_folders(mut self: Pin<&mut Self>, parent_id: &QString) -> QString {
+        let parent_id = parent_id.to_string();
+        match dbus_client::with_proxy(|proxy| proxy.list_drive_folders(&parent_id)) {
+            Ok(rows) => {
+                let folders: Vec<DriveFolderView> = rows
+                    .into_iter()
+                    .map(|(id, name)| DriveFolderView { id, name })
+                    .collect();
+                QString::from(&serde_json::to_string(&folders).unwrap_or_else(|_| "[]".to_string()))
+            }
+            Err(message) => {
+                self.as_mut().set_status_message(QString::from(&message));
+                QString::from("[]")
+            }
+        }
+    }
+
+    pub fn create_local_folder(
+        mut self: Pin<&mut Self>,
+        parent_path: &QString,
+        name: &QString,
+    ) -> bool {
+        let parent_path = parent_path.to_string();
+        let name = name.to_string();
+
+        if name.is_empty() || name.contains('/') {
+            self.as_mut().set_status_message(QString::from(
+                "folder name must be non-empty and cannot contain '/'",
+            ));
+            return false;
+        }
+
+        let full_path = std::path::Path::new(&parent_path).join(&name);
+        match std::fs::create_dir(&full_path) {
+            Ok(()) => true,
+            Err(err) => {
+                self.as_mut().set_status_message(QString::from(&format!(
+                    "could not create {}: {err}",
+                    full_path.display()
+                )));
+                false
+            }
+        }
+    }
+
+    pub fn native_folder_picker_available(self: Pin<&mut Self>) -> bool {
+        std::process::Command::new("kdialog")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    pub fn pick_local_folder_native(mut self: Pin<&mut Self>, start_path: &QString) -> QString {
+        use std::os::unix::process::CommandExt;
+
+        let start_path = start_path.to_string();
+        let mut command = std::process::Command::new("kdialog");
+        command.arg("--getexistingdirectory");
+        if !start_path.is_empty() {
+            command.arg(&start_path);
+        }
+
+        // Ask the kernel to send kdialog a SIGTERM if this process dies
+        // before it exits (e.g. gdrive-ui is killed while the picker is
+        // still open), so it doesn't linger as an orphan.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        match command.output() {
+            Ok(output) if output.status.success() => {
+                QString::from(String::from_utf8_lossy(&output.stdout).trim())
+            }
+            // Non-zero exit means the user cancelled the dialog - not an
+            // error, just nothing selected.
+            Ok(_) => QString::from(""),
+            Err(err) => {
+                self.as_mut()
+                    .set_status_message(QString::from(&format!("failed to run kdialog: {err}")));
+                QString::from("")
+            }
+        }
     }
 }

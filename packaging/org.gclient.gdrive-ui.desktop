@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=g-client Google Drive Sync
+Comment=Manage which local folders are kept in sync with Google Drive
+Exec=/usr/bin/gdrive-ui
+Icon=folder-remote
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true

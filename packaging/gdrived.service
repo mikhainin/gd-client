@@ -1,0 +1,10 @@
+[Unit]
+Description=g-client Google Drive sync daemon
+Documentation=https://github.com/mikhainin/g-client
+
+[Service]
+ExecStart=/usr/bin/gdrived
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

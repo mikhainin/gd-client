@@ -7,8 +7,9 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use gdrive_common::dbus_api::SyncFolderRow;
+use gdrive_common::dbus_api::{DriveFolderRow, SyncFolderRow};
 use gdrive_common::{AppConfig, SyncFolder};
+use gdrive_sync::auth::{self, OAuthConfig};
 use gdrive_sync::SyncEngine;
 use uuid::Uuid;
 use zbus::interface;
@@ -78,7 +79,12 @@ impl GDriveService {
         owner_group: String,
         enabled: bool,
     ) -> zbus::fdo::Result<String> {
-        let mut folder = SyncFolder::new(display_name, PathBuf::from(local_path), owner_user, owner_group);
+        let mut folder = SyncFolder::new(
+            display_name,
+            PathBuf::from(local_path),
+            owner_user,
+            owner_group,
+        );
         folder.drive_folder_id = if drive_folder_id.is_empty() {
             None
         } else {
@@ -132,8 +138,96 @@ impl GDriveService {
         }
         Ok(())
     }
+
+    /// Returns whether a Google account is currently authenticated (i.e. a
+    /// cached OAuth token exists).
+    async fn is_authenticated(&self) -> zbus::fdo::Result<bool> {
+        let token_path = auth::default_token_path()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("failed to resolve token path: {e}")))?;
+        let token = auth::load_token(&token_path)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("failed to load cached token: {e}")))?;
+        Ok(token.is_some())
+    }
+
+    /// Starts the interactive Google OAuth sign-in flow in the background
+    /// and returns immediately; the browser consent step can take an
+    /// arbitrary amount of time, so it must not block this D-Bus call (and
+    /// therefore the caller's UI thread). Clients should poll
+    /// [`Self::is_authenticated`] to detect completion.
+    async fn sign_in(&self) -> zbus::fdo::Result<()> {
+        let token_path = auth::default_token_path()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("failed to resolve token path: {e}")))?;
+        let oauth_config = OAuthConfig::from_env().ok_or_else(|| {
+            zbus::fdo::Error::Failed(
+                "GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET are not set - cannot start the OAuth flow"
+                    .to_string(),
+            )
+        })?;
+
+        let engine = self.engine.clone();
+        let config = self.config.lock().unwrap().clone();
+        tokio::spawn(async move {
+            let result = auth::authenticate(&oauth_config, &token_path, |url| {
+                if let Err(err) = std::process::Command::new("xdg-open").arg(url).spawn() {
+                    tracing::warn!(
+                        "failed to open browser for sign-in ({err}); open this URL manually: {url}"
+                    );
+                } else {
+                    tracing::info!("opened browser for Google sign-in: {url}");
+                }
+            })
+            .await;
+
+            match result {
+                Ok(token) => {
+                    tracing::info!("sign-in succeeded");
+                    engine.set_access_token(token.access_token);
+                    engine.start_all(&config);
+                }
+                Err(err) => tracing::error!("sign-in failed: {err}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Forgets the cached OAuth token and stops all running sync folders.
+    async fn sign_out(&self) -> zbus::fdo::Result<()> {
+        let token_path = auth::default_token_path()
+            .map_err(|e| zbus::fdo::Error::Failed(format!("failed to resolve token path: {e}")))?;
+
+        for folder_id in self.engine.running_folders() {
+            self.engine.stop_folder(folder_id);
+        }
+        self.engine.set_access_token(String::new());
+
+        if token_path.exists() {
+            std::fs::remove_file(&token_path).map_err(|e| {
+                zbus::fdo::Error::Failed(format!("failed to remove cached token: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Lists the direct sub-folders of a Google Drive folder, for the
+    /// "browse Drive folder" picker in the UI.
+    async fn list_drive_folders(
+        &self,
+        parent_id: String,
+    ) -> zbus::fdo::Result<Vec<DriveFolderRow>> {
+        let parent_id = if parent_id.is_empty() {
+            "root"
+        } else {
+            &parent_id
+        };
+        self.engine
+            .list_child_folders(parent_id)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("failed to list Drive folders: {e}")))
+    }
 }
 
 fn parse_uuid(id: &str) -> zbus::fdo::Result<Uuid> {
-    Uuid::parse_str(id).map_err(|e| zbus::fdo::Error::Failed(format!("invalid sync folder id {id:?}: {e}")))
+    Uuid::parse_str(id)
+        .map_err(|e| zbus::fdo::Error::Failed(format!("invalid sync folder id {id:?}: {e}")))
 }

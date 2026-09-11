@@ -19,7 +19,9 @@ fn main() {
     let mut engine = QQmlApplicationEngine::new();
 
     if let Some(engine) = engine.as_mut() {
-        engine.load(&QUrl::from("qrc:/qt/qml/org/gclient/gdrive_ui/qml/main.qml"));
+        engine.load(&QUrl::from(
+            "qrc:/qt/qml/org/gclient/gdrive_ui/qml/main.qml",
+        ));
     }
 
     if let Some(engine) = engine.as_mut() {

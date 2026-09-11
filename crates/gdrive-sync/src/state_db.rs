@@ -26,7 +26,9 @@ impl StateDb {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -59,8 +61,9 @@ impl StateDb {
 
     pub fn get_page_token(&self, sync_folder_id: Uuid) -> Result<Option<String>, SyncError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT changes_page_token FROM sync_folder_state WHERE sync_folder_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT changes_page_token FROM sync_folder_state WHERE sync_folder_id = ?1",
+        )?;
         let result = stmt
             .query_row(params![sync_folder_id.to_string()], |row| row.get(0))
             .ok();
@@ -100,7 +103,11 @@ impl StateDb {
         Ok(())
     }
 
-    pub fn remove_file_state(&self, sync_folder_id: Uuid, local_rel_path: &str) -> Result<(), SyncError> {
+    pub fn remove_file_state(
+        &self,
+        sync_folder_id: Uuid,
+        local_rel_path: &str,
+    ) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
             "DELETE FROM file_state WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
             params![sync_folder_id.to_string(), local_rel_path],
@@ -181,7 +188,10 @@ mod tests {
         let folder_id = Uuid::new_v4();
         assert_eq!(db.get_page_token(folder_id).unwrap(), None);
         db.set_page_token(folder_id, "token-1").unwrap();
-        assert_eq!(db.get_page_token(folder_id).unwrap(), Some("token-1".to_string()));
+        assert_eq!(
+            db.get_page_token(folder_id).unwrap(),
+            Some("token-1".to_string())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

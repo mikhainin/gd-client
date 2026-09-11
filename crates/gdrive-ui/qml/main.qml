@@ -10,6 +10,8 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Window
+import Qt.labs.folderlistmodel
+import Qt.labs.platform as Platform
 
 // This must match the uri specified in the qml_module in build.rs.
 import org.gclient.gdrive_ui
@@ -24,9 +26,46 @@ ApplicationWindow {
     title: qsTr("g-client - Google Drive Sync")
     color: palette.window
 
+    // Hide to tray instead of quitting when the window is closed; the
+    // application only truly exits via the tray menu's "Quit" action.
+    onClosing: close => {
+        close.accepted = false
+        root.hide()
+    }
+
     SyncManager {
         id: syncManager
         Component.onCompleted: refresh()
+    }
+
+    // Polls gdrived periodically so sign-in (completed asynchronously in a
+    // browser tab) and folder sync status changes are picked up without
+    // requiring the user to click "Refresh" manually.
+    Timer {
+        interval: 3000
+        running: true
+        repeat: true
+        onTriggered: syncManager.refresh()
+    }
+
+    Platform.SystemTrayIcon {
+        id: trayIcon
+        visible: true
+        icon.name: "folder-remote"
+        tooltip: qsTr("g-client - Google Drive Sync")
+
+        onActivated: root.visible ? root.hide() : root.show()
+
+        menu: Platform.Menu {
+            Platform.MenuItem {
+                text: root.visible ? qsTr("Hide") : qsTr("Show")
+                onTriggered: root.visible ? root.hide() : root.show()
+            }
+            Platform.MenuItem {
+                text: qsTr("Quit")
+                onTriggered: Qt.quit()
+            }
+        }
     }
 
     // Parsed once per foldersJson change rather than in every binding.
@@ -47,7 +86,7 @@ ApplicationWindow {
             Label {
                 text: qsTr("Sync folders")
                 font.bold: true
-                width: root.width - 340
+                width: root.width - 470
                 anchors.verticalCenter: parent.verticalCenter
             }
 
@@ -55,6 +94,12 @@ ApplicationWindow {
                 text: syncManager.connected ? qsTr("Connected to gdrived") : qsTr("Not connected")
                 color: syncManager.connected ? "green" : "red"
                 anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Button {
+                text: syncManager.authenticated ? qsTr("Sign out") : qsTr("Sign in\u2026")
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: syncManager.authenticated ? syncManager.signOut() : syncManager.signIn()
             }
 
             Button {
@@ -68,6 +113,7 @@ ApplicationWindow {
             }
         }
     }
+
 
     Column {
         anchors.fill: parent
@@ -139,6 +185,222 @@ ApplicationWindow {
         }
     }
 
+    // Custom local folder browser (rather than QtQuick.Dialogs' FolderDialog)
+    // so we can offer a "New folder" button, which Qt doesn't provide out of
+    // the box for its Quick-based FolderDialog fallback. Backed by
+    // Qt.labs.folderlistmodel (a lightweight live directory listing) and
+    // SyncManager.createLocalFolder for folder creation.
+    Dialog {
+        id: localFolderDialog
+        title: qsTr("Select local folder")
+        modal: true
+        standardButtons: Dialog.Cancel
+        anchors.centerIn: parent
+        width: Math.min(420, root.width - 40)
+        height: Math.min(460, root.height - 40)
+
+        property string currentPath: Platform.StandardPaths.writableLocation(Platform.StandardPaths.HomeLocation)
+            .toString().replace("file://", "")
+        property bool showNewFolderRow: false
+
+        function goUp() {
+            var idx = currentPath.lastIndexOf("/")
+            currentPath = idx > 0 ? currentPath.substring(0, idx) : "/"
+        }
+
+        function enterFolder(name) {
+            currentPath = (currentPath === "/" ? "" : currentPath) + "/" + name
+        }
+
+        onOpened: {
+            showNewFolderRow = false
+            newFolderNameField.text = ""
+        }
+
+        FolderListModel {
+            id: localFolderModel
+            folder: "file://" + localFolderDialog.currentPath
+            showFiles: false
+            showDotAndDotDot: false
+            sortField: FolderListModel.Name
+        }
+
+        Column {
+            anchors.fill: parent
+            spacing: 6
+
+            Row {
+                width: parent.width
+                spacing: 4
+
+                Button {
+                    text: qsTr("\u2191 Up")
+                    enabled: localFolderDialog.currentPath !== "/"
+                    onClicked: localFolderDialog.goUp()
+                }
+
+                Label {
+                    text: localFolderDialog.currentPath
+                    elide: Text.ElideMiddle
+                    width: parent.width - 180
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+
+            ListView {
+                width: parent.width
+                height: parent.height - (localFolderDialog.showNewFolderRow ? 170 : 130)
+                clip: true
+                model: localFolderModel
+
+                delegate: ItemDelegate {
+                    width: ListView.view.width
+                    text: fileName
+                    onClicked: localFolderDialog.enterFolder(fileName)
+                }
+
+                Label {
+                    anchors.centerIn: parent
+                    visible: localFolderModel.count === 0
+                    text: qsTr("No sub-folders here.")
+                    opacity: 0.6
+                }
+            }
+
+            Row {
+                width: parent.width
+                visible: localFolderDialog.showNewFolderRow
+                spacing: 6
+
+                TextField {
+                    id: newFolderNameField
+                    width: parent.width - 90
+                    placeholderText: qsTr("New folder name")
+                    onAccepted: createNewFolderButton.clicked()
+                }
+                Button {
+                    id: createNewFolderButton
+                    text: qsTr("Create")
+                    width: 84
+                    onClicked: {
+                        if (syncManager.createLocalFolder(localFolderDialog.currentPath, newFolderNameField.text)) {
+                            localFolderDialog.enterFolder(newFolderNameField.text)
+                            localFolderDialog.showNewFolderRow = false
+                            newFolderNameField.text = ""
+                        }
+                    }
+                }
+            }
+
+            Button {
+                width: parent.width
+                text: qsTr("New folder\u2026")
+                visible: !localFolderDialog.showNewFolderRow
+                onClicked: localFolderDialog.showNewFolderRow = true
+            }
+
+            Button {
+                width: parent.width
+                text: qsTr("Select this folder")
+                onClicked: {
+                    localPathField.text = localFolderDialog.currentPath
+                    localFolderDialog.close()
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: driveFolderDialog
+        title: qsTr("Select Drive folder")
+        modal: true
+        standardButtons: Dialog.Cancel
+        anchors.centerIn: parent
+        width: Math.min(420, root.width - 40)
+        height: Math.min(420, root.height - 40)
+
+        // Stack of {id, name} visited so far, for breadcrumb navigation and
+        // the "Select this folder" action; the last entry is the folder
+        // currently being browsed ("" id means "My Drive" root).
+        property var pathStack: [{ id: "", name: qsTr("My Drive") }]
+        property var entries: []
+
+        function currentFolder() {
+            return pathStack[pathStack.length - 1]
+        }
+
+        function load() {
+            var json = syncManager.listDriveFolders(currentFolder().id)
+            try {
+                entries = JSON.parse(json)
+            } catch (e) {
+                entries = []
+            }
+        }
+
+        function enterFolder(id, name) {
+            pathStack = pathStack.concat([{ id: id, name: name }])
+            load()
+        }
+
+        function goTo(index) {
+            pathStack = pathStack.slice(0, index + 1)
+            load()
+        }
+
+        onOpened: {
+            pathStack = [{ id: "", name: qsTr("My Drive") }]
+            load()
+        }
+
+        Column {
+            anchors.fill: parent
+            spacing: 6
+
+            Row {
+                width: parent.width
+                spacing: 4
+                Repeater {
+                    model: driveFolderDialog.pathStack
+                    delegate: Button {
+                        text: modelData.name
+                        flat: true
+                        onClicked: driveFolderDialog.goTo(index)
+                    }
+                }
+            }
+
+            ListView {
+                width: parent.width
+                height: parent.height - 90
+                clip: true
+                model: driveFolderDialog.entries
+
+                delegate: ItemDelegate {
+                    width: ListView.view.width
+                    text: modelData.name
+                    onClicked: driveFolderDialog.enterFolder(modelData.id, modelData.name)
+                }
+
+                Label {
+                    anchors.centerIn: parent
+                    visible: driveFolderDialog.entries.length === 0
+                    text: qsTr("No sub-folders here.")
+                    opacity: 0.6
+                }
+            }
+
+            Button {
+                width: parent.width
+                text: qsTr("Select \"%1\"").arg(driveFolderDialog.currentFolder().name)
+                onClicked: {
+                    driveFolderIdField.text = driveFolderDialog.currentFolder().id
+                    driveFolderDialog.close()
+                }
+            }
+        }
+    }
+
     Dialog {
         id: addDialog
         title: qsTr("Add sync folder")
@@ -168,10 +430,40 @@ ApplicationWindow {
             TextField { id: displayNameField; width: parent.width }
 
             Label { text: qsTr("Drive folder id (leave empty for \"My Drive\" root)") }
-            TextField { id: driveFolderIdField; width: parent.width }
+            Row {
+                width: parent.width
+                spacing: 6
+                TextField { id: driveFolderIdField; width: parent.width - 90 }
+                Button { text: qsTr("Browse\u2026"); width: 84; onClicked: driveFolderDialog.open() }
+            }
 
             Label { text: qsTr("Local path") }
-            TextField { id: localPathField; width: parent.width; placeholderText: qsTr("/home/user/GoogleDrive/Folder") }
+            Row {
+                width: parent.width
+                spacing: 6
+                TextField {
+                    id: localPathField
+                    width: parent.width - 90
+                    placeholderText: qsTr("/home/user/GoogleDrive/Folder")
+                }
+                Button {
+                    text: qsTr("Browse\u2026")
+                    width: 84
+                    onClicked: {
+                        // Prefer a genuine native (KDE) folder picker via
+                        // `kdialog` when available; fall back to our own
+                        // FolderListModel-based browser otherwise.
+                        if (syncManager.nativeFolderPickerAvailable()) {
+                            var path = syncManager.pickLocalFolderNative(localPathField.text)
+                            if (path.length > 0) {
+                                localPathField.text = path
+                            }
+                        } else {
+                            localFolderDialog.open()
+                        }
+                    }
+                }
+            }
 
             Label { text: qsTr("Owner user (optional)") }
             TextField { id: ownerUserField; width: parent.width }
@@ -181,3 +473,4 @@ ApplicationWindow {
         }
     }
 }
+

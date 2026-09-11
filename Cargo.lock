@@ -867,6 +867,7 @@ dependencies = [
  "cxx-qt-build",
  "cxx-qt-lib",
  "gdrive-common",
+ "libc",
  "serde",
  "serde_json",
  "tracing",

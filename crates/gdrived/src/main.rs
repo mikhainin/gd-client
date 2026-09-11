@@ -11,7 +11,7 @@ mod dbus_service;
 
 use gdrive_common::dbus_api::{BUS_NAME, OBJECT_PATH};
 use gdrive_common::AppConfig;
-use gdrive_sync::auth::{self, OAuthConfig};
+use gdrive_sync::auth;
 use gdrive_sync::state_db::StateDb;
 use gdrive_sync::SyncEngine;
 
@@ -27,16 +27,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Not being authenticated yet must not prevent the D-Bus service (and
     // therefore the UI) from starting: without it, a first-run user would
-    // have no way to discover *why* nothing is syncing. Sync folders simply
-    // won't be started until `gdrived` is restarted after authenticating -
-    // see the module doc on `obtain_access_token`.
-    let access_token = match obtain_access_token().await {
-        Ok(token) => Some(token),
-        Err(err) => {
-            tracing::warn!(
-                "not authenticated with Google Drive yet ({err}); the D-Bus service will still \
-                 start, but no sync folders will run until gdrived is restarted after authenticating"
+    // have no way to discover *why* nothing is syncing. Only a *cached*
+    // token is loaded here - if none exists yet, the daemon still starts
+    // (with no folders running) and the UI's "Sign in" button drives the
+    // interactive OAuth flow via the `SignIn` D-Bus method instead, so
+    // startup never blocks on the user completing browser-based consent.
+    let access_token = match load_cached_access_token() {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            tracing::info!(
+                "not authenticated with Google Drive yet; sign in via the UI's \"Sign in\" \
+                 button (or the SignIn D-Bus method) to start syncing"
             );
+            None
+        }
+        Err(err) => {
+            tracing::warn!("failed to load cached OAuth token ({err}); treating as signed out");
             None
         }
     };
@@ -57,7 +63,11 @@ async fn main() -> anyhow::Result<()> {
         .serve_at(OBJECT_PATH, service)?
         .build()
         .await?;
-    tracing::info!(bus_name = BUS_NAME, object_path = OBJECT_PATH, "D-Bus service ready");
+    tracing::info!(
+        bus_name = BUS_NAME,
+        object_path = OBJECT_PATH,
+        "D-Bus service ready"
+    );
 
     // Log sync events for now; a future revision can forward these as D-Bus
     // signals (see dbus_service.rs) once the UI needs live progress updates
@@ -74,33 +84,16 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns a cached OAuth access token if one is available, otherwise runs
-/// the interactive authentication flow (requires `GDRIVE_CLIENT_ID` /
-/// `GDRIVE_CLIENT_SECRET` to be set - see `gdrive_sync::auth`).
+/// Returns a cached OAuth access token if one is available, without ever
+/// starting the interactive authentication flow (that's now only triggered
+/// on demand via the D-Bus `SignIn` method - see `dbus_service::sign_in`).
 ///
 /// Token refresh is not yet implemented: once Google Cloud OAuth client
 /// credentials are wired up, this should check `expires_at` and use the
 /// refresh token instead of always trusting the cached access token.
-async fn obtain_access_token() -> anyhow::Result<String> {
+fn load_cached_access_token() -> anyhow::Result<Option<String>> {
     let token_path = auth::default_token_path()?;
-
-    if let Some(token) = auth::load_token(&token_path)? {
-        return Ok(token.access_token);
-    }
-
-    let oauth_config = OAuthConfig::from_env().ok_or_else(|| {
-        anyhow::anyhow!(
-            "not authenticated with Google Drive yet, and GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET \
-             are not set - cannot start the interactive OAuth flow"
-        )
-    })?;
-
-    let token = auth::authenticate(&oauth_config, &token_path, |url| {
-        tracing::info!("open this URL in a browser to authorize gdrived: {url}");
-    })
-    .await?;
-
-    Ok(token.access_token)
+    Ok(auth::load_token(&token_path)?.map(|token| token.access_token))
 }
 
 async fn wait_for_shutdown_signal() {

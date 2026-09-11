@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
+    Scope, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 
@@ -210,7 +210,11 @@ pub enum ReqwestOAuthError {
 /// `reqwest` integration.
 fn reqwest_http_client(
     http_client: reqwest::Client,
-) -> impl Fn(oauth2::HttpRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<oauth2::HttpResponse, ReqwestOAuthError>> + Send>> {
+) -> impl Fn(
+    oauth2::HttpRequest,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<oauth2::HttpResponse, ReqwestOAuthError>> + Send>,
+> {
     move |request| {
         let http_client = http_client.clone();
         Box::pin(async move {
