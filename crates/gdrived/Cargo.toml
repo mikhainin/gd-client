@@ -1,0 +1,26 @@
+[package]
+name = "gdrived"
+description = "Background service that synchronises configured folders with Google Drive and exposes status/control over D-Bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gdrived"
+path = "src/main.rs"
+
+[dependencies]
+gdrive-common = { workspace = true }
+gdrive-sync = { workspace = true }
+tokio = { workspace = true }
+zbus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

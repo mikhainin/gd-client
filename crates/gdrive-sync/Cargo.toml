@@ -1,0 +1,25 @@
+[package]
+name = "gdrive-sync"
+description = "Google Drive <-> local filesystem synchronisation engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+gdrive-common = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+oauth2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+notify = { workspace = true }
+rusqlite = { workspace = true }
+bytes = { workspace = true }
+nix = { workspace = true }

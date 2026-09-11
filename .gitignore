@@ -1,0 +1,8 @@
+/target
+**/target
+.cxxqt_generated/
+*.moc
+*.o
+.vscode/
+.idea/
+*.log

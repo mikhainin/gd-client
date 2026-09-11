@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gdrive-common",
+    "crates/gdrive-sync",
+    "crates/gdrived",
+    "crates/gdrive-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["g-client contributors"]
+repository = "https://github.com/mikhainin/g-client"
+
+# Centralized dependency versions. Keep these in sync with the latest stable
+# releases on crates.io (see AGENTS.md: "Dependency management"). Do not
+# downgrade a version listed here without an explicit decision recorded in
+# AGENTS.md's Change Log.
+[workspace.dependencies]
+gdrive-common = { path = "crates/gdrive-common" }
+gdrive-sync = { path = "crates/gdrive-sync" }
+
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "signal"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
+oauth2 = { version = "5.0.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151" }
+toml = { version = "1.1.5" }
+anyhow = { version = "1.0.104" }
+thiserror = { version = "2.0.20" }
+tracing = { version = "0.1.44" }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.6.6", features = ["derive"] }
+directories = { version = "6.0.0" }
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
+notify = { version = "8.2.0" }
+bytes = { version = "1.12.1" }
+nix = { version = "0.31.3", features = ["user"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+zbus = { version = "5.19.0" }
+
+cxx = { version = "1.0" }
+cxx-qt = { version = "0.10.0" }
+cxx-qt-build = { version = "0.10.0" }
+cxx-qt-lib = { version = "0.10.0", features = ["qt_full"] }

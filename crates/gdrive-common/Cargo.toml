@@ -1,0 +1,18 @@
+[package]
+name = "gdrive-common"
+description = "Shared types, configuration and errors for the g-client Google Drive sync suite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+directories = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+zbus = { workspace = true }
