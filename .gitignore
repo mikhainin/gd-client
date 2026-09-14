@@ -8,3 +8,8 @@
 *.log
 .venv-scancode/
 .scancode/
+.tools-pmd/
+.cpd-report/
+.tools-dolos/
+.dolos-report/
+.tools-moss/
