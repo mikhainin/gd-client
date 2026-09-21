@@ -5,6 +5,8 @@
 //! predictable. Only the subset of endpoints needed for folder sync is
 //! implemented.
 
+use std::sync::RwLock;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::SyncError;
@@ -14,7 +16,11 @@ const UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
 
 pub struct DriveClient {
     http: reqwest::Client,
-    access_token: String,
+    // A `RwLock` (rather than a plain `String`) so a freshly signed-in
+    // access token can be swapped in after construction (see
+    // `SyncEngine::set_access_token`), without needing to rebuild the
+    // client or the `Arc`s already handed out to running sync tasks.
+    access_token: RwLock<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,12 +77,19 @@ impl DriveClient {
     pub fn new(access_token: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
-            access_token: access_token.into(),
+            access_token: RwLock::new(access_token.into()),
         }
     }
 
+    /// Replaces the access token used for subsequent requests, e.g. after a
+    /// fresh sign-in via the D-Bus `SignIn` call.
+    pub fn set_access_token(&self, access_token: impl Into<String>) {
+        *self.access_token.write().unwrap() = access_token.into();
+    }
+
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder.bearer_auth(&self.access_token)
+        let token = self.access_token.read().unwrap().clone();
+        builder.bearer_auth(token)
     }
 
     /// Lists the direct (non-trashed) children of a Drive folder.
@@ -111,6 +124,17 @@ impl DriveClient {
         }
 
         Ok(files)
+    }
+
+    /// Lists the direct (non-trashed) sub-folders of a Drive folder, for
+    /// the "browse Drive folder" picker in the UI. Pass `folder_id = "root"`
+    /// for the top level of "My Drive".
+    pub async fn list_child_folders(&self, folder_id: &str) -> Result<Vec<DriveFile>, SyncError> {
+        let children = self.list_children(folder_id).await?;
+        Ok(children
+            .into_iter()
+            .filter(|f| f.mime_type == FOLDER_MIME_TYPE)
+            .collect())
     }
 
     /// Fetches a starting page token for the Changes API, to be persisted
@@ -162,7 +186,10 @@ impl DriveClient {
         let request = self
             .http
             .post(format!("{API_BASE}/files"))
-            .query(&[("fields", "id, name, mimeType, parents, modifiedTime, trashed")])
+            .query(&[(
+                "fields",
+                "id, name, mimeType, parents, modifiedTime, trashed",
+            )])
             .json(&body);
         let response = self.auth(request).send().await?;
         let response = check_status(response).await?;
@@ -209,9 +236,17 @@ impl DriveClient {
                 });
                 let boundary = "gdrive_client_boundary";
                 let mut body = Vec::new();
-                body.extend_from_slice(format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n").as_bytes());
+                body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
                 body.extend_from_slice(metadata.to_string().as_bytes());
-                body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+                body.extend_from_slice(
+                    format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n")
+                        .as_bytes(),
+                );
                 body.extend_from_slice(&content);
                 body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
 

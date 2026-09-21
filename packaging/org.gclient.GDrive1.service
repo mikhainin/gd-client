@@ -1,0 +1,6 @@
+[D-BUS Service]
+Name=org.gclient.GDrive1
+Exec=/usr/bin/gdrived
+# Route activation through the systemd user unit (not a bare fork/exec) so
+# EnvironmentFile=/other systemd settings there actually apply.
+SystemdService=gdrived.service

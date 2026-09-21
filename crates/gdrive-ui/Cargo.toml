@@ -8,6 +8,24 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[package.metadata.deb]
+maintainer = "g-client contributors"
+copyright = "2026, g-client contributors"
+license-file = ["../../LICENSE-APACHE", "5"]
+extended-description = """\
+Qt6/QML desktop control panel for gdrived: lists, adds, removes, and \
+enables/disables Google Drive sync folders over D-Bus. Holds no sync \
+state itself - gdrived does the actual synchronising."""
+section = "net"
+priority = "optional"
+depends = "$auto, gdrived, qml6-module-qt-labs-platform, qml6-module-qt-labs-folderlistmodel"
+recommends = "kdialog"
+assets = [
+    ["target/release/gdrive-ui", "usr/bin/", "755"],
+    ["../../packaging/org.gclient.gdrive-ui.desktop", "usr/share/applications/", "644"],
+    ["../../README.md", "usr/share/doc/gdrive-ui/README.md", "644"],
+]
+
 [dependencies]
 gdrive-common = { workspace = true }
 zbus = { workspace = true }
@@ -18,6 +36,7 @@ tracing-subscriber = { workspace = true }
 cxx = { workspace = true }
 cxx-qt = { workspace = true }
 cxx-qt-lib = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 cxx-qt-build = { workspace = true }
