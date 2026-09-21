@@ -48,13 +48,18 @@ pub mod qobject {
         /// array of objects (id, displayName, driveFolderId, localPath,
         /// ownerUser, ownerGroup, enabled, running), refreshed by calling
         /// `refresh()`; `statusMessage` reports the outcome of the last
-        /// operation (including D-Bus/connection errors).
+        /// operation (including D-Bus/connection errors). `darkMode` is
+        /// whether the desktop's dark color scheme preference was detected
+        /// at startup (see `dbus_client::system_prefers_dark`); the QML UI
+        /// uses it to apply a matching palette, since Qt Quick Controls'
+        /// styles don't reliably auto-detect this on Linux.
         #[qobject]
         #[qml_element]
-        #[qproperty(QString, folders_json)]
-        #[qproperty(QString, status_message)]
+        #[qproperty(QString, folders_json, cxx_name = "foldersJson")]
+        #[qproperty(QString, status_message, cxx_name = "statusMessage")]
         #[qproperty(bool, connected)]
         #[qproperty(bool, authenticated)]
+        #[qproperty(bool, dark_mode, cxx_name = "darkMode")]
         type SyncManager = super::SyncManagerRust;
 
         /// Re-fetches the list of sync folders from `gdrived` over D-Bus.
@@ -133,12 +138,29 @@ use core::pin::Pin;
 use cxx_qt_lib::QString;
 
 /// Rust-side state for the [`qobject::SyncManager`] `QObject`.
-#[derive(Default)]
 pub struct SyncManagerRust {
     folders_json: QString,
     status_message: QString,
     connected: bool,
     authenticated: bool,
+    dark_mode: bool,
+}
+
+impl Default for SyncManagerRust {
+    fn default() -> Self {
+        Self {
+            folders_json: QString::default(),
+            status_message: QString::default(),
+            connected: false,
+            authenticated: false,
+            // Detected once at startup rather than kept live: the desktop
+            // portal doesn't need to be polled since QML's Loader-free
+            // static palette assignment on load is enough for this app's
+            // needs (a running app rarely has the OS theme flipped under
+            // it, and restarting picks up any change).
+            dark_mode: dbus_client::system_prefers_dark(),
+        }
+    }
 }
 
 impl qobject::SyncManager {

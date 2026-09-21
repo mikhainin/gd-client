@@ -26,6 +26,44 @@ ApplicationWindow {
     title: qsTr("g-client - Google Drive Sync")
     color: palette.window
 
+    // Approximation of the Breeze Dark palette, applied via the Binding
+    // below when SyncManager.darkMode (detected via the freedesktop desktop
+    // portal's color-scheme setting, see ../src/dbus_client.rs) is true.
+    // Every Fusion-styled control (see src/main.rs, which sets Fusion as
+    // the fallback style) reads its colors from the window's `palette`
+    // property, so this alone re-themes the whole UI.
+    Palette {
+        id: darkPalette
+        window: "#31363b"
+        windowText: "#eff0f1"
+        base: "#232629"
+        alternateBase: "#2a2e32"
+        text: "#eff0f1"
+        button: "#31363b"
+        buttonText: "#eff0f1"
+        light: "#3d4247"
+        midlight: "#3a3f44"
+        mid: "#232629"
+        dark: "#1b1e21"
+        highlight: "#3daee9"
+        highlightedText: "#eff0f1"
+        placeholderText: "#9099a0"
+        toolTipBase: "#232629"
+        toolTipText: "#eff0f1"
+    }
+
+    // Only overrides root.palette while darkMode is true; restores the
+    // Fusion style's own default (light) palette otherwise, avoiding a
+    // binding loop that a plain `darkMode ? darkPalette : palette`
+    // conditional would create.
+    Binding {
+        target: root
+        property: "palette"
+        value: darkPalette
+        when: syncManager.darkMode
+        restoreMode: Binding.RestoreBindingOrValue
+    }
+
     // Hide to tray instead of quitting when the window is closed; the
     // application only truly exits via the tray menu's "Quit" action.
     onClosing: close => {
@@ -252,6 +290,7 @@ ApplicationWindow {
                 height: parent.height - (localFolderDialog.showNewFolderRow ? 170 : 130)
                 clip: true
                 model: localFolderModel
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn; width: 14 }
 
                 delegate: ItemDelegate {
                     width: ListView.view.width
@@ -375,6 +414,7 @@ ApplicationWindow {
                 height: parent.height - 90
                 clip: true
                 model: driveFolderDialog.entries
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn; width: 14 }
 
                 delegate: ItemDelegate {
                     width: ListView.view.width
@@ -395,6 +435,10 @@ ApplicationWindow {
                 text: qsTr("Select \"%1\"").arg(driveFolderDialog.currentFolder().name)
                 onClicked: {
                     driveFolderIdField.text = driveFolderDialog.currentFolder().id
+                    driveFolderPathField.text = qsTr("Selected: %1").arg(
+                        driveFolderDialog.pathStack.map(function (entry) {
+                            return entry.name
+                        }).join(" / "))
                     driveFolderDialog.close()
                 }
             }
@@ -419,6 +463,7 @@ ApplicationWindow {
                 true)
             displayNameField.text = ""
             driveFolderIdField.text = ""
+            driveFolderPathField.text = ""
             localPathField.text = ""
         }
 
@@ -433,8 +478,25 @@ ApplicationWindow {
             Row {
                 width: parent.width
                 spacing: 6
-                TextField { id: driveFolderIdField; width: parent.width - 90 }
+                TextField {
+                    id: driveFolderIdField
+                    width: parent.width - 90
+                    // Manual edits invalidate the last picked path preview
+                    // (the dialog re-sets it right after this, for picks).
+                    onTextChanged: driveFolderPathField.text = ""
+                }
                 Button { text: qsTr("Browse\u2026"); width: 84; onClicked: driveFolderDialog.open() }
+            }
+            Label {
+                id: driveFolderPathField
+                width: parent.width
+                opacity: 0.7
+                elide: Text.ElideMiddle
+                // Set by the Drive folder browser when a folder is picked;
+                // shows a human-readable path since the field above holds
+                // the (unreadable) Drive folder id actually sent to gdrived.
+                visible: text.length > 0
+                text: ""
             }
 
             Label { text: qsTr("Local path") }

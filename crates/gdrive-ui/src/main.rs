@@ -7,13 +7,22 @@ pub mod cxxqt_object;
 mod dbus_client;
 
 use cxx_qt::casting::Upcast;
-use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQmlEngine, QUrl};
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQmlEngine, QQuickStyle, QString, QUrl};
 use std::pin::Pin;
 
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // Fall back to the Fusion style (rather than Controls' "Basic" default)
+    // unless the user overrides it (`-style`/`QT_QUICK_CONTROLS_STYLE`):
+    // Fusion draws every control from the QML `palette` property, which
+    // `qml/main.qml` sets to a dark palette when the desktop portal reports
+    // a dark color-scheme preference (`SyncManager.darkMode`); Basic mostly
+    // ignores `palette` for its backgrounds, so it wouldn't follow suit.
+    // Must happen before any QML importing Qt Quick Controls is loaded.
+    QQuickStyle::set_fallback_style(&QString::from("Fusion"));
 
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();

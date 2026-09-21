@@ -42,6 +42,21 @@ system (see [`scripts/install-qt6.sh`](scripts/install-qt6.sh) for the
 Debian/Ubuntu package list). Run that script directly on your development
 machine, not inside a restricted sandbox.
 
+A root [`Makefile`](Makefile) wraps the common build/package/install flow:
+
+```sh
+make build     # cargo build --workspace --release
+make test      # cargo test --workspace
+make deb       # build target/debian/{gdrived,gdrive-ui}_*.deb via cargo-deb
+make install   # prints the `sudo apt install .../target/debian/*.deb` command to run yourself
+make uninstall # prints the `sudo apt remove gdrived gdrive-ui` command to run yourself
+make clean     # cargo clean + remove target/debian
+```
+
+`make deb` requires [`cargo-deb`](https://github.com/kornelski/cargo-deb)
+(`cargo install cargo-deb`). `install`/`uninstall` never run `sudo`
+themselves — they only print the exact command for you to run.
+
 ## Running
 
 1. Set `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` (a Google Cloud OAuth

@@ -26,6 +26,21 @@ pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
+/// Default OAuth client credentials baked into the binary at *build* time
+/// via the `GDRIVE_BUILD_CLIENT_ID` / `GDRIVE_BUILD_CLIENT_SECRET`
+/// environment variables (read with `option_env!`, so nothing is ever
+/// hardcoded/committed to source). This lets a maintainer/packager ship a
+/// pre-configured build where end users just click "Sign in" with no setup
+/// of their own, following the standard "installed application" OAuth
+/// pattern used by e.g. `rclone` (the client secret isn't treated as
+/// confidential for this flow - PKCE protects it).
+///
+/// Runtime `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET` environment
+/// variables still take priority over these, so anyone can override with
+/// their own OAuth client (e.g. for separate API quota) without rebuilding.
+const BUILT_IN_CLIENT_ID: Option<&str> = option_env!("GDRIVE_BUILD_CLIENT_ID");
+const BUILT_IN_CLIENT_SECRET: Option<&str> = option_env!("GDRIVE_BUILD_CLIENT_SECRET");
+
 /// OAuth client credentials for the "installed application" (desktop) flow.
 ///
 /// These identify *this application* to Google, not the end user. Obtain
@@ -38,16 +53,30 @@ pub struct OAuthConfig {
 }
 
 impl OAuthConfig {
-    /// Loads credentials from the `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET`
-    /// environment variables. Returns `None` if either is unset, in which
-    /// case the caller should surface a "not configured yet" state in the UI
-    /// rather than attempting to authenticate.
+    /// Loads credentials, preferring the `GDRIVE_CLIENT_ID` /
+    /// `GDRIVE_CLIENT_SECRET` runtime environment variables (so users can
+    /// always bring their own OAuth client), then falling back to whatever
+    /// was baked in at build time via [`BUILT_IN_CLIENT_ID`] /
+    /// [`BUILT_IN_CLIENT_SECRET`]. Returns `None` if neither source
+    /// provides both values, in which case the caller should surface a
+    /// "not configured yet" state in the UI rather than attempting to
+    /// authenticate.
     pub fn from_env() -> Option<Self> {
-        let client_id = std::env::var("GDRIVE_CLIENT_ID").ok()?;
-        let client_secret = std::env::var("GDRIVE_CLIENT_SECRET").ok()?;
+        if let (Ok(client_id), Ok(client_secret)) = (
+            std::env::var("GDRIVE_CLIENT_ID"),
+            std::env::var("GDRIVE_CLIENT_SECRET"),
+        ) {
+            return Some(Self {
+                client_id,
+                client_secret,
+            });
+        }
+
+        let client_id = BUILT_IN_CLIENT_ID.filter(|s| !s.is_empty())?;
+        let client_secret = BUILT_IN_CLIENT_SECRET.filter(|s| !s.is_empty())?;
         Some(Self {
-            client_id,
-            client_secret,
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
         })
     }
 }

@@ -8,3 +8,4 @@
 *.log
 .venv-scancode/
 .scancode/
+.env

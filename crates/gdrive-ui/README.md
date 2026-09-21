@@ -6,9 +6,13 @@ Qt6/QML desktop control panel for `gdrived`, built with
 - `cxxqt_object.rs` — the `SyncManager` `QObject` exposed to QML: lists,
   adds, removes, and enables/disables sync folders by calling `gdrived`'s
   D-Bus interface (`gdrive_common::dbus_api::GDrive1`), exposing a JSON
-  `foldersJson` property for the QML `ListView` model.
+  `foldersJson` property for the QML `ListView` model, plus a `darkMode`
+  property (see `dbus_client::system_prefers_dark`).
 - `dbus_client.rs` — thin helper for talking to `gdrived` over D-Bus
-  (`GDrive1ProxyBlocking`, auto-generated from the shared `GDrive1` trait).
+  (`GDrive1ProxyBlocking`, auto-generated from the shared `GDrive1` trait),
+  plus `system_prefers_dark()`, which asks the freedesktop desktop portal
+  (`org.freedesktop.portal.Desktop`) for the user's dark/light color-scheme
+  preference.
 - `qml/main.qml` — the UI itself: a folder list with add/remove/enable
   controls, deliberately avoiding `QtQuick.Layouts` (not always packaged
   alongside base QtQuick Controls) in favour of plain `Row`/`Column`.
@@ -29,3 +33,16 @@ cargo run -p gdrive-ui
 
 Requires `gdrived` to be running for the "Connected to gdrived" status and
 folder list to populate; the UI itself holds no sync state.
+
+## Dark mode
+
+The UI follows the desktop's dark/light preference. At startup, `main.rs`
+sets the Qt Quick Controls fallback style to "Fusion" (which draws every
+control from the QML `palette` property, unlike the default "Basic" style),
+and `dbus_client::system_prefers_dark()` queries the freedesktop desktop
+portal's `org.freedesktop.appearance` `color-scheme` setting over D-Bus
+(supported by `xdg-desktop-portal-kde`/`-gnome`/`-gtk` on effectively every
+modern desktop, so this doesn't depend on a Qt6-specific platform theme
+plugin being installed). `qml/main.qml` applies an approximate Breeze Dark
+`Palette` to the window when `SyncManager.darkMode` is true. The preference
+is only read once at startup (not live-updated if changed while running).
