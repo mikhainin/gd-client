@@ -6,11 +6,12 @@ Guidance for AI agents (and human contributors) working in this repository.
 
 This is a Rust project.
 
-## Change logging
+## Documentation
 
-- Every meaningful change must be recorded either in this file (under "Change Log" below) or in the corresponding documentation file for the affected crate/module (e.g. its own README.md).
+- There is no changelog. Do not append change-log-style, dated entries anywhere.
+- Every meaningful change must instead be reflected by editing the relevant existing section in this file, or in the corresponding documentation file for the affected crate/module (e.g. its own README.md), so the docs always describe only the current state of the project.
 - "Meaningful" means anything that affects behavior, architecture, dependencies, configuration, or public interfaces — not typo fixes or formatting-only edits.
-- When a change belongs to a specific documented area (e.g. a crate's own README), record it there instead of duplicating it here, and add a one-line pointer here if it's significant.
+- When a change belongs to a specific documented area (e.g. a crate's own README), edit it there; add or update a dedicated section in this file only for guidance that applies across the whole repository.
 
 ## Dependency management
 

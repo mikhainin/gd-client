@@ -44,18 +44,12 @@ machine, not inside a restricted sandbox.
 
 A root [`Makefile`](Makefile) wraps the common build/package/install flow:
 
-```sh
-make build     # cargo build --workspace --release
-make test      # cargo test --workspace
-make deb       # build target/debian/{gdrived,gdrive-ui}_*.deb via cargo-deb
-make install   # prints the `sudo apt install .../target/debian/*.deb` command to run yourself
-make uninstall # prints the `sudo apt remove gdrived gdrive-ui` command to run yourself
-make clean     # cargo clean + remove target/debian
-```
-
-`make deb` requires [`cargo-deb`](https://github.com/kornelski/cargo-deb)
-(`cargo install cargo-deb`). `install`/`uninstall` never run `sudo`
-themselves — they only print the exact command for you to run.
+A root `Makefile` wraps the common workflows: `make build`/`make test` run
+the `cargo` commands above; `make deb` runs `cargo deb -p gdrived`/
+`cargo deb -p gdrive-ui` to produce `target/debian/*.deb` packages; `make
+install`/`make uninstall` only print the `sudo apt install`/`sudo apt
+remove` commands (never run them — see [`AGENTS.md`](AGENTS.md)); `make
+clean` removes build artifacts.
 
 ## Running
 
@@ -94,7 +88,7 @@ Following the XDG base directory spec (see
 ## Repository conventions
 
 See [`AGENTS.md`](AGENTS.md) for contributor/agent guidance, including the
-change-logging convention and how to verify the Qt/QML UI visually.
+documentation-editing convention and how to verify the Qt/QML UI visually.
 
 ## Alternatives
 
