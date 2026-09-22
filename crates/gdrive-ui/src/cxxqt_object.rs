@@ -304,12 +304,17 @@ impl qobject::SyncManager {
         let parent_path = parent_path.to_string();
         let name = name.to_string();
 
-        if name.is_empty() || name.contains('/') {
-            self.as_mut().set_status_message(QString::from(
-                "folder name must be non-empty and cannot contain '/'",
-            ));
-            return false;
-        }
+if name.is_empty()
+    || name == "."
+    || name == ".."
+    || name.contains('/')
+    || name.contains('\\')
+{
+    self.as_mut().set_status_message(QString::from(
+        "folder name must be non-empty and cannot be '.'/'..' or contain path separators",
+    ));
+    return false;
+}
 
         let full_path = std::path::Path::new(&parent_path).join(&name);
         match std::fs::create_dir(&full_path) {
