@@ -5,7 +5,7 @@
 //! Bus name: `org.gclient.GDrive1`, object path: `/org/gclient/GDrive1`.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use gdrive_common::dbus_api::{DriveFolderRow, SyncFolderRow};
 use gdrive_common::{AppConfig, SyncFolder};
@@ -18,7 +18,7 @@ use zbus::interface;
 /// configuration (guarded by a mutex since D-Bus calls are handled
 /// concurrently) and the running sync engine.
 pub struct GDriveService {
-    config: Mutex<AppConfig>,
+    config: Arc<Mutex<AppConfig>>,
     config_path: PathBuf,
     engine: SyncEngine,
 }
@@ -26,7 +26,7 @@ pub struct GDriveService {
 impl GDriveService {
     pub fn new(config: AppConfig, config_path: PathBuf, engine: SyncEngine) -> Self {
         Self {
-            config: Mutex::new(config),
+            config: Arc::new(Mutex::new(config)),
             config_path,
             engine,
         }
@@ -165,7 +165,7 @@ impl GDriveService {
         })?;
 
         let engine = self.engine.clone();
-        let config = self.config.lock().unwrap().clone();
+        let config = self.config.clone();
         tokio::spawn(async move {
             let result = auth::authenticate(&oauth_config, &token_path, |url| {
                 if let Err(err) = std::process::Command::new("xdg-open").arg(url).spawn() {
@@ -182,6 +182,11 @@ impl GDriveService {
                 Ok(token) => {
                     tracing::info!("sign-in succeeded");
                     engine.set_access_token(token.access_token);
+                    // Read the configuration at the moment the OAuth flow
+                    // completes (rather than the moment it started), so any
+                    // folders added/enabled while the user was completing
+                    // browser consent are included when starting sync.
+                    let config = config.lock().unwrap().clone();
                     engine.start_all(&config);
                 }
                 Err(err) => tracing::error!("sign-in failed: {err}"),
