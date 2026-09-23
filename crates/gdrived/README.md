@@ -14,7 +14,12 @@ On startup it:
 4. Serves the `org.gclient.GDrive1` interface (defined in
    `gdrive_common::dbus_api`, implemented in `dbus_service.rs`) on the
    session D-Bus bus, exposing `ListSyncFolders`/`AddSyncFolder`/
-   `RemoveSyncFolder`/`SetFolderEnabled`.
+   `RemoveSyncFolder`/`SetFolderEnabled`/`IsAuthenticated`/`SignIn`/
+   `SignOut`/`ListDriveFolders`. `SignIn` spawns a background task running
+   `gdrive_sync::auth::authenticate`'s PKCE flow via `xdg-open`, so the
+   D-Bus call itself returns immediately rather than blocking on browser
+   interaction; `SignOut` deletes the cached token and stops all running
+   folders.
 
 Run it with:
 
@@ -42,6 +47,19 @@ EOF
 chmod 600 ~/.config/gdrived/env
 systemctl --user restart gdrived.service
 ```
+## Packaged (systemd/D-Bus-activated) daemon
+
+When installed from the `.deb`, `gdrived` is started via D-Bus activation
+(`packaging/org.gclient.GDrive1.service`, which has
+`SystemdService=gdrived.service` so activation routes through the systemd
+user unit rather than a bare `Exec=`) or the systemd user unit directly
+(`packaging/gdrived.service`). Such activation does not inherit the
+invoking user's exported shell environment variables, so
+`GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` set in e.g. `~/.bashrc` are not
+visible to it. To override OAuth credentials for the packaged daemon, set
+them in `~/.config/gdrived/env` (referenced via
+`EnvironmentFile=-%h/.config/gdrived/env` in `gdrived.service`; the leading
+`-` makes the file optional).
 
 Query it directly without the UI, e.g.:
 

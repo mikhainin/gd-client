@@ -226,7 +226,7 @@ impl qobject::SyncManager {
         let owner_user = owner_user.to_string();
         let owner_group = owner_group.to_string();
 
-        let result = dbus_client::with_proxy(|proxy| {
+        let result = dbus_client::with_proxy(move |proxy| {
             proxy.add_sync_folder(
                 &display_name,
                 &drive_folder_id,
@@ -244,7 +244,7 @@ impl qobject::SyncManager {
 
     pub fn remove_folder(mut self: Pin<&mut Self>, id: &QString) {
         let id = id.to_string();
-        let result = dbus_client::with_proxy(|proxy| proxy.remove_sync_folder(&id));
+        let result = dbus_client::with_proxy(move |proxy| proxy.remove_sync_folder(&id));
         if let Err(message) = result {
             self.as_mut().set_status_message(QString::from(&message));
         }
@@ -253,7 +253,7 @@ impl qobject::SyncManager {
 
     pub fn set_folder_enabled(mut self: Pin<&mut Self>, id: &QString, enabled: bool) {
         let id = id.to_string();
-        let result = dbus_client::with_proxy(|proxy| proxy.set_folder_enabled(&id, enabled));
+        let result = dbus_client::with_proxy(move |proxy| proxy.set_folder_enabled(&id, enabled));
         if let Err(message) = result {
             self.as_mut().set_status_message(QString::from(&message));
         }
@@ -281,7 +281,7 @@ impl qobject::SyncManager {
 
     pub fn list_drive_folders(mut self: Pin<&mut Self>, parent_id: &QString) -> QString {
         let parent_id = parent_id.to_string();
-        match dbus_client::with_proxy(|proxy| proxy.list_drive_folders(&parent_id)) {
+        match dbus_client::with_proxy(move |proxy| proxy.list_drive_folders(&parent_id)) {
             Ok(rows) => {
                 let folders: Vec<DriveFolderView> = rows
                     .into_iter()
@@ -304,12 +304,17 @@ impl qobject::SyncManager {
         let parent_path = parent_path.to_string();
         let name = name.to_string();
 
-        if name.is_empty() || name.contains('/') {
-            self.as_mut().set_status_message(QString::from(
-                "folder name must be non-empty and cannot contain '/'",
-            ));
-            return false;
-        }
+if name.is_empty()
+    || name == "."
+    || name == ".."
+    || name.contains('/')
+    || name.contains('\\')
+{
+    self.as_mut().set_status_message(QString::from(
+        "folder name must be non-empty and cannot be '.'/'..' or contain path separators",
+    ));
+    return false;
+}
 
         let full_path = std::path::Path::new(&parent_path).join(&name);
         match std::fs::create_dir(&full_path) {

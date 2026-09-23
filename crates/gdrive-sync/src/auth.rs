@@ -146,6 +146,11 @@ pub async fn authenticate(
 
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // Bound the token-exchange request too, per AGENTS.md's "every
+        // network call must have a timeout" rule - a stalled connection to
+        // Google's token endpoint should fail, not hang the sign-in flow.
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let token_result = client
