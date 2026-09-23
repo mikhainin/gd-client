@@ -119,8 +119,10 @@ pub mod qobject {
         /// Requests the direct sub-folders of a Google Drive folder (empty
         /// string for "My Drive"'s top level) for the remote folder-browse
         /// dialog. The result is delivered by the `driveFoldersReady`
-        /// signal; only the most recently requested parent is reported, so
-        /// quickly clicking through folders cannot show stale contents.
+        /// signal (always emitted exactly once per call, with an empty
+        /// array if the request failed); only the most recently requested
+        /// parent is reported, so quickly clicking through folders cannot
+        /// show stale contents.
         #[qinvokable]
         #[cxx_name = "listDriveFolders"]
         fn list_drive_folders(self: Pin<&mut Self>, parent_id: &QString);
@@ -362,6 +364,7 @@ impl qobject::SyncManager {
 
         let parent_id = parent_id.to_string();
         let requested_parent = parent_id.clone();
+        let rejected_parent = parent_id.clone();
         let qt_thread = self.as_ref().qt_thread();
         let submitted = dbus_client::call(
             move |proxy| async move { proxy.list_drive_folders(&parent_id).await },
@@ -393,7 +396,12 @@ impl qobject::SyncManager {
             },
         );
         if let Err(error) = submitted {
+            // The signal is the only completion notification the dialog
+            // gets, so it must be emitted even when the request never made
+            // it to the worker - otherwise the dialog waits forever.
             self.as_mut().report(&error.to_string());
+            self.as_mut()
+                .drive_folders_ready(&QString::from(&rejected_parent), &QString::from("[]"));
         }
     }
 

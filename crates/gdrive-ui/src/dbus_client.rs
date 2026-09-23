@@ -106,12 +106,22 @@ where
                 Ok(proxy) => match tokio::time::timeout(CALL_TIMEOUT, op(proxy)).await {
                     Ok(Ok(value)) => (Ok(value), Health::Usable),
                     Ok(Err(error)) => {
-                        // Only transport-level failures say anything about
-                        // the connection; a method error (e.g. "no such sync
-                        // folder") means the daemon answered just fine.
+                        // A reply from the peer (even an error one, e.g. "no
+                        // such sync folder" or "service unknown" when the
+                        // daemon isn't running), or a problem with the
+                        // request itself, says nothing bad about the
+                        // connection. Anything else - I/O, handshake,
+                        // connection or generic failures - means it is
+                        // suspect, so drop it and reconnect next time.
                         let health = match error {
-                            zbus::Error::InputOutput(_) => Health::Broken,
-                            _ => Health::Usable,
+                            zbus::Error::MethodError(..)
+                            | zbus::Error::FDO(_)
+                            | zbus::Error::Variant(_)
+                            | zbus::Error::Names(_)
+                            | zbus::Error::InterfaceNotFound
+                            | zbus::Error::Unsupported
+                            | zbus::Error::MissingParameter(_) => Health::Usable,
+                            _ => Health::Broken,
                         };
                         (Err(error.to_string()), health)
                     }
@@ -178,7 +188,8 @@ fn auth_listener() -> &'static Mutex<Option<AuthListener>> {
 /// Registers `listener` to be called (on the worker thread) whenever
 /// `gdrived` emits `AuthenticationChanged`, so the UI learns about a
 /// completed sign-in as soon as it happens instead of waiting for the next
-/// poll. Replaces any previously registered listener.
+/// poll. There is a single listener slot, so registering again replaces the
+/// previous one: the UI creates exactly one `SyncManager`.
 pub fn set_authentication_listener(listener: impl Fn(bool) + Send + 'static) {
     *auth_listener()
         .lock()
