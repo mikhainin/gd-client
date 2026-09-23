@@ -76,9 +76,11 @@ ApplicationWindow {
         Component.onCompleted: refresh()
     }
 
-    // Polls gdrived periodically so sign-in (completed asynchronously in a
-    // browser tab) and folder sync status changes are picked up without
-    // requiring the user to click "Refresh" manually.
+    // Polls gdrived periodically so folder sync status changes (which have
+    // no D-Bus signal of their own) are picked up without requiring the user
+    // to click "Refresh" manually. Sign-in completion does not rely on this:
+    // gdrived emits AuthenticationChanged, which SyncManager subscribes to.
+    // refresh() only queues D-Bus requests, so this never blocks the UI.
     Timer {
         interval: 3000
         running: true
@@ -363,18 +365,19 @@ ApplicationWindow {
         // currently being browsed ("" id means "My Drive" root).
         property var pathStack: [{ id: "", name: qsTr("My Drive") }]
         property var entries: []
+        property bool loading: false
 
         function currentFolder() {
             return pathStack[pathStack.length - 1]
         }
 
+        // Asks for the current folder's children and returns immediately;
+        // SyncManager delivers them via its driveFoldersReady signal (see
+        // the Connections below), so browsing never blocks the UI.
         function load() {
-            var json = syncManager.listDriveFolders(currentFolder().id)
-            try {
-                entries = JSON.parse(json)
-            } catch (e) {
-                entries = []
-            }
+            entries = []
+            loading = true
+            syncManager.listDriveFolders(currentFolder().id)
         }
 
         function enterFolder(id, name) {
@@ -425,7 +428,8 @@ ApplicationWindow {
                 Label {
                     anchors.centerIn: parent
                     visible: driveFolderDialog.entries.length === 0
-                    text: qsTr("No sub-folders here.")
+                    text: driveFolderDialog.loading ? qsTr("Loading\u2026")
+                                                    : qsTr("No sub-folders here.")
                     opacity: 0.6
                 }
             }
@@ -440,6 +444,24 @@ ApplicationWindow {
                             return entry.name
                         }).join(" / "))
                     driveFolderDialog.close()
+                }
+            }
+        }
+
+        // The listing arrives asynchronously, so ignore replies for a
+        // folder the user has already navigated away from.
+        Connections {
+            target: syncManager
+
+            function onDriveFoldersReady(parentId, foldersJson) {
+                if (parentId !== driveFolderDialog.currentFolder().id)
+                    return
+
+                driveFolderDialog.loading = false
+                try {
+                    driveFolderDialog.entries = JSON.parse(foldersJson)
+                } catch (e) {
+                    driveFolderDialog.entries = []
                 }
             }
         }

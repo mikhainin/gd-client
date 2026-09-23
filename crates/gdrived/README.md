@@ -14,7 +14,10 @@ On startup it:
 4. Serves the `org.gclient.GDrive1` interface (defined in
    `gdrive_common::dbus_api`, implemented in `dbus_service.rs`) on the
    session D-Bus bus, exposing `ListSyncFolders`/`AddSyncFolder`/
-   `RemoveSyncFolder`/`SetFolderEnabled`.
+   `RemoveSyncFolder`/`SetFolderEnabled`, the authentication methods
+   (`IsAuthenticated`/`SignIn`/`SignOut`) and the `AuthenticationChanged`
+   signal, emitted when the interactive sign-in flow finishes or the user
+   signs out so clients don't have to poll.
 
 Run it with:
 
