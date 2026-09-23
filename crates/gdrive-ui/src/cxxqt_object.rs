@@ -303,7 +303,7 @@ impl qobject::SyncManager {
         let owner_group = owner_group.to_string();
 
         self.as_mut().submit(
-            |proxy| async move {
+            move |proxy| async move {
                 proxy
                     .add_sync_folder(
                         &display_name,
@@ -323,7 +323,7 @@ impl qobject::SyncManager {
     pub fn remove_folder(mut self: Pin<&mut Self>, id: &QString) {
         let id = id.to_string();
         self.as_mut().submit(
-            |proxy| async move { proxy.remove_sync_folder(&id).await },
+            move |proxy| async move { proxy.remove_sync_folder(&id).await },
             "removing the sync folder",
         );
     }
@@ -331,7 +331,7 @@ impl qobject::SyncManager {
     pub fn set_folder_enabled(mut self: Pin<&mut Self>, id: &QString, enabled: bool) {
         let id = id.to_string();
         self.as_mut().submit(
-            |proxy| async move { proxy.set_folder_enabled(&id, enabled).await },
+            move |proxy| async move { proxy.set_folder_enabled(&id, enabled).await },
             "updating the sync folder",
         );
     }
