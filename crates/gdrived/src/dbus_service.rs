@@ -13,6 +13,7 @@ use gdrive_sync::auth::{self, OAuthConfig};
 use gdrive_sync::SyncEngine;
 use uuid::Uuid;
 use zbus::interface;
+use zbus::object_server::SignalEmitter;
 
 /// Shared daemon state backing the D-Bus interface: the persisted
 /// configuration (guarded by a mutex since D-Bus calls are handled
@@ -152,9 +153,12 @@ impl GDriveService {
     /// Starts the interactive Google OAuth sign-in flow in the background
     /// and returns immediately; the browser consent step can take an
     /// arbitrary amount of time, so it must not block this D-Bus call (and
-    /// therefore the caller's UI thread). Clients should poll
-    /// [`Self::is_authenticated`] to detect completion.
-    async fn sign_in(&self) -> zbus::fdo::Result<()> {
+    /// therefore the caller's UI thread). Completion is reported by the
+    /// [`Self::authentication_changed`] signal.
+    async fn sign_in(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
         let token_path = auth::default_token_path()
             .map_err(|e| zbus::fdo::Error::Failed(format!("failed to resolve token path: {e}")))?;
         let oauth_config = OAuthConfig::from_env().ok_or_else(|| {
@@ -166,6 +170,7 @@ impl GDriveService {
 
         let engine = self.engine.clone();
         let config = self.config.lock().unwrap().clone();
+        let emitter = emitter.to_owned();
         tokio::spawn(async move {
             let result = auth::authenticate(&oauth_config, &token_path, |url| {
                 if let Err(err) = std::process::Command::new("xdg-open").arg(url).spawn() {
@@ -178,13 +183,21 @@ impl GDriveService {
             })
             .await;
 
-            match result {
+            let authenticated = match result {
                 Ok(token) => {
                     tracing::info!("sign-in succeeded");
                     engine.set_access_token(token.access_token);
                     engine.start_all(&config);
+                    true
                 }
-                Err(err) => tracing::error!("sign-in failed: {err}"),
+                Err(err) => {
+                    tracing::error!("sign-in failed: {err}");
+                    false
+                }
+            };
+
+            if let Err(err) = Self::authentication_changed(&emitter, authenticated).await {
+                tracing::warn!("failed to emit AuthenticationChanged: {err}");
             }
         });
 
@@ -192,7 +205,10 @@ impl GDriveService {
     }
 
     /// Forgets the cached OAuth token and stops all running sync folders.
-    async fn sign_out(&self) -> zbus::fdo::Result<()> {
+    async fn sign_out(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
         let token_path = auth::default_token_path()
             .map_err(|e| zbus::fdo::Error::Failed(format!("failed to resolve token path: {e}")))?;
 
@@ -205,6 +221,10 @@ impl GDriveService {
             std::fs::remove_file(&token_path).map_err(|e| {
                 zbus::fdo::Error::Failed(format!("failed to remove cached token: {e}"))
             })?;
+        }
+
+        if let Err(err) = Self::authentication_changed(&emitter, false).await {
+            tracing::warn!("failed to emit AuthenticationChanged: {err}");
         }
         Ok(())
     }
@@ -225,6 +245,14 @@ impl GDriveService {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("failed to list Drive folders: {e}")))
     }
+
+    /// Emitted whenever the authentication state changes, so clients (e.g.
+    /// `gdrive-ui`) learn about a finished sign-in without polling.
+    #[zbus(signal)]
+    async fn authentication_changed(
+        emitter: &SignalEmitter<'_>,
+        authenticated: bool,
+    ) -> zbus::Result<()>;
 }
 
 fn parse_uuid(id: &str) -> zbus::fdo::Result<Uuid> {

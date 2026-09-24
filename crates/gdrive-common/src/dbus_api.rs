@@ -69,4 +69,11 @@ pub trait GDrive1 {
     /// "browse Drive folder" picker in the UI. Pass an empty string (or
     /// `"root"`) for the top level of "My Drive".
     fn list_drive_folders(&self, parent_id: &str) -> zbus::Result<Vec<DriveFolderRow>>;
+
+    /// Emitted whenever the authentication state changes: after the
+    /// interactive [`Self::sign_in`] flow finishes (successfully or not) and
+    /// after [`Self::sign_out`]. Lets clients react immediately instead of
+    /// polling [`Self::is_authenticated`].
+    #[zbus(signal)]
+    fn authentication_changed(&self, authenticated: bool) -> zbus::Result<()>;
 }

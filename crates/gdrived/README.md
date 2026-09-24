@@ -15,11 +15,13 @@ On startup it:
    `gdrive_common::dbus_api`, implemented in `dbus_service.rs`) on the
    session D-Bus bus, exposing `ListSyncFolders`/`AddSyncFolder`/
    `RemoveSyncFolder`/`SetFolderEnabled`/`IsAuthenticated`/`SignIn`/
-   `SignOut`/`ListDriveFolders`. `SignIn` spawns a background task running
+   `SignOut`/`ListDriveFolders`, plus the `AuthenticationChanged` signal.
+   `SignIn` spawns a background task running
    `gdrive_sync::auth::authenticate`'s PKCE flow via `xdg-open`, so the
    D-Bus call itself returns immediately rather than blocking on browser
-   interaction; `SignOut` deletes the cached token and stops all running
-   folders.
+   interaction, and emits `AuthenticationChanged` once the flow finishes so
+   clients don't have to poll; `SignOut` deletes the cached token, stops all
+   running folders and emits the same signal.
 
 Run it with:
 
