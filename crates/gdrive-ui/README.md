@@ -19,9 +19,38 @@ Qt6/QML desktop control panel for `gdrived`, built with
   `AuthenticationChanged` signal.
 - `qml/main.qml` — the UI itself: a folder list with add/remove/enable
   controls, deliberately avoiding `QtQuick.Layouts` (not always packaged
-  alongside base QtQuick Controls) in favour of plain `Row`/`Column`.
+  alongside base QtQuick Controls) in favour of plain `Row`/`Column`. Also
+  includes: a Sign in/out button (sign-in completion arrives via
+  `gdrived`'s `AuthenticationChanged` signal, and a 3s polling `Timer`
+  refreshes the folders' `running` status, which has no signal of its
+  own); a `Qt.labs.platform.SystemTrayIcon` (closing
+  the window hides it to tray instead of quitting; Show/Hide + Quit menu);
+  a custom local folder browser `Dialog` (backed by
+  `Qt.labs.folderlistmodel`, with a "New folder…" button) for the local
+  path field; and a custom breadcrumb-navigable Drive folder browser
+  `Dialog` (driven by `listDriveFolders` plus the `driveFoldersReady`
+  signal) for the Drive folder id field.
+  `Qt.labs.platform.FolderDialog` and `QtQuick.Dialogs`' `FolderDialog`
+  were tried first for a native picker but rejected: the former needs
+  `QApplication`/QtWidgets (this app is a pure-QML `QGuiApplication` and
+  doesn't link against it, so it fails at runtime with "No native
+  FileDialog implementation available"), and the latter works but has no
+  "new folder" affordance.
 - `build.rs` — builds the QML module (`org.gclient.gdrive_ui`) via
   `cxx-qt-build`.
+
+## Local folder picker: native dialog first
+
+The Local path "Browse…" button calls `SyncManager::nativeFolderPickerAvailable()`
+and, if true, `pickLocalFolderNative(start_path)` (both in `cxxqt_object.rs`),
+which shell out to `kdialog --getexistingdirectory` (a real KDE-native
+`QFileDialog`, run as a separate process so this app doesn't need to link
+`QApplication`/QtWidgets itself). `kdialog` is an optional/recommended
+dependency, not a hard one: when it isn't installed, the button falls back
+to the custom `FolderListModel`-based `localFolderDialog` described above.
+The spawned `kdialog` process has `PR_SET_PDEATHSIG` (via the `libc` crate's
+`pre_exec` hook) set to `SIGTERM` before `exec`, so it's killed automatically
+if `gdrive-ui` itself dies while the picker is open.
 
 ## Prerequisites
 

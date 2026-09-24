@@ -4,22 +4,25 @@
 //!
 //! `#[qinvokable]` methods run on the Qt/QML UI thread, so none of them may
 //! wait for a D-Bus round-trip: a stalled session bus or an unresponsive
-//! `gdrived` would otherwise freeze the whole UI. Instead of blocking (and
-//! instead of spawning one OS thread per call), this module owns a *single*
-//! long-lived worker thread running a current-thread Tokio runtime with one
-//! `zbus` session connection and one async [`GDrive1Proxy`] on it. Callers
-//! submit a request plus a completion callback over a bounded channel and
-//! return immediately; the callback runs on the worker thread once the reply
-//! arrives, and is expected to hand the result back to the Qt thread (see
-//! `cxxqt_object`, which queues a closure onto the Qt event loop with
-//! `CxxQtThread::queue`).
+//! `gdrived` (e.g. stuck on a hung Drive API request - see
+//! `gdrive-sync::drive_client`'s own timeouts) would otherwise freeze the
+//! whole UI with no way to recover short of killing the process. Instead of
+//! blocking (and instead of spawning one OS thread per call), this module
+//! owns a *single* long-lived worker thread running a current-thread Tokio
+//! runtime with one `zbus` session connection and one async
+//! [`GDrive1Proxy`] on it. Callers submit a request plus a completion
+//! callback over a bounded channel and return immediately; the callback runs
+//! on the worker thread once the reply arrives, and is expected to hand the
+//! result back to the Qt thread (see `cxxqt_object`, which queues a closure
+//! onto the Qt event loop with `CxxQtThread::queue`).
 //!
 //! Requests are processed one at a time, which keeps the ordering of a
 //! "mutate, then refresh" pair intact, and the channel is bounded so a
 //! wedged daemon makes new requests fail fast ([`Error::Busy`]) rather than
 //! accumulate without limit. Every call is additionally bounded by
 //! [`CALL_TIMEOUT`], and connection setup by [`CONNECT_TIMEOUT`], so a
-//! request can never stay outstanding indefinitely.
+//! request can never stay outstanding indefinitely (see AGENTS.md: every
+//! network/IPC call must have a timeout).
 
 use std::future::Future;
 use std::pin::Pin;

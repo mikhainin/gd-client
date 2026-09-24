@@ -438,7 +438,6 @@ ApplicationWindow {
                 width: parent.width
                 text: qsTr("Select \"%1\"").arg(driveFolderDialog.currentFolder().name)
                 onClicked: {
-                    driveFolderIdField.text = driveFolderDialog.currentFolder().id
                     driveFolderPathField.text = qsTr("Selected: %1").arg(
                         driveFolderDialog.pathStack.map(function (entry) {
                             return entry.name

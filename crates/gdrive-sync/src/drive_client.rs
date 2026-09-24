@@ -6,6 +6,7 @@
 //! implemented.
 
 use std::sync::RwLock;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,20 @@ use crate::error::SyncError;
 
 const API_BASE: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
+
+/// Bounds how long the TCP connect + TLS handshake for a Drive API request
+/// may take, so a stalled network (rather than a slow-but-progressing one)
+/// fails fast instead of hanging forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bounds the total duration of a single Drive API request (connect + send
+/// + receive full response). All requests here upload/download whole
+/// small-to-medium files in memory (no chunked/resumable transfer yet), so
+/// a single generous-but-finite timeout is appropriate for every call -
+/// without this, a stalled request (e.g. a dropped connection that never
+/// errors) would block its caller indefinitely. See AGENTS.md: every
+/// network/IPC call must have a timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct DriveClient {
     http: reqwest::Client,
@@ -75,8 +90,16 @@ pub struct Change {
 
 impl DriveClient {
     pub fn new(access_token: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            // Only fails on TLS backend initialisation errors, which would
+            // also break every other `reqwest::Client` in the process -
+            // there's nothing more graceful to do here.
+            .expect("failed to build the Drive API HTTP client");
         Self {
-            http: reqwest::Client::new(),
+            http,
             access_token: RwLock::new(access_token.into()),
         }
     }
