@@ -25,6 +25,9 @@ pub enum SyncError {
     #[error("not authenticated with Google Drive yet")]
     NotAuthenticated,
 
+    #[error("timed out while {0}")]
+    Timeout(&'static str),
+
     #[error("OAuth2 error: {0}")]
     OAuth(String),
 }

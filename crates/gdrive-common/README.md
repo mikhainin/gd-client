@@ -10,7 +10,9 @@ Shared types and utilities used by both `gdrived` and `gdrive-ui`:
 - `dbus_api` — the `org.gclient.GDrive1` D-Bus interface contract: bus name,
   object path, and a `#[zbus::proxy]` trait (`GDrive1`) implemented by
   `gdrived` and consumed by `gdrive-ui`. This is the single source of truth
-  for the interface's method names/signatures — both sides must match it
+  for the interface's method and signal names/signatures, including
+  `AuthenticationChanged(b)` after successful sign-in/out. Clients query
+  `IsAuthenticated` for initial/reconnected state. Both sides must match it
   exactly, since zbus does not check this across independent crates at
   compile time.
 - `error` — the shared `CommonError` type.
