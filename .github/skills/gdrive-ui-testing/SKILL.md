@@ -199,7 +199,11 @@ the overall budget. Polls clear AT-SPI caches before reading names, states and
 children rather than assuming a sleeping client dispatches GLib change events.
 `--max-nodes`/`--max-depth` fail instead of returning incomplete ambiguous trees.
 Actions require SHOWING, ENABLED and SENSITIVE; hidden inspection is not action
-authorization. Errors are JSON with exit 2; the hard worker deadline exits 124.
+authorization. Guards clear the selected node's cache and reread these states
+after traversal and again immediately before action/edit dispatch, including
+after interface/action discovery. Results report the refreshed states.
+The provider can still change state after a guard, so verify postconditions.
+Errors are JSON with exit 2; the hard worker deadline exits 124.
 
 If taking a screenshot immediately after launch, use the documented active-window
 capture without raising/focusing through window-manager tools:

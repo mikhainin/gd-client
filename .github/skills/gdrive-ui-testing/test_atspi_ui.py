@@ -70,6 +70,21 @@ def fake_atspi(apps=()):
     return Mock(StateType=states, get_desktop=Mock(return_value=Node("desktop", children=apps)))
 
 
+class CachedStatesNode(Node):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cached_states = None
+
+    def get_state_set(self):
+        if self.cached_states is None:
+            self.cached_states = FakeStates(**self.state_set.values)
+        return self.cached_states
+
+    def clear_cache(self):
+        super().clear_cache()
+        self.cached_states = None
+
+
 def action(*names, accepted=True):
     result = Mock()
     result.get_n_actions.return_value = len(names)
@@ -191,6 +206,66 @@ class ActionTests(unittest.TestCase):
                 self.perform()
             self.node.action.do_action.assert_not_called()
 
+    def test_controls_changed_during_selection_are_refused(self):
+        for command in ("press", "invoke", "edit"):
+            for state in ("showing", "enabled", "sensitive"):
+                with self.subTest(command=command, state=state):
+                    target = CachedStatesNode("Cancel")
+                    target.action = action("Press")
+                    target.editable = Mock()
+                    later_sibling = Node("Later sibling")
+
+                    def change_target():
+                        target.state_set.values[state] = False
+                        return 0
+
+                    later_sibling.get_child_count = change_target
+                    root = Node("app", children=[target, later_sibling])
+                    selected, info = self.ui.select(root, {"name": ["Cancel"]})
+                    self.assertTrue(info["states"][state])
+                    with self.assertRaisesRegex(ui.UIError, "not showing|disabled or insensitive"):
+                        self.ui.act(
+                            selected, info, command, {"action": "Press", "text": "unsaved"}
+                        )
+                    target.action.do_action.assert_not_called()
+                    target.editable.set_text_contents.assert_not_called()
+                    self.assertEqual(target.cache_clears, 2)
+
+    def test_controls_disabled_during_interface_resolution_are_refused(self):
+        for command in ("press", "invoke", "edit"):
+            with self.subTest(command=command):
+                target = CachedStatesNode("Cancel")
+                target.action = action("Press")
+                target.editable = Mock()
+                info = next(self.ui.walk(target))[1]
+
+                def action_name(_index):
+                    target.state_set.values["enabled"] = False
+                    return "Press"
+
+                def editable_interface():
+                    target.state_set.values["enabled"] = False
+                    return target.editable
+
+                target.action.get_action_name.side_effect = action_name
+                target.get_editable_text_iface = editable_interface
+                with self.assertRaisesRegex(ui.UIError, "disabled or insensitive"):
+                    self.ui.act(
+                        target, info, command, {"action": "Press", "text": "unsaved"}
+                    )
+                target.action.do_action.assert_not_called()
+                target.editable.set_text_contents.assert_not_called()
+
+    def test_action_result_contains_refreshed_states(self):
+        target = CachedStatesNode("Cancel")
+        target.action = action("Press")
+        info = next(self.ui.walk(target))[1]
+        target.state_set.values["focused"] = True
+        result = self.ui.act(target, info, "press", {})
+        self.assertFalse(info["states"]["focused"])
+        self.assertTrue(result["states"]["focused"])
+        target.action.do_action.assert_called_once_with(0)
+
     def test_false_action_result_reported(self):
         self.node.action = action("press", accepted=False)
         with self.assertRaisesRegex(ui.UIError, "returned false"):
@@ -210,21 +285,7 @@ class ActionTests(unittest.TestCase):
 
 class DeadlineTests(unittest.TestCase):
     def test_wait_invalidates_cached_hidden_state_between_polls(self):
-        class CachedNode(Node):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.cached_states = None
-
-            def get_state_set(self):
-                if self.cached_states is None:
-                    self.cached_states = FakeStates(**self.state_set.values)
-                return self.cached_states
-
-            def clear_cache(self):
-                super().clear_cache()
-                self.cached_states = None
-
-        retry = CachedNode("Retry", showing=False)
+        retry = CachedStatesNode("Retry", showing=False)
         root = Node("app", children=[retry])
         atspi = fake_atspi([root])
         args = {

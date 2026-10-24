@@ -164,15 +164,22 @@ class UI:
             "editable": node.get_editable_text_iface() is not None,
         }
 
-    def act(self, node, info, command, args):
+    def guard_action(self, node, info):
+        node.clear_cache()
+        info = {**info, "states": self.states(node)}
         if not info["states"]["showing"]:
             raise UIError("Refusing to act on a control that is not showing.")
         if not info["states"]["enabled"] or not info["states"]["sensitive"]:
             raise UIError("Refusing to act on a disabled or insensitive control.")
+        return info
+
+    def act(self, node, info, command, args):
+        info = self.guard_action(node, info)
         if command == "edit":
             editable = node.get_editable_text_iface()
             if editable is None:
                 raise UIError("Control does not expose the AT-SPI EditableText interface.")
+            info = self.guard_action(node, info)
             if not editable.set_text_contents(args["text"]):
                 raise UIError("AT-SPI EditableText rejected set_text_contents.")
             return {**info, "operation": "set_text_contents", "success": True}
@@ -194,6 +201,7 @@ class UI:
                 "Use invoke --action with an exact advertised action name."
             )
         index = candidates[0]
+        info = self.guard_action(node, info)
         if not action.do_action(index):
             raise UIError(f"AT-SPI action {names[index]!r} returned false.")
         return {**info, "operation": names[index], "success": True}
