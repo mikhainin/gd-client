@@ -29,10 +29,14 @@ uv pip install --python "$VENV_DIR/bin/python" \
 mkdir -p .scancode
 
 echo "--- Scanning repository source for embedded licenses/copyrights ---"
+ROOT_NAME=$(basename "$PWD")
 "$VENV_DIR/bin/scancode" \
   --license --copyright --info \
-  --ignore "target/*" --ignore "$VENV_DIR/*" --ignore ".scancode/*" --ignore "Cargo.lock" \
+  --ignore "*" \
+  --include "$ROOT_NAME/crates/*" --include "$ROOT_NAME/scripts/*" \
+  --include "$ROOT_NAME/Cargo.toml" --include "$ROOT_NAME/AGENTS.md" \
+  --include "$ROOT_NAME/README.md" \
   --json-pp .scancode/scancode-report.json \
-  crates/ scripts/ Cargo.toml AGENTS.md README.md "$@"
+  . "$@"
 
 echo "--- Report written to .scancode/scancode-report.json ---"

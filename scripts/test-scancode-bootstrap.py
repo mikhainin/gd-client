@@ -144,9 +144,15 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         arguments = (self.root / "scan-args").read_text().splitlines()
         self.assertEqual(arguments[:3], ["--license", "--copyright", "--info"])
-        self.assertEqual(arguments[-7:], [
-            "crates/", "scripts/", "Cargo.toml", "AGENTS.md", "README.md",
-            "--ignore", "folder with spaces/*",
+        self.assertEqual(arguments[-3:], [".", "--ignore", "folder with spaces/*"])
+        includes = [
+            arguments[index + 1] for index, argument in enumerate(arguments)
+            if argument == "--include"
+        ]
+        self.assertEqual(includes, [
+            f"{self.root.name}/crates/*", f"{self.root.name}/scripts/*",
+            f"{self.root.name}/Cargo.toml", f"{self.root.name}/AGENTS.md",
+            f"{self.root.name}/README.md",
         ])
 
     def test_requirements_pin_the_verified_compatible_plugin_set(self):
