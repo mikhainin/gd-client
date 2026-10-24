@@ -196,6 +196,7 @@ class ReportTests(unittest.TestCase):
     def test_scan_errors_and_incomplete_reports_fail(self):
         for report in (
             {}, {"headers": [{"errors": ["failed"]}], "files": []},
+            {"headers": [{}], "files": []},
             {"headers": [{}], "files": [{"path": "x", "scan_errors": ["failed"]}]},
         ):
             with self.assertRaises(ValueError):

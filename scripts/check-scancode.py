@@ -19,6 +19,8 @@ def unexpected_files(report, root_name):
         raise ValueError("ScanCode report is missing headers or files")
     if any(header.get("errors") for header in report["headers"]):
         raise ValueError("ScanCode reported scan errors")
+    if not any(entry.get("type") == "file" for entry in report["files"]):
+        raise ValueError("ScanCode report contains no scanned files")
     hits = []
     for entry in report["files"]:
         if entry.get("scan_errors"):
