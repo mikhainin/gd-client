@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+skill_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+case "${1:-}" in
+    --worker)
+        echo "The internal worker is not a public command; use the bounded UI commands." >&2
+        exit 2
+        ;;
+    smoke)
+        shift
+        exec /usr/bin/python3 -B "$skill_dir/smoke.py" "$@"
+        ;;
+    test)
+        shift
+        if [ "$#" -ne 0 ]; then
+            echo "Usage: $0 test (runs only this skill's tests)" >&2
+            exit 2
+        fi
+        exec /usr/bin/python3 -B -m unittest discover \
+            -s "$skill_dir" -p 'test_*.py'
+        ;;
+    qml-test)
+        shift
+        if [ "$#" -ne 0 ]; then
+            echo "Usage: $0 qml-test (runs only this skill's QML fixture)" >&2
+            exit 2
+        fi
+        for runner in /usr/lib/qt6/bin/qmltestrunner /usr/lib64/qt6/bin/qmltestrunner; do
+            if [ -x "$runner" ]; then
+                exec env QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+                    QT_QUICK_CONTROLS_STYLE=Fusion \
+                    "$runner" -input "$skill_dir/tests/qml"
+            fi
+        done
+        echo "Qt 6 qmltestrunner is missing. Ask the user to install their distro's Qt 6 test tools." >&2
+        echo "Debian/Ubuntu user-run command: sudo apt install qt6-declarative-dev-tools qml6-module-qttest" >&2
+        exit 2
+        ;;
+    --help|-h)
+        printf '%s\n' \
+            "Dedicated Qt UI-testing entry point." \
+            "Additional commands: smoke --pid PID, test, qml-test" \
+            "All other arguments are passed to the bounded AT-SPI helper:" ""
+        exec /usr/bin/python3 -B "$skill_dir/atspi_ui.py" --help
+        ;;
+    *)
+        exec /usr/bin/python3 -B "$skill_dir/atspi_ui.py" "$@"
+        ;;
+esac
