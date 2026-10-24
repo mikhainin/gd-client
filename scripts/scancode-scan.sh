@@ -15,20 +15,27 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 VENV_DIR=".venv-scancode"
+export UV_HTTP_TIMEOUT=30
 
-if [ ! -x "$VENV_DIR/bin/scancode" ]; then
+if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "--- Setting up ScanCode Toolkit in $VENV_DIR ---"
   uv venv "$VENV_DIR" --python 3.12
-  uv pip install --python "$VENV_DIR" scancode-toolkit
 fi
+
+echo "--- Ensuring compatible ScanCode dependencies ---"
+uv pip install --python "$VENV_DIR/bin/python" \
+  --requirement scripts/scancode-requirements.txt
 
 mkdir -p .scancode
 
 echo "--- Scanning repository source for embedded licenses/copyrights ---"
+ROOT_NAME=$(basename "$PWD")
 "$VENV_DIR/bin/scancode" \
   --license --copyright --info \
-  --ignore "target/*" --ignore "$VENV_DIR/*" --ignore ".scancode/*" --ignore "Cargo.lock" \
+  --include "$ROOT_NAME/crates/*" --include "$ROOT_NAME/scripts/*" \
+  --include "$ROOT_NAME/Cargo.toml" --include "$ROOT_NAME/AGENTS.md" \
+  --include "$ROOT_NAME/README.md" \
   --json-pp .scancode/scancode-report.json \
-  crates/ scripts/ Cargo.toml AGENTS.md README.md "$@"
+  . "$@"
 
 echo "--- Report written to .scancode/scancode-report.json ---"
