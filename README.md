@@ -122,3 +122,18 @@ Dependency licenses are checked with [`cargo-deny`](https://github.com/EmbarkStu
 is scanned for embedded license/copyright text with
 [`scripts/scancode-scan.sh`](scripts/scancode-scan.sh) (ScanCode Toolkit).
 Both run in CI on every push/PR — see [`AGENTS.md`](AGENTS.md#license-compliance-tooling).
+
+ScanCode's tested compatibility versions are pinned in
+[`scripts/scancode-requirements.txt`](scripts/scancode-requirements.txt).
+Plugincode 32 uses class-marked hooks that Pluggy 1.7 no longer discovers,
+so this scanner uses Pluggy 1.6. The bootstrap checks these requirements on
+every invocation, repairing incompatible existing `.venv-scancode`
+environments as well as setting up fresh ones. Running the scan script can
+install or change packages inside that venv; agents must ask the user to
+perform any needed local installation rather than doing it themselves.
+The bootstrap's offline regression tests use a fake installer and scanner:
+`./scripts/test-scancode-bootstrap.py`.
+The report checker fails on scan errors and unexpected source notices. Its
+path-specific baseline in `.github/scancode-policy.json` recognizes only the project's own license mentions and
+the two Debian package manifests' license-file/copyright metadata; it does not
+globally exempt source files or third-party copyrights.

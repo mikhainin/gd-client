@@ -15,12 +15,16 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 VENV_DIR=".venv-scancode"
+export UV_HTTP_TIMEOUT=30
 
-if [ ! -x "$VENV_DIR/bin/scancode" ]; then
+if [ ! -x "$VENV_DIR/bin/python" ]; then
   echo "--- Setting up ScanCode Toolkit in $VENV_DIR ---"
   uv venv "$VENV_DIR" --python 3.12
-  uv pip install --python "$VENV_DIR" scancode-toolkit
 fi
+
+echo "--- Ensuring compatible ScanCode dependencies ---"
+uv pip install --python "$VENV_DIR/bin/python" \
+  --requirement scripts/scancode-requirements.txt
 
 mkdir -p .scancode
 
