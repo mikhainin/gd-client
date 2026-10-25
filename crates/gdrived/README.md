@@ -86,16 +86,28 @@ Run it with:
 cargo run -p gdrived
 ```
 
-Set `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` in the environment beforehand
-so the interactive OAuth flow can run on first use (see
-[`gdrive-sync`'s auth module](../gdrive-sync/src/auth.rs)).
+Unless the binary includes a default OAuth client, set both
+`GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` in the environment beforehand.
+They are needed for sign-in and token refresh. A complete runtime pair
+overrides defaults compiled using `GDRIVE_BUILD_CLIENT_ID` and
+`GDRIVE_BUILD_CLIENT_SECRET`; a partial pair does not. See the
+[workspace OAuth setup](../../README.md#oauth-client-configuration).
+Starting the daemon does not open a browser: click **Sign in** in the UI
+or call `SignIn` over D-Bus.
 
-When installed as a package, `gdrived` normally isn't launched from your
-shell - it's started on demand by D-Bus/systemd activation (see
-`packaging/gdrived.service` and `packaging/org.gclient.GDrive1.service`),
-which does **not** inherit your shell's exported environment variables.
-For sign-in to work from `gdrive-ui` in that case, put your credentials in
-`~/.config/gdrived/env` (create the file and directory if needed):
+## Packaged (systemd/D-Bus-activated) daemon
+
+When installed from the `.deb`, `gdrived` is started via D-Bus activation
+([`org.gclient.GDrive1.service`](../../packaging/org.gclient.GDrive1.service),
+which has `SystemdService=gdrived.service`) or the
+[systemd user unit](../../packaging/gdrived.service) directly.
+Activation normally does not inherit the invoking shell's exported
+environment variables. If the binary has no embedded OAuth client, or to
+override it, put both credentials in `~/.config/gdrived/env`. The unit
+references this optional file via `EnvironmentFile=-%h/.config/gdrived/env`;
+its location does not follow `XDG_CONFIG_HOME`.
+
+Create the file and directory if needed, replacing the placeholders:
 
 ```sh
 mkdir -p ~/.config/gdrived
@@ -106,19 +118,6 @@ EOF
 chmod 600 ~/.config/gdrived/env
 systemctl --user restart gdrived.service
 ```
-## Packaged (systemd/D-Bus-activated) daemon
-
-When installed from the `.deb`, `gdrived` is started via D-Bus activation
-(`packaging/org.gclient.GDrive1.service`, which has
-`SystemdService=gdrived.service` so activation routes through the systemd
-user unit rather than a bare `Exec=`) or the systemd user unit directly
-(`packaging/gdrived.service`). Such activation does not inherit the
-invoking user's exported shell environment variables, so
-`GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` set in e.g. `~/.bashrc` are not
-visible to it. To override OAuth credentials for the packaged daemon, set
-them in `~/.config/gdrived/env` (referenced via
-`EnvironmentFile=-%h/.config/gdrived/env` in `gdrived.service`; the leading
-`-` makes the file optional).
 
 Query it directly without the UI, e.g.:
 
