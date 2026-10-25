@@ -86,14 +86,27 @@ Run it with:
 cargo run -p gdrived
 ```
 
+## OAuth client configuration
+
+Create a Google Cloud OAuth client of type **Desktop app** in a project
+with the Google Drive API enabled. The app requests full Drive access
+(`https://www.googleapis.com/auth/drive`).
+
 Unless the binary includes a default OAuth client, set both
 `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` in the environment beforehand.
 They are needed for sign-in and token refresh. A complete runtime pair
 overrides defaults compiled using `GDRIVE_BUILD_CLIENT_ID` and
-`GDRIVE_BUILD_CLIENT_SECRET`; a partial pair does not. See the
-[workspace OAuth setup](../../README.md#oauth-client-configuration).
+`GDRIVE_BUILD_CLIENT_SECRET`; a partial pair does not.
+
+Packagers must set both build-time variables before compilation, such as
+`cargo build` or `make deb`. With `cargo deb --no-build`, credentials must
+already be in the compiled binary. This uses installed-application OAuth
+with PKCE: the embedded client secret is not confidential. Embedded
+credentials remove per-user client setup, not browser sign-in and consent.
+
 Starting the daemon does not open a browser: click **Sign in** in the UI
-or call `SignIn` over D-Bus.
+or call `SignIn` over D-Bus. The daemon opens the browser via `xdg-open` and
+receives the redirect on `127.0.0.1:8734`.
 
 ## Packaged (systemd/D-Bus-activated) daemon
 
