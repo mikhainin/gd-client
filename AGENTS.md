@@ -34,6 +34,8 @@ This is a Rust project.
 
 ## Verifying the Qt/QML UI visually
 
+- Use the repository's `.github/skills/gdrive-ui-testing` skill for semantic Qt UI interaction through AT-SPI and display-independent Qt Quick tests. Launch owned accessibility test instances with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; do not assume X11 is available or change real sync-folder settings during smoke tests.
+- If any testing tool or package is missing, give the user its exact installation command and wait for them to install it; do not install it yourself.
 - To screenshot the running `gdrive-ui` window, do not try to raise/focus it via `wmctrl`/`xdotool`/KWin scripting - just run `sleep 5 && spectacle -a -b -n -o /path/to/file.png` right after launching it, which captures the active window directly (`-a`), in the background (`-b`), with no capture-start sound (`-n`).
 
 ## License compliance tooling
@@ -41,4 +43,3 @@ This is a Rust project.
 - `deny.toml` configures `cargo-deny` (`cargo install cargo-deny`) to check dependency licenses (`cargo deny check licenses`), security advisories, banned/duplicate crates, and source registries (`cargo deny check`). The `[licenses.allow]` list must stay in sync with the workspace's own `license = "MIT OR Apache-2.0"` - only add an SPDX id there once you've confirmed it's compatible.
 - `scripts/scancode-scan.sh` runs ScanCode Toolkit (via a `uv`-managed venv in `.venv-scancode/`, gitignored) over our own source (not dependencies) to catch any embedded license text/copyright notices that might indicate copy-pasted code from an incompatibly-licensed project. Requires `uv` (`curl -LsSf https://astral.sh/uv/install.sh | sh`); the script bootstraps everything else itself. Output goes to `.scancode/scancode-report.json` (also gitignored).
 - Both checks run in CI via `.github/workflows/license-check.yml` on every push/PR.
-

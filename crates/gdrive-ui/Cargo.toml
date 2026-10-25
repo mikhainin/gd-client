@@ -28,6 +28,7 @@ assets = [
 
 [dependencies]
 gdrive-common = { workspace = true }
+tokio = { workspace = true }
 zbus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

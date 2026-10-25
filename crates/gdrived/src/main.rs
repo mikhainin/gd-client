@@ -56,7 +56,12 @@ async fn main() -> anyhow::Result<()> {
         engine.start_all(&config);
     }
 
-    let service = dbus_service::GDriveService::new(config, config_path, engine.clone());
+    let service = dbus_service::GDriveService::new(
+        config,
+        config_path,
+        auth::default_token_path()?,
+        engine.clone(),
+    );
 
     let _connection = zbus::connection::Builder::session()?
         .name(BUS_NAME)?

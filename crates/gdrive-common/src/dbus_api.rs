@@ -58,12 +58,18 @@ pub trait GDrive1 {
     /// Starts the interactive Google OAuth sign-in flow: opens the consent
     /// URL in the user's default browser and returns immediately (it does
     /// *not* wait for the flow to finish, since that can take an arbitrary
-    /// amount of time - poll [`Self::is_authenticated`] to detect
-    /// completion). Once signed in, all enabled sync folders are started.
+    /// amount of time). Successful completion emits
+    /// [`Self::authentication_changed`]. Once signed in, the currently enabled
+    /// sync folders are started.
     fn sign_in(&self) -> zbus::Result<()>;
 
     /// Forgets the cached OAuth token and stops all running sync folders.
     fn sign_out(&self) -> zbus::Result<()>;
+
+    /// Authentication changed after successful sign-in or sign-out.
+    /// Fetch [`Self::is_authenticated`] for initial state and after reconnecting.
+    #[zbus(signal)]
+    fn authentication_changed(&self, authenticated: bool) -> zbus::Result<()>;
 
     /// Lists the direct sub-folders of a Google Drive folder, for the
     /// "browse Drive folder" picker in the UI. Pass an empty string (or

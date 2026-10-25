@@ -123,6 +123,17 @@ pub async fn authenticate(
     token_path: &Path,
     show_auth_url: impl FnOnce(&str),
 ) -> Result<StoredToken, SyncError> {
+    let stored = authorize(config, show_auth_url).await?;
+    save_token(token_path, &stored)?;
+    Ok(stored)
+}
+
+/// Obtains tokens without persisting them, allowing the caller to coordinate
+/// persistence with cancellation and changes to its authentication state.
+pub async fn authorize(
+    config: &OAuthConfig,
+    show_auth_url: impl FnOnce(&str),
+) -> Result<StoredToken, SyncError> {
     let redirect_port = 8734;
     let redirect_url = format!("http://127.0.0.1:{redirect_port}");
 
@@ -168,7 +179,6 @@ pub async fn authenticate(
             .map(|d| now_unix_secs() + d.as_secs() as i64),
     };
 
-    save_token(token_path, &stored)?;
     Ok(stored)
 }
 

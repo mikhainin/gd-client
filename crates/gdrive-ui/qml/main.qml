@@ -73,12 +73,11 @@ ApplicationWindow {
 
     SyncManager {
         id: syncManager
-        Component.onCompleted: refresh()
+        Component.onCompleted: initialize()
     }
 
-    // Polls gdrived periodically so sign-in (completed asynchronously in a
-    // browser tab) and folder sync status changes are picked up without
-    // requiring the user to click "Refresh" manually.
+    // Polls folder status and provides an authentication fallback for older
+    // daemons; AuthenticationChanged normally updates sign-in state immediately.
     Timer {
         interval: 3000
         running: true
@@ -134,19 +133,24 @@ ApplicationWindow {
                 anchors.verticalCenter: parent.verticalCenter
             }
 
-            Button {
+            AccessibleButton {
                 text: syncManager.authenticated ? qsTr("Sign out") : qsTr("Sign in\u2026")
+                enabled: !syncManager.busy
                 anchors.verticalCenter: parent.verticalCenter
                 onClicked: syncManager.authenticated ? syncManager.signOut() : syncManager.signIn()
             }
 
-            Button {
+            AccessibleButton {
                 text: qsTr("Refresh")
+                enabled: !syncManager.busy && !syncManager.refreshing
                 onClicked: syncManager.refresh()
             }
 
-            Button {
+            AccessibleButton {
+                objectName: "addFolderButton"
                 text: qsTr("Add folder\u2026")
+                Accessible.name: qsTr("Add folder")
+                enabled: !syncManager.busy
                 onClicked: addDialog.open()
             }
         }
@@ -200,14 +204,17 @@ ApplicationWindow {
                         anchors.verticalCenter: parent.verticalCenter
                     }
 
-                    Switch {
-                        checked: modelData.enabled
+                    SyncFolderSwitch {
+                        enabled: !syncManager.busy
+                        Accessible.name: qsTr("Enable sync for %1").arg(modelData.displayName)
+                        backendChecked: modelData.enabled
                         anchors.verticalCenter: parent.verticalCenter
-                        onToggled: syncManager.setFolderEnabled(modelData.id, checked)
+                        onChangeRequested: desired => syncManager.setFolderEnabled(modelData.id, desired)
                     }
 
-                    Button {
+                    AccessibleButton {
                         text: qsTr("Remove")
+                        enabled: !syncManager.busy
                         anchors.verticalCenter: parent.verticalCenter
                         onClicked: syncManager.removeFolder(modelData.id)
                     }
@@ -233,6 +240,11 @@ ApplicationWindow {
         title: qsTr("Select local folder")
         modal: true
         standardButtons: Dialog.Cancel
+        footer: DialogButtonBox {
+            Accessible.role: Accessible.Grouping
+            Accessible.name: localFolderDialog.title
+            delegate: AccessibleButton {}
+        }
         anchors.centerIn: parent
         width: Math.min(420, root.width - 40)
         height: Math.min(460, root.height - 40)
@@ -271,7 +283,7 @@ ApplicationWindow {
                 width: parent.width
                 spacing: 4
 
-                Button {
+                AccessibleButton {
                     text: qsTr("\u2191 Up")
                     enabled: localFolderDialog.currentPath !== "/"
                     onClicked: localFolderDialog.goUp()
@@ -317,7 +329,7 @@ ApplicationWindow {
                     placeholderText: qsTr("New folder name")
                     onAccepted: createNewFolderButton.clicked()
                 }
-                Button {
+                AccessibleButton {
                     id: createNewFolderButton
                     text: qsTr("Create")
                     width: 84
@@ -331,14 +343,14 @@ ApplicationWindow {
                 }
             }
 
-            Button {
+            AccessibleButton {
                 width: parent.width
                 text: qsTr("New folder\u2026")
                 visible: !localFolderDialog.showNewFolderRow
                 onClicked: localFolderDialog.showNewFolderRow = true
             }
 
-            Button {
+            AccessibleButton {
                 width: parent.width
                 text: qsTr("Select this folder")
                 onClicked: {
@@ -349,106 +361,27 @@ ApplicationWindow {
         }
     }
 
-    Dialog {
+    DriveFolderDialog {
         id: driveFolderDialog
-        title: qsTr("Select Drive folder")
-        modal: true
-        standardButtons: Dialog.Cancel
+        backend: syncManager
         anchors.centerIn: parent
-        width: Math.min(420, root.width - 40)
-        height: Math.min(420, root.height - 40)
-
-        // Stack of {id, name} visited so far, for breadcrumb navigation and
-        // the "Select this folder" action; the last entry is the folder
-        // currently being browsed ("" id means "My Drive" root).
-        property var pathStack: [{ id: "", name: qsTr("My Drive") }]
-        property var entries: []
-
-        function currentFolder() {
-            return pathStack[pathStack.length - 1]
-        }
-
-        function load() {
-            var json = syncManager.listDriveFolders(currentFolder().id)
-            try {
-                entries = JSON.parse(json)
-            } catch (e) {
-                entries = []
-            }
-        }
-
-        function enterFolder(id, name) {
-            pathStack = pathStack.concat([{ id: id, name: name }])
-            load()
-        }
-
-        function goTo(index) {
-            pathStack = pathStack.slice(0, index + 1)
-            load()
-        }
-
-        onOpened: {
-            pathStack = [{ id: "", name: qsTr("My Drive") }]
-            load()
-        }
-
-        Column {
-            anchors.fill: parent
-            spacing: 6
-
-            Row {
-                width: parent.width
-                spacing: 4
-                Repeater {
-                    model: driveFolderDialog.pathStack
-                    delegate: Button {
-                        text: modelData.name
-                        flat: true
-                        onClicked: driveFolderDialog.goTo(index)
-                    }
-                }
-            }
-
-            ListView {
-                width: parent.width
-                height: parent.height - 90
-                clip: true
-                model: driveFolderDialog.entries
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn; width: 14 }
-
-                delegate: ItemDelegate {
-                    width: ListView.view.width
-                    text: modelData.name
-                    onClicked: driveFolderDialog.enterFolder(modelData.id, modelData.name)
-                }
-
-                Label {
-                    anchors.centerIn: parent
-                    visible: driveFolderDialog.entries.length === 0
-                    text: qsTr("No sub-folders here.")
-                    opacity: 0.6
-                }
-            }
-
-            Button {
-                width: parent.width
-                text: qsTr("Select \"%1\"").arg(driveFolderDialog.currentFolder().name)
-                onClicked: {
-                    driveFolderPathField.text = qsTr("Selected: %1").arg(
-                        driveFolderDialog.pathStack.map(function (entry) {
-                            return entry.name
-                        }).join(" / "))
-                    driveFolderDialog.close()
-                }
-            }
+        onFolderSelected: (folderId, folderPath) => {
+            driveFolderIdField.text = folderId
+            driveFolderPathField.text = qsTr("Selected: %1").arg(folderPath)
         }
     }
 
     Dialog {
         id: addDialog
+        objectName: "addFolderDialog"
         title: qsTr("Add sync folder")
         modal: true
         standardButtons: Dialog.Ok | Dialog.Cancel
+        footer: DialogButtonBox {
+            Accessible.role: Accessible.Grouping
+            Accessible.name: addDialog.title
+            delegate: AccessibleButton {}
+        }
         anchors.centerIn: parent
         width: Math.min(420, root.width - 40)
 
@@ -467,11 +400,13 @@ ApplicationWindow {
         }
 
         Column {
+            Accessible.role: Accessible.Dialog
+            Accessible.name: addDialog.title
             width: parent.width
             spacing: 6
 
             Label { text: qsTr("Display name") }
-            TextField { id: displayNameField; width: parent.width }
+            TextField { id: displayNameField; width: parent.width; Accessible.name: qsTr("Display name") }
 
             Label { text: qsTr("Drive folder id (leave empty for \"My Drive\" root)") }
             Row {
@@ -479,12 +414,20 @@ ApplicationWindow {
                 spacing: 6
                 TextField {
                     id: driveFolderIdField
+                    objectName: "driveFolderIdField"
+                    Accessible.name: qsTr("Drive folder id")
                     width: parent.width - 90
                     // Manual edits invalidate the last picked path preview
                     // (the dialog re-sets it right after this, for picks).
                     onTextChanged: driveFolderPathField.text = ""
                 }
-                Button { text: qsTr("Browse\u2026"); width: 84; onClicked: driveFolderDialog.open() }
+                AccessibleButton {
+                    objectName: "browseDriveFoldersButton"
+                    text: qsTr("Browse\u2026")
+                    Accessible.name: qsTr("Browse Drive folders")
+                    width: 84
+                    onClicked: driveFolderDialog.open()
+                }
             }
             Label {
                 id: driveFolderPathField
@@ -504,10 +447,11 @@ ApplicationWindow {
                 spacing: 6
                 TextField {
                     id: localPathField
+                    Accessible.name: qsTr("Local path")
                     width: parent.width - 90
                     placeholderText: qsTr("/home/user/GoogleDrive/Folder")
                 }
-                Button {
+                AccessibleButton {
                     text: qsTr("Browse\u2026")
                     width: 84
                     onClicked: {
@@ -527,11 +471,10 @@ ApplicationWindow {
             }
 
             Label { text: qsTr("Owner user (optional)") }
-            TextField { id: ownerUserField; width: parent.width }
+            TextField { id: ownerUserField; width: parent.width; Accessible.name: qsTr("Owner user") }
 
             Label { text: qsTr("Owner group (optional)") }
-            TextField { id: ownerGroupField; width: parent.width }
+            TextField { id: ownerGroupField; width: parent.width; Accessible.name: qsTr("Owner group") }
         }
     }
 }
-
