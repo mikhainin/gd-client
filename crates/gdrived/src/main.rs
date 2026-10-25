@@ -55,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(token) = cached_token {
         engine.restore_token(token, auth::default_token_path()?);
     }
+    let mut events = engine.subscribe();
+    let status_changes = engine.subscribe_status();
     if authenticated {
         engine.start_all(&config);
     }
@@ -66,24 +68,35 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
     );
 
-    let _connection = zbus::connection::Builder::session()?
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, service)?
-        .build()
-        .await?;
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        zbus::connection::Builder::session()
+            .method_timeout(std::time::Duration::from_secs(5))
+            .name(BUS_NAME)
+            .serve_at(OBJECT_PATH, service)
+            .build(),
+    )
+    .await??;
     tracing::info!(
         bus_name = BUS_NAME,
         object_path = OBJECT_PATH,
         "D-Bus service ready"
     );
 
-    // Log sync events for now; a future revision can forward these as D-Bus
-    // signals (see dbus_service.rs) once the UI needs live progress updates
-    // rather than polling ListSyncFolders.
-    let mut events = engine.subscribe();
+    tokio::spawn(dbus_service::GDriveService::forward_status(
+        connection.clone(),
+        status_changes,
+    ));
     tokio::spawn(async move {
-        while let Ok(event) = events.recv().await {
-            tracing::info!(?event, "sync event");
+        loop {
+            match events.recv().await {
+                Ok(event) => tracing::info!(?event, "sync event"),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => tracing::warn!(
+                    count,
+                    "sync log events skipped; current status remains available"
+                ),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 

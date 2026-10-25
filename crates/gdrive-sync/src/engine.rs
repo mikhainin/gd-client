@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,7 @@ use crate::error::SyncError;
 use crate::local_watcher::{LocalChange, LocalWatcher};
 use crate::ownership::{apply_ownership, resolve_owner};
 use crate::state_db::{FileStateEntry, StateDb};
+use crate::sync_status::{FolderRun, StatusTracker};
 
 /// Status/progress events the engine emits, consumed by the D-Bus service
 /// layer in `gdrived` to report state to the Qt UI.
@@ -61,6 +63,8 @@ pub struct SyncEngine {
     drive: Arc<DriveClient>,
     events: broadcast::Sender<SyncEvent>,
     tasks: Arc<Mutex<HashMap<Uuid, JoinHandle<()>>>>,
+    status: StatusTracker,
+    generation: Arc<AtomicU64>,
 }
 
 impl SyncEngine {
@@ -72,11 +76,21 @@ impl SyncEngine {
             drive: Arc::new(DriveClient::new(access_token)),
             events,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            status: StatusTracker::default(),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SyncEvent> {
         self.events.subscribe()
+    }
+
+    pub fn sync_status(&self) -> gdrive_common::dbus_api::SyncStatus {
+        self.status.snapshot()
+    }
+
+    pub fn subscribe_status(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.status.subscribe()
     }
 
     /// Replaces a bare Drive API access token and discards refresh metadata.
@@ -117,13 +131,18 @@ impl SyncEngine {
     /// its previous task so there's never more than one watcher/poller per
     /// folder id.
     pub fn start_folder(&self, folder: SyncFolder) {
-        self.stop_folder(folder.id);
+        let mut tasks = self.tasks.lock().unwrap();
+        if let Some(previous) = tasks.remove(&folder.id) {
+            previous.abort();
+        }
 
         let state_db = Arc::clone(&self.state_db);
         let drive = Arc::clone(&self.drive);
         let events = self.events.clone();
         let poll_interval = Duration::from_secs(self.poll_interval_secs.max(5));
         let folder_id = folder.id;
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        let run = self.status.start(folder_id, generation);
 
         let handle = tokio::spawn(async move {
             if let Err(err) = run_folder(
@@ -132,9 +151,11 @@ impl SyncEngine {
                 drive,
                 events.clone(),
                 poll_interval,
+                &run,
             )
             .await
             {
+                run.finish("initial sync", Err(err.to_string()));
                 let _ = events.send(SyncEvent::Error {
                     folder_id: Some(folder.id),
                     message: err.to_string(),
@@ -142,20 +163,28 @@ impl SyncEngine {
             }
         });
 
-        self.tasks.lock().unwrap().insert(folder_id, handle);
+        tasks.insert(folder_id, handle);
     }
 
     /// Stops the background task synchronising `folder_id`, if one is running.
     /// A no-op if the folder was never started or was already stopped.
     pub fn stop_folder(&self, folder_id: Uuid) {
-        if let Some(handle) = self.tasks.lock().unwrap().remove(&folder_id) {
+        let mut tasks = self.tasks.lock().unwrap();
+        if let Some(handle) = tasks.remove(&folder_id) {
             handle.abort();
         }
+        self.status.stop(folder_id);
     }
 
     /// Returns the ids of all folders currently being synchronised.
     pub fn running_folders(&self) -> Vec<Uuid> {
-        self.tasks.lock().unwrap().keys().copied().collect()
+        self.tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, task)| !task.is_finished())
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Starts every enabled folder in `config` concurrently. Intended for
@@ -174,6 +203,7 @@ async fn run_folder(
     drive: Arc<DriveClient>,
     events: broadcast::Sender<SyncEvent>,
     poll_interval: Duration,
+    status: &FolderRun,
 ) -> Result<(), SyncError> {
     let _ = events.send(SyncEvent::FolderStarted {
         folder_id: folder.id,
@@ -211,20 +241,29 @@ async fn run_folder(
     // 2. Watch local changes and push them to Drive.
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<LocalChange>();
     let _watcher = LocalWatcher::watch(&folder.local_path, local_tx)?;
+    status.finish("initial sync", Ok(()));
 
     let mut poll_timer = tokio::time::interval(poll_interval);
 
     loop {
         tokio::select! {
             Some(change) = local_rx.recv() => {
-                if let Err(err) = handle_local_change(&folder, &drive, &state_db, &root_folder_id, &change, owner_uid, owner_gid).await {
+                let work = format!("local {}", change.path.strip_prefix(&folder.local_path).unwrap_or(&change.path).display());
+                let result = handle_local_change(&folder, &drive, &state_db, &root_folder_id, &change, owner_uid, owner_gid, status).await;
+                if matches!(result, Ok(false)) {
+                    continue;
+                }
+                status.finish(&work, result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                if let Err(err) = result {
                     let _ = events.send(SyncEvent::Error { folder_id: Some(folder.id), message: err.to_string() });
                     continue;
                 }
                 let _ = events.send(SyncEvent::LocalChangeUploaded { folder_id: folder.id, path: change.path });
             }
             _ = poll_timer.tick() => {
-                if let Err(err) = poll_remote_changes(&folder, &drive, &state_db, owner_uid, owner_gid, &events).await {
+                let result = poll_remote_changes(&folder, &drive, &state_db, owner_uid, owner_gid, &events, status).await;
+                status.finish("remote changes", result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                if let Err(err) = result {
                     let _ = events.send(SyncEvent::Error { folder_id: Some(folder.id), message: err.to_string() });
                 }
             }
@@ -317,21 +356,23 @@ async fn handle_local_change(
     change: &LocalChange,
     owner_uid: nix::unistd::Uid,
     owner_gid: nix::unistd::Gid,
-) -> Result<(), SyncError> {
+    status: &FolderRun,
+) -> Result<bool, SyncError> {
     use crate::local_watcher::LocalChangeKind;
 
     let Ok(rel_path) = change.path.strip_prefix(&folder.local_path) else {
-        return Ok(());
+        return Ok(false);
     };
     let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
     if rel_path_str.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     match change.kind {
         LocalChangeKind::Removed => {
             if let Some(existing) = find_local_state(state_db, folder.id, &rel_path_str)? {
                 if let Some(drive_id) = existing.drive_file_id {
+                    status.active();
                     drive.delete_file(&drive_id).await?;
                 }
                 state_db.remove_file_state(folder.id, &rel_path_str)?;
@@ -340,7 +381,16 @@ async fn handle_local_change(
         LocalChangeKind::Created | LocalChangeKind::Modified | LocalChangeKind::Other => {
             let metadata = match tokio::fs::metadata(&change.path).await {
                 Ok(m) => m,
-                Err(_) => return Ok(()), // Path disappeared again (e.g. temp file); nothing to do.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if find_local_state(state_db, folder.id, &rel_path_str)?
+                        .and_then(|entry| entry.drive_file_id)
+                        .is_none()
+                    {
+                        status.clear_error(&format!("local {}", rel_path.display()));
+                    }
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
             };
 
             if metadata.is_dir() {
@@ -352,10 +402,11 @@ async fn handle_local_change(
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
+                    status.active();
                     let created = drive.create_folder(&name, &parent_drive_id).await?;
                     record_state(folder.id, state_db, &rel_path_str, &created, true)?;
                 }
-                return Ok(());
+                return Ok(true);
             }
 
             let content = tokio::fs::read(&change.path).await?;
@@ -369,6 +420,7 @@ async fn handle_local_change(
             let parent_drive_id =
                 parent_drive_folder_id(folder, state_db, root_folder_id, rel_path)?;
 
+            status.active();
             let uploaded = drive
                 .upload_file(
                     existing.as_ref().and_then(|e| e.drive_file_id.as_deref()),
@@ -381,7 +433,7 @@ async fn handle_local_change(
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn find_local_state(
@@ -424,6 +476,7 @@ async fn poll_remote_changes(
     owner_uid: nix::unistd::Uid,
     owner_gid: nix::unistd::Gid,
     events: &broadcast::Sender<SyncEvent>,
+    status: &FolderRun,
 ) -> Result<(), SyncError> {
     let Some(page_token) = state_db.get_page_token(folder.id)? else {
         return Ok(());
@@ -443,11 +496,12 @@ async fn poll_remote_changes(
         let local_path = folder.local_path.join(&existing.local_rel_path);
 
         if change.removed || change.file.as_ref().map(|f| f.trashed).unwrap_or(true) {
+            status.active();
             if local_path.exists() {
                 if existing.is_folder {
-                    tokio::fs::remove_dir_all(&local_path).await.ok();
+                    tokio::fs::remove_dir_all(&local_path).await?;
                 } else {
-                    tokio::fs::remove_file(&local_path).await.ok();
+                    tokio::fs::remove_file(&local_path).await?;
                 }
             }
             state_db.remove_file_state(folder.id, &existing.local_rel_path)?;
@@ -458,6 +512,7 @@ async fn poll_remote_changes(
             if remote_file.md5_checksum.as_deref() == existing.md5_checksum.as_deref() {
                 continue; // Unchanged content, e.g. a metadata-only update.
             }
+            status.active();
             let content = drive.download_file(&remote_file.id).await?;
             tokio::fs::write(&local_path, &content).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
@@ -484,4 +539,155 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fatal_initial_failure_is_reported_and_stop_restart_clear_it() {
+        let root = std::env::temp_dir().join(format!("gclient-status-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let path = root.join("not-a-directory");
+        tokio::fs::write(&path, b"fixture").await.unwrap();
+        let folder = SyncFolder::new("fixture", path, "", "");
+        let engine = SyncEngine::new(
+            AppConfig::default(),
+            StateDb::open(&root.join("state.sqlite")).unwrap(),
+            String::new(),
+        );
+        let mut changes = engine.subscribe_status();
+        engine.start_folder(folder.clone());
+        assert!(engine.sync_status().folders[0].syncing);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.sync_status().folders[0].errors.is_empty() {
+                changes.changed().await.unwrap();
+            }
+            while !engine.running_folders().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = engine.sync_status();
+        assert!(!status.folders[0].syncing);
+        assert!(status.folders[0].errors[0].contains("initial sync"));
+        engine.start_folder(folder.clone());
+        assert!(engine.sync_status().folders[0].errors.is_empty());
+        engine.stop_folder(folder.id);
+        tokio::task::yield_now().await;
+        assert!(engine.sync_status().folders.is_empty());
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vanished_rename_sources_clear_only_untracked_work_errors() {
+        let root = std::env::temp_dir().join(format!("gclient-rename-{}", Uuid::new_v4()));
+        let db = StateDb::open(&root.join("state.sqlite")).unwrap();
+        let folder = SyncFolder::new("fixture", root.join("files"), "", "");
+        tokio::fs::create_dir(&folder.local_path).await.unwrap();
+        let drive = DriveClient::new(String::new());
+
+        for (name, tracked) in [("untracked.txt", false), ("tracked.txt", true)] {
+            let source = folder.local_path.join(name);
+            tokio::fs::write(&source, b"fixture").await.unwrap();
+            if tracked {
+                db.upsert_file_state(&FileStateEntry {
+                    sync_folder_id: folder.id,
+                    local_rel_path: name.into(),
+                    drive_file_id: Some("remote-file".into()),
+                    is_folder: false,
+                    local_mtime_secs: None,
+                    drive_modified_time: None,
+                    md5_checksum: None,
+                })
+                .unwrap();
+            }
+            let tracker = StatusTracker::default();
+            let status = tracker.start(folder.id, 1);
+            let work = format!("local {name}");
+            status.finish(&work, Err("upload failed".into()));
+            status.finish("local unrelated.txt", Err("another failure".into()));
+            let renamed = format!("renamed-{name}");
+            tokio::fs::rename(&source, folder.local_path.join(&renamed))
+                .await
+                .unwrap();
+            let change = LocalChange {
+                path: source,
+                kind: crate::local_watcher::LocalChangeKind::Modified,
+            };
+            assert!(!handle_local_change(
+                &folder,
+                &drive,
+                &db,
+                "root",
+                &change,
+                nix::unistd::Uid::current(),
+                nix::unistd::Gid::current(),
+                &status,
+            )
+            .await
+            .unwrap());
+            status.finish(&format!("local {renamed}"), Ok(()));
+            let snapshot = tracker.snapshot();
+            let errors = &snapshot.folders[0].errors;
+            assert_eq!(
+                errors.iter().any(|error| error.starts_with(&work)),
+                tracked,
+                "a vanished source only retains work with a pending remote deletion"
+            );
+            assert!(errors
+                .iter()
+                .any(|error| error.starts_with("local unrelated.txt:")));
+            assert!(!snapshot.folders[0].syncing);
+        }
+
+        drop(db);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_poll_and_disappeared_local_file_never_start_activity() {
+        let root = std::env::temp_dir().join(format!("gclient-idle-{}", Uuid::new_v4()));
+        let db = StateDb::open(&root.join("state.sqlite")).unwrap();
+        let folder = SyncFolder::new("fixture", root.join("files"), "", "");
+        let drive = DriveClient::new(String::new());
+        let tracker = StatusTracker::default();
+        let status = tracker.start(folder.id, 1);
+        status.finish("initial sync", Ok(()));
+        let before = tracker.snapshot();
+        let (events, _) = broadcast::channel(1);
+        poll_remote_changes(
+            &folder,
+            &drive,
+            &db,
+            nix::unistd::Uid::current(),
+            nix::unistd::Gid::current(),
+            &events,
+            &status,
+        )
+        .await
+        .unwrap();
+        let change = LocalChange {
+            path: folder.local_path.join("vanished"),
+            kind: crate::local_watcher::LocalChangeKind::Modified,
+        };
+        assert!(!handle_local_change(
+            &folder,
+            &drive,
+            &db,
+            "root",
+            &change,
+            nix::unistd::Uid::current(),
+            nix::unistd::Gid::current(),
+            &status,
+        )
+        .await
+        .unwrap());
+        assert_eq!(tracker.snapshot(), before);
+        drop(db);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 }

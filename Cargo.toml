@@ -10,20 +10,19 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 authors = ["g-client contributors"]
 repository = "https://github.com/mikhainin/g-client"
 
 # Centralized dependency versions. Keep these in sync with the latest stable
 # releases on crates.io (see AGENTS.md: "Dependency management"). Do not
-# downgrade a version listed here without an explicit decision recorded in
-# AGENTS.md's Change Log.
+# downgrade a version listed here without explicit user approval.
 [workspace.dependencies]
 gdrive-common = { path = "crates/gdrive-common" }
 gdrive-sync = { path = "crates/gdrive-sync" }
 
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
 oauth2 = { version = "5.0.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -40,7 +39,7 @@ notify = { version = "8.2.0" }
 bytes = { version = "1.12.1" }
 nix = { version = "0.31.3", features = ["user"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-zbus = { version = "5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
+zbus = { version = "6.1.0", default-features = false, features = ["tokio", "proxy", "service", "tracing"] }
 libc = { version = "0.2.189" }
 
 cxx = { version = "1.0" }

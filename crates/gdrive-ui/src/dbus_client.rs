@@ -4,11 +4,10 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use gdrive_common::dbus_api::{DriveFolderRow, GDrive1Proxy, SyncFolderRow};
+use gdrive_common::dbus_api::{DriveFolderRow, GDrive1Proxy, SyncFolderRow, SyncStatus};
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 use zbus::export::futures_core::Stream;
-use zbus::proxy::CacheProperties;
 
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -44,6 +43,77 @@ pub enum AuthenticationEvent {
     Changed(bool),
 }
 
+#[derive(Debug)]
+pub enum SyncStatusEvent {
+    Snapshot(SyncStatus),
+    Unavailable(String),
+}
+
+pub async fn watch_sync_status(notify: impl Fn(SyncStatusEvent) + Send + Sync + 'static) {
+    loop {
+        if let Err(error) = sync_status_session(&notify).await {
+            tracing::warn!("sync status unavailable: {error}");
+            notify(SyncStatusEvent::Unavailable(error));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+async fn sync_status_session(notify: &(impl Fn(SyncStatusEvent) + Sync)) -> Result<(), String> {
+    let connection = bounded(CONTROL_TIMEOUT, connect(CONTROL_TIMEOUT)).await?;
+    let bus = bounded(CONTROL_TIMEOUT, zbus::fdo::DBusProxy::new(&connection)).await?;
+    let mut owners = bounded(
+        CONTROL_TIMEOUT,
+        bus.receive_name_owner_changed_with_args(&[(0, gdrive_common::dbus_api::BUS_NAME)]),
+    )
+    .await?;
+    let owner = bounded(CONTROL_TIMEOUT, async {
+        bus.get_name_owner(
+            gdrive_common::dbus_api::BUS_NAME
+                .try_into()
+                .expect("valid bus name"),
+        )
+        .await
+        .map_err(zbus::Error::from)
+    })
+    .await?;
+    // Bind to this unique owner: a restarted daemon's revision starts over.
+    let proxy = bounded(
+        CONTROL_TIMEOUT,
+        GDrive1Proxy::builder(&connection)
+            .destination(owner.as_str())
+            .build(),
+    )
+    .await?;
+    let mut signals = bounded(CONTROL_TIMEOUT, proxy.receive_sync_status_changed()).await?;
+    let mut poll = tokio::time::interval(Duration::from_secs(3));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await;
+    let mut revision = None;
+    loop {
+        let snapshot = tokio::select! {
+            biased;
+            _ = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) =>
+                return Err("daemon owner changed; reconnecting".into()),
+            result = bounded(CONTROL_TIMEOUT, proxy.sync_status()) => result?,
+        };
+        if revision.is_none_or(|last| snapshot.revision > last) {
+            revision = Some(snapshot.revision);
+            notify(SyncStatusEvent::Snapshot(snapshot));
+        }
+        tokio::select! {
+            biased;
+            _ = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) =>
+                return Err("daemon owner changed; reconnecting".into()),
+            signal = std::future::poll_fn(|cx| std::pin::Pin::new(&mut signals).poll_next(cx)) => {
+                let signal = signal.ok_or("sync status signal stream closed")?;
+                signal.args().map_err(|error| format!("invalid SyncStatusChanged signal: {error}"))?;
+            }
+            _ = poll.tick() => {}
+        }
+    }
+}
+
 pub async fn watch_authentication(notify: impl Fn(AuthenticationEvent) + Send + Sync + 'static) {
     loop {
         if let Err(error) = authentication_session(&notify).await {
@@ -57,19 +127,13 @@ async fn authentication_session(
     notify: &(impl Fn(AuthenticationEvent) + Sync),
 ) -> Result<(), String> {
     let connection = bounded(CONTROL_TIMEOUT, async {
-        zbus::connection::Builder::session()?
+        zbus::connection::Builder::session()
             .method_timeout(CONTROL_TIMEOUT)
             .build()
             .await
     })
     .await?;
-    let proxy = bounded(
-        CONTROL_TIMEOUT,
-        GDrive1Proxy::builder(&connection)
-            .cache_properties(CacheProperties::No)
-            .build(),
-    )
-    .await?;
+    let proxy = bounded(CONTROL_TIMEOUT, GDrive1Proxy::new(&connection)).await?;
     let bus = bounded(CONTROL_TIMEOUT, zbus::fdo::DBusProxy::new(&connection)).await?;
     let mut owners = bounded(
         CONTROL_TIMEOUT,
@@ -162,14 +226,7 @@ async fn execute_with_timeout(request: Request, deadline: Duration) -> Result<Re
     if matches!(request, Request::Refresh) {
         let end = tokio::time::Instant::now() + deadline;
         let connection = bounded_until(end, deadline, connect(deadline)).await?;
-        let proxy = bounded_until(
-            end,
-            deadline,
-            GDrive1Proxy::builder(&connection)
-                .cache_properties(CacheProperties::No)
-                .build(),
-        )
-        .await?;
+        let proxy = bounded_until(end, deadline, GDrive1Proxy::new(&connection)).await?;
         let rows = bounded_until(end, deadline, proxy.list_sync_folders()).await?;
         let authentication = bounded_until(end, deadline, proxy.is_authenticated()).await;
         return Ok(Response::Snapshot(rows, authentication));
@@ -201,7 +258,7 @@ async fn bounded_until<T>(
 }
 
 async fn connect(deadline: Duration) -> zbus::Result<zbus::Connection> {
-    zbus::connection::Builder::session()?
+    zbus::connection::Builder::session()
         .method_timeout(deadline)
         .build()
         .await
@@ -221,15 +278,12 @@ async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
                 &("org.freedesktop.appearance", "color-scheme"),
             )
             .await?;
-        let value: zbus::zvariant::OwnedValue = reply.body().deserialize()?;
-        let color_scheme: u32 = zbus::zvariant::Value::from(value).downcast()?;
+        let value: zbus::OwnedVariant = reply.body().deserialize()?;
+        let color_scheme: u32 = zbus::Variant::from(value).downcast()?;
         return Ok(Response::DarkMode(color_scheme == 1));
     }
 
-    let proxy = GDrive1Proxy::builder(&connection)
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await?;
+    let proxy = GDrive1Proxy::new(&connection).await?;
     match request {
         Request::Refresh => unreachable!("refresh handles partial results separately"),
         Request::AddFolder {
@@ -305,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_includes_a_stalled_connection_handshake() {
-        let (client, _stalled_server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, _stalled_server) = std::os::unix::net::UnixStream::pair().unwrap();
         let start = std::time::Instant::now();
         let error = bounded(
             Duration::from_millis(50),
@@ -318,6 +372,21 @@ mod tests {
     }
 
     struct SlowDaemon(Arc<AtomicBool>, Arc<AtomicU8>);
+
+    struct PortalSettings(Arc<AtomicU8>);
+
+    #[zbus::interface(name = "org.freedesktop.portal.Settings")]
+    impl PortalSettings {
+        async fn read(&self, namespace: &str, key: &str) -> zbus::OwnedVariant {
+            assert_eq!(namespace, "org.freedesktop.appearance");
+            assert_eq!(key, "color-scheme");
+            match self.0.load(Ordering::SeqCst) {
+                0 => 1u32.into(),
+                1 => 2u32.into(),
+                _ => true.into(),
+            }
+        }
+    }
 
     #[zbus::interface(name = "org.gclient.GDrive1")]
     impl SlowDaemon {
@@ -375,21 +444,28 @@ mod tests {
         assert_eq!(std::env::var("GDRIVE_UI_TEST_BUS").as_deref(), Ok("1"));
         let stall = Arc::new(AtomicBool::new(true));
         let auth_mode = Arc::new(AtomicU8::new(0));
+        let color_mode = Arc::new(AtomicU8::new(0));
         let _service = bounded(
             CONTROL_TIMEOUT,
             zbus::connection::Builder::session()
-                .unwrap()
                 .name(gdrive_common::dbus_api::BUS_NAME)
-                .unwrap()
+                .name("org.freedesktop.portal.Desktop")
                 .serve_at(
                     gdrive_common::dbus_api::OBJECT_PATH,
                     SlowDaemon(stall.clone(), auth_mode.clone()),
                 )
-                .unwrap()
+                .serve_at(
+                    "/org/freedesktop/portal/desktop",
+                    PortalSettings(color_mode.clone()),
+                )
                 .build(),
         )
         .await
         .unwrap();
+        let unavailable = sync_status_session(&|_| panic!("older daemon must not report idle"))
+            .await
+            .unwrap_err();
+        assert!(unavailable.contains("UnknownMethod"), "{unavailable}");
         let start = std::time::Instant::now();
         let (browse, refresh) = tokio::join!(
             execute_with_timeout(
@@ -414,6 +490,18 @@ mod tests {
             .await
             .unwrap_err()
             .contains("fixture mutation failed"));
+
+        assert!(matches!(
+            execute(Request::DarkMode).await,
+            Ok(Response::DarkMode(true))
+        ));
+        color_mode.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            execute(Request::DarkMode).await,
+            Ok(Response::DarkMode(false))
+        ));
+        color_mode.store(2, Ordering::SeqCst);
+        assert!(execute(Request::DarkMode).await.is_err());
 
         for mode in [1, 2] {
             auth_mode.store(mode, Ordering::SeqCst);
@@ -509,5 +597,164 @@ mod tests {
         );
         watcher.abort();
         assert!(watcher.await.unwrap_err().is_cancelled());
+    }
+
+    struct StatusDaemon {
+        status: Arc<std::sync::Mutex<SyncStatus>>,
+        stall: Arc<AtomicBool>,
+    }
+
+    #[zbus::interface(name = "org.gclient.GDrive1")]
+    impl StatusDaemon {
+        async fn sync_status(&self) -> SyncStatus {
+            if self.stall.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            self.status.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated bus and serialized ignored tests"]
+    async fn private_bus_sync_status_recovers_signals_polling_restart_and_timeouts() {
+        assert_eq!(std::env::var("GDRIVE_UI_TEST_BUS").as_deref(), Ok("1"));
+        let status = Arc::new(std::sync::Mutex::new(SyncStatus {
+            revision: 1,
+            folders: vec![],
+        }));
+        let stall = Arc::new(AtomicBool::new(false));
+        let service = bounded(
+            CONTROL_TIMEOUT,
+            zbus::connection::Builder::session()
+                .method_timeout(CONTROL_TIMEOUT)
+                .name(gdrive_common::dbus_api::BUS_NAME)
+                .serve_at(
+                    gdrive_common::dbus_api::OBJECT_PATH,
+                    StatusDaemon {
+                        status: status.clone(),
+                        stall: stall.clone(),
+                    },
+                )
+                .build(),
+        )
+        .await
+        .unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = tokio::spawn(watch_sync_status(move |event| {
+            let _ = events.send(event);
+        }));
+        async fn next(
+            events: &mut tokio::sync::mpsc::UnboundedReceiver<SyncStatusEvent>,
+        ) -> SyncStatusEvent {
+            tokio::time::timeout(Duration::from_secs(9), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        assert!(matches!(
+            next(&mut received).await,
+            SyncStatusEvent::Snapshot(SyncStatus { revision: 1, .. })
+        ));
+        {
+            let mut value = status.lock().unwrap();
+            value.revision = 2;
+            value
+                .folders
+                .push(gdrive_common::dbus_api::FolderSyncStatus {
+                    folder_id: "fixture".into(),
+                    syncing: true,
+                    errors: vec![],
+                });
+        }
+        bounded(
+            CONTROL_TIMEOUT,
+            service.emit_signal(
+                None::<&str>,
+                gdrive_common::dbus_api::OBJECT_PATH,
+                "org.gclient.GDrive1",
+                "SyncStatusChanged",
+                &(2u64,),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 2 && value.folders[0].syncing)
+        );
+        {
+            let mut value = status.lock().unwrap();
+            value.revision = 3;
+            value.folders[0].syncing = false;
+            value.folders[0].errors.push("upload failed".into());
+        }
+        // No signal: periodic snapshots recover a lost notification.
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 3 && value.folders[0].errors == ["upload failed"])
+        );
+        status.lock().unwrap().revision = 2;
+        bounded(
+            CONTROL_TIMEOUT,
+            service.emit_signal(
+                None::<&str>,
+                gdrive_common::dbus_api::OBJECT_PATH,
+                "org.gclient.GDrive1",
+                "SyncStatusChanged",
+                &(2u64,),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.recv())
+                .await
+                .is_err(),
+            "obsolete snapshot must not replace newer errors"
+        );
+        bounded(
+            CONTROL_TIMEOUT,
+            service.release_name(gdrive_common::dbus_api::BUS_NAME),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            next(&mut received).await,
+            SyncStatusEvent::Unavailable(_)
+        ));
+        status.lock().unwrap().revision = 0;
+        let replacement = bounded(
+            CONTROL_TIMEOUT,
+            zbus::connection::Builder::session()
+                .method_timeout(CONTROL_TIMEOUT)
+                .name(gdrive_common::dbus_api::BUS_NAME)
+                .serve_at(
+                    gdrive_common::dbus_api::OBJECT_PATH,
+                    StatusDaemon {
+                        status: status.clone(),
+                        stall: stall.clone(),
+                    },
+                )
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 0)
+        );
+        stall.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Unavailable(error) if error.contains("timed out"))
+        );
+        stall.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 0)
+        );
+        watcher.abort();
+        assert!(watcher.await.unwrap_err().is_cancelled());
+        bounded(
+            CONTROL_TIMEOUT,
+            replacement.release_name(gdrive_common::dbus_api::BUS_NAME),
+        )
+        .await
+        .unwrap();
     }
 }

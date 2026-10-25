@@ -14,11 +14,23 @@ On startup it:
    `gdrive_common::dbus_api`, implemented in `dbus_service.rs`) on the
    session D-Bus bus, exposing `ListSyncFolders`/`AddSyncFolder`/
    `RemoveSyncFolder`/`SetFolderEnabled`/`IsAuthenticated`/`SignIn`/
-   `SignOut`/`ListDriveFolders`. `SignIn` spawns a background task running
+   `SignOut`/`ListDriveFolders`/`SyncStatus`. `SignIn` spawns a background task running
    `gdrive_sync::auth::authorize`'s PKCE flow via `xdg-open`, so the
    D-Bus call itself returns immediately rather than blocking on browser
    interaction; `SignOut` deletes the cached token and stops all running
    folders. Successful sign-in and sign-out emit `AuthenticationChanged(b)`.
+
+`SyncStatus` returns the engine's authoritative in-memory per-folder activity
+and outstanding failures, with a monotonic revision. `SyncStatusChanged(t)`
+notifies clients to re-read it. Subscribers are established before workers
+start; snapshots remain available even if no UI was connected during a change.
+Coalesced notifications do not lose the current state, and emission failures
+are logged with a two-second bound. Clients can recover by reading a snapshot.
+Startup bus connection/registration has a five-second overall bound.
+The separate sync-event logging loop tolerates lag instead of terminating.
+Idle background workers and empty polling are not active file sync. Errors
+survive unrelated successes and clear only when affected work recovers or
+the folder is explicitly stopped/restarted.
 
 The OAuth flow has a ten-minute overall deadline, and a duplicate `SignIn`
 request is rejected while one is pending. Its tokens are saved only when the
@@ -64,7 +76,8 @@ cargo test -p gdrived
 dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrived -- --ignored
 ```
 
-The private-bus case verifies sign-out signals and cancellation without a real
+The private-bus case verifies status snapshots/signals, fatal sync failures,
+explicit stop, sign-out signals and cancellation without a real
 Google account or the user's daemon.
 
 Run it with:

@@ -85,11 +85,19 @@ ApplicationWindow {
         onTriggered: syncManager.refresh()
     }
 
+    TrayPresentation {
+        id: trayPresentation
+        connected: syncManager.connected
+        authenticated: syncManager.authenticated
+        syncState: syncManager.syncState
+        syncError: syncManager.syncError
+    }
+
     Platform.SystemTrayIcon {
         id: trayIcon
         visible: true
-        icon.name: "folder-remote"
-        tooltip: qsTr("g-client - Google Drive Sync")
+        icon.source: trayPresentation.source
+        tooltip: trayPresentation.tooltip
 
         onActivated: root.visible ? root.hide() : root.show()
 
