@@ -18,11 +18,12 @@ enables/disables Google Drive sync folders over D-Bus. Holds no sync \
 state itself - gdrived does the actual synchronising."""
 section = "net"
 priority = "optional"
-depends = "$auto, gdrived, qml6-module-qt-labs-platform, qml6-module-qt-labs-folderlistmodel"
+depends = "$auto, gdrived, libqt6svg6, qml6-module-qt-labs-platform, qml6-module-qt-labs-folderlistmodel"
 recommends = "kdialog"
 assets = [
     ["target/release/gdrive-ui", "usr/bin/", "755"],
     ["../../packaging/org.gclient.gdrive-ui.desktop", "usr/share/applications/", "644"],
+    ["icons/org.gclient.gdrive-ui.svg", "usr/share/icons/hicolor/scalable/apps/org.gclient.gdrive-ui.svg", "644"],
     ["../../README.md", "usr/share/doc/gdrive-ui/README.md", "644"],
 ]
 

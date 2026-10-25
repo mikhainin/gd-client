@@ -18,6 +18,21 @@ pub type SyncFolderRow = (String, String, String, String, String, String, bool, 
 /// [`GDrive1::list_drive_folders`]: `(id, name)`.
 pub type DriveFolderRow = (String, String);
 
+/// Runtime status, independent of whether a background worker is merely running.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::Type)]
+pub struct FolderSyncStatus {
+    pub folder_id: String,
+    pub syncing: bool,
+    pub errors: Vec<String>,
+}
+
+/// Revisions are monotonic within a daemon lifetime, not across bus owners.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::Type)]
+pub struct SyncStatus {
+    pub revision: u64,
+    pub folders: Vec<FolderSyncStatus>,
+}
+
 /// The `org.gclient.GDrive1` D-Bus interface exposed by `gdrived`, letting
 /// clients (e.g. `gdrive-ui`) list, add, remove and toggle sync folders
 /// without touching the configuration file or sync engine directly.
@@ -29,6 +44,13 @@ pub type DriveFolderRow = (String, String);
 pub trait GDrive1 {
     /// Lists all configured sync folders and whether each is currently active.
     fn list_sync_folders(&self) -> zbus::Result<Vec<SyncFolderRow>>;
+
+    /// Authoritative activity and outstanding failures, including initial sync.
+    fn sync_status(&self) -> zbus::Result<SyncStatus>;
+
+    /// Invalidates the cached snapshot; clients re-read `SyncStatus`.
+    #[zbus(signal)]
+    fn sync_status_changed(&self, revision: u64) -> zbus::Result<()>;
 
     /// Adds a new sync folder and, if `enabled` is true, starts synchronising
     /// it immediately. Returns the new folder's generated id.

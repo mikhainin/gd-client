@@ -17,6 +17,8 @@ Qt6/QML desktop control panel for `gdrived`, built with
   alongside base QtQuick Controls) in favour of plain `Row`/`Column`.
 - `qml/DriveFolderDialog.qml` — asynchronous Drive folder browser, also
   exercised directly by the Qt Quick tests.
+- `qml/TrayPresentation.qml` — tray icon and tooltip selection from explicit
+  connection, authentication, and engine-status properties.
 - `build.rs` — builds the QML module (`org.gclient.gdrive_ui`) via
   `cxx-qt-build`.
 
@@ -25,6 +27,9 @@ Qt6/QML desktop control panel for `gdrived`, built with
 Qt6 + the QML modules used by QtQuick Controls' Fusion style must be
 installed (see [`scripts/install-qt6.sh`](../../scripts/install-qt6.sh) for
 the Debian/Ubuntu package list).
+SVG icons require the Qt SVG runtime plugin (`libqt6svg6` on Debian/Ubuntu),
+including when running directly from Cargo. The Debian package declares this
+dependency explicitly.
 
 ## Running
 
@@ -34,6 +39,36 @@ cargo run -p gdrive-ui
 
 Requires `gdrived` to be running for the "Connected to gdrived" status and
 folder list to populate; the UI itself holds no sync state.
+
+## Application identity and tray status
+
+The original violet folder icon combines a path-drawn lowercase **g** with
+sync arrows, independently of Google's branding. SVGs under `icons/` are embedded
+in the binary, so window and tray icons do not depend on an installed theme.
+The static identity is installed as
+`hicolor/scalable/apps/org.gclient.gdrive-ui.svg`; the desktop entry and Qt
+desktop-file identity both use `org.gclient.gdrive-ui`. This also associates
+Wayland windows with the launcher. Title-bar icons remain compositor-dependent;
+some desktops deliberately do not show them.
+
+Only the tray changes with sync status. Disconnected/signed-out takes precedence
+over sync errors, then syncing, then idle. Syncing means initial reconciliation
+or actual upload/download/change application, not an idle watcher, empty remote
+poll, folder browser, or UI operation. Error and disconnected variants have
+distinct shapes, not just different colors. Tooltips distinguish startup,
+disconnection, sign-out, and unavailable status, and describe the state and
+outstanding errors. Existing Show/Hide, Quit, and hide-on-close actions are
+unchanged.
+
+The UI uses `SyncStatus` snapshots plus `SyncStatusChanged` invalidations,
+subscribing before its initial snapshot. Status runs on a separate cancellable
+worker from authentication and folder requests, with five-second bounds on
+setup and method calls. Snapshots are tied to a unique daemon bus owner and
+monotonic revision; reconnect resets revision tracking. Three-second polling
+recovers missing signals. Unsupported methods or timeouts explicitly show
+**Sync status unavailable** without discarding the folder/authentication state
+or pretending the engine is idle. UI operation failures still use the existing
+status message; the tray's sync errors come from the engine.
 
 ## Responsiveness and errors
 
@@ -81,7 +116,8 @@ must not install it themselves.
 
 ```sh
 cargo test -p gdrive-ui
-dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrive-ui -- --ignored
+cargo run -p gdrive-ui --example verify-icons
+dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrive-ui -- --ignored --test-threads=1
 QT_QPA_PLATFORM=offscreen QT_QUICK_CONTROLS_STYLE=Fusion \
   /usr/lib/qt6/bin/qmltestrunner -input crates/gdrive-ui/tests/qml
 ```
@@ -95,6 +131,17 @@ retry, cancellation, late replies, breadcrumbs, and root/nested selection;
 they also measure GUI heartbeat/cancel responsiveness while work is pending.
 Switch tests cover native and accessible input, failed updates, and subsequent
 backend changes without losing the checked-state binding.
+Tray tests cover state precedence, transitions, unavailable status, and decoding
+every selected SVG. The standalone `verify-icons` Qt probe renders all embedded
+variants at
+16/22/24/32/48/128 pixels and checks application/new-window icon propagation.
+Set `GDRIVE_ICON_PREVIEWS` to an existing absolute artifact directory to save
+light/dark-background PNG previews during that probe. Qt runs on its process's
+main thread, not on a Rust unit-test worker; it does not load the UI or contact
+the daemon. Missing SVG support fails
+the rendering tests explicitly. Private-bus tests also cover status signals,
+lost-signal polling recovery, stale revisions, daemon replacement, and timeout
+recovery; run ignored UI tests serially because they own the same service name.
 
 `tests/live_browse.py` drives the actual debug binary using the skill,
 against `tests/mock_daemon.py` on a private D-Bus session. It tests the
