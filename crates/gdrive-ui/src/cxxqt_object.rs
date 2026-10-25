@@ -302,11 +302,20 @@ impl qobject::SyncManager {
             match result {
                 Ok((json, count, authenticated)) => {
                     object.as_mut().set_folders_json(QString::from(&json));
+                    let mut authentication_error = None;
                     if object.authentication_revision == authentication_revision {
-                        object.as_mut().set_authenticated(authenticated);
-                        if authenticated && object.waiting_for_sign_in {
-                            object.as_mut().rust_mut().operation_message = None;
-                            object.as_mut().rust_mut().waiting_for_sign_in = false;
+                        match authenticated {
+                            Ok(authenticated) => {
+                                object.as_mut().set_authenticated(authenticated);
+                                if authenticated && object.waiting_for_sign_in {
+                                    object.as_mut().rust_mut().operation_message = None;
+                                    object.as_mut().rust_mut().waiting_for_sign_in = false;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!("authentication status unavailable: {error}");
+                                authentication_error = Some(error);
+                            }
                         }
                     }
                     object.as_mut().set_connected(true);
@@ -314,6 +323,12 @@ impl qobject::SyncManager {
                         .operation_message
                         .clone()
                         .unwrap_or_else(|| format!("{count} sync folder(s)"));
+                    let message = match authentication_error {
+                        Some(error) => {
+                            format!("{message}; authentication status unavailable: {error}")
+                        }
+                        None => message,
+                    };
                     object.as_mut().set_status_message(QString::from(&message));
                 }
                 Err(error) => {

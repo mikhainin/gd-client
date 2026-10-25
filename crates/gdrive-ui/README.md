@@ -51,6 +51,11 @@ mutation controls are disabled during a mutation. Starting a mutation
 invalidates an older refresh; its completion triggers a fresh snapshot.
 Action errors remain visible across successful polling refreshes until the
 next action, rather than being immediately replaced by the folder count.
+Folder switches remain bound to the backend state while a change is pending
+or fails, including changes requested through accessibility. A successful folder
+snapshot remains visible and connected even if its separate authentication read
+fails or times out; the previous authentication state is retained and the status
+reports that failure. Both reads share the same five-second overall deadline.
 `AuthenticationChanged` signals update sign-in/out state immediately and
 invalidate older snapshots. Each `SyncManager` owns one cancellable subscription;
 daemon ownership changes replace it, and transport failures retry after three
@@ -87,6 +92,8 @@ ownership changes, and subscription cleanup without touching the user's daemon.
 The Qt tests use a controllable backend double for loading, errors,
 retry, cancellation, late replies, breadcrumbs, and root/nested selection;
 they also measure GUI heartbeat/cancel responsiveness while work is pending.
+Switch tests cover native and accessible input, failed updates, and subsequent
+backend changes without losing the checked-state binding.
 
 `tests/live_browse.py` drives the actual debug binary using the skill,
 against `tests/mock_daemon.py` on a private D-Bus session. It tests the
@@ -101,7 +108,9 @@ dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 \
 ```
 
 Logs go to the supplied artifact directory. The fixture also mocks the portal
-to avoid activating real desktop services on its private bus.
+to avoid activating real desktop services on its private bus. Cancellation
+measurements wait for the scoped Drive-dialog Cancel control to disappear,
+not for a control behind the modal dialog to remain visible.
 
 `AccessibleButton.qml` explicitly connects accessible Press to the enabled
 button's click action, including dialog footer buttons. This is necessary

@@ -204,20 +204,12 @@ ApplicationWindow {
                         anchors.verticalCenter: parent.verticalCenter
                     }
 
-                    Switch {
+                    SyncFolderSwitch {
                         enabled: !syncManager.busy
                         Accessible.name: qsTr("Enable sync for %1").arg(modelData.displayName)
-                        function toggleAccessible() {
-                            if (enabled) {
-                                checked = !checked
-                                toggled()
-                            }
-                        }
-                        Accessible.onToggleAction: toggleAccessible()
-                        Accessible.onPressAction: toggleAccessible()
-                        checked: modelData.enabled
+                        backendChecked: modelData.enabled
                         anchors.verticalCenter: parent.verticalCenter
-                        onToggled: syncManager.setFolderEnabled(modelData.id, checked)
+                        onChangeRequested: desired => syncManager.setFolderEnabled(modelData.id, desired)
                     }
 
                     AccessibleButton {

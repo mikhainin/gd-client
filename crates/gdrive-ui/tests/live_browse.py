@@ -97,6 +97,20 @@ def main():
                     deadline=deadline,
                 )
 
+            def wait_hidden(name, ancestor, deadline=3):
+                end = time.monotonic() + deadline
+                while True:
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(f"{name} under {ancestor} is still showing")
+                    nodes = helper("tree", deadline=min(3, remaining))["nodes"]
+                    if not any(
+                        node["name"] == name and ancestor in node["ancestors"]
+                        and node["states"]["showing"] for node in nodes
+                    ):
+                        return
+                    time.sleep(min(0.05, max(0, end - time.monotonic())))
+
             def mode(value):
                 run(
                     "busctl", "--user", "--timeout=3s", "call",
@@ -131,7 +145,7 @@ def main():
             wait("Loading Drive folders...")
             start = time.monotonic()
             press("Cancel", "Select Drive folder")
-            wait("Browse Drive folders")
+            wait_hidden("Cancel", "Select Drive folder")
             cancel_seconds = time.monotonic() - start
             if cancel_seconds >= 3:
                 raise RuntimeError(f"Cancel took {cancel_seconds:.2f}s")
@@ -168,13 +182,16 @@ def main():
             press("Open folder Projects")
             wait("Loading Drive folders...")
             press("Cancel", "Select Drive folder")
+            wait_hidden("Cancel", "Select Drive folder")
             mode("success")
             press("Browse Drive folders")
             wait("Open folder Projects")
             time.sleep(1.7)
             helper("find", "--name", "Open folder Projects")
             press("Cancel", "Select Drive folder")
+            wait_hidden("Cancel", "Select Drive folder")
             press("Cancel", "Add sync folder")
+            wait_hidden("Cancel", "Add sync folder")
             wait("Add folder")
 
             print(json.dumps({

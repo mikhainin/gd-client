@@ -13,18 +13,20 @@ use gdrive_common::{AppConfig, SyncFolder};
 use gdrive_sync::auth::{self, OAuthConfig};
 use gdrive_sync::{SyncEngine, SyncError};
 use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const SIGN_IN_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ServiceState {
     config: AppConfig,
     sign_in_generation: u64,
-    sign_in: Option<AbortHandle>,
+    sign_in: Option<JoinHandle<()>>,
+    cancelling_sign_in: bool,
 }
 
 impl ServiceState {
@@ -46,11 +48,23 @@ impl ServiceState {
         Ok(true)
     }
 
-    fn cancel_sign_in(&mut self) {
-        self.sign_in_generation = self.sign_in_generation.wrapping_add(1);
-        if let Some(task) = self.sign_in.take() {
-            task.abort();
+    fn sign_in_busy(&self) -> bool {
+        self.cancelling_sign_in
+            || self
+                .sign_in
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+    }
+
+    fn cancel_sign_in(&mut self) -> Option<JoinHandle<()>> {
+        if self.cancelling_sign_in {
+            return None;
         }
+        self.sign_in_generation = self.sign_in_generation.wrapping_add(1);
+        self.sign_in.take().inspect(|task| {
+            task.abort();
+            self.cancelling_sign_in = true;
+        })
     }
 }
 
@@ -77,6 +91,7 @@ impl GDriveService {
                 config,
                 sign_in_generation: 0,
                 sign_in: None,
+                cancelling_sign_in: false,
             })),
             config_path,
             token_path,
@@ -88,6 +103,30 @@ impl GDriveService {
         config
             .save_to(&self.config_path)
             .map_err(|e| zbus::fdo::Error::Failed(format!("failed to save configuration: {e}")))
+    }
+
+    async fn finish_sign_in_cancellation(
+        &self,
+        task: Option<JoinHandle<()>>,
+        deadline: Duration,
+    ) -> zbus::fdo::Result<()> {
+        let Some(mut task) = task else { return Ok(()) };
+        let result = tokio::time::timeout(deadline, &mut task).await;
+        let mut state = self.state.lock().await;
+        state.cancelling_sign_in = false;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if error.is_cancelled() => Ok(()),
+            Ok(Err(_)) => Err(zbus::fdo::Error::Failed(
+                "sign-in task failed during cancellation".into(),
+            )),
+            Err(_) => {
+                state.sign_in = Some(task);
+                Err(zbus::fdo::Error::Timeout(
+                    "sign-in cancellation is still in progress; retry shortly".into(),
+                ))
+            }
+        }
     }
 
     async fn notify_authentication(emitter: &SignalEmitter<'_>, authenticated: bool) {
@@ -235,7 +274,7 @@ impl GDriveService {
         })?;
 
         let mut state = self.state.lock().await;
-        if state.sign_in.is_some() {
+        if state.sign_in_busy() {
             return Err(zbus::fdo::Error::Failed(
                 "sign-in is already in progress".into(),
             ));
@@ -285,7 +324,7 @@ impl GDriveService {
                 Err(err) => tracing::error!("sign-in failed: {err}"),
             }
         });
-        state.sign_in = Some(task.abort_handle());
+        state.sign_in = Some(task);
 
         Ok(())
     }
@@ -295,20 +334,31 @@ impl GDriveService {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let mut state = self.state.lock().await;
-        state.cancel_sign_in();
-        if self.token_path.exists() {
-            std::fs::remove_file(&self.token_path).map_err(|e| {
-                zbus::fdo::Error::Failed(format!("failed to remove cached token: {e}"))
-            })?;
-        }
+        let (task, removal) = {
+            let mut state = self.state.lock().await;
+            let task = state.cancel_sign_in();
+            let removal = if self.token_path.exists() {
+                std::fs::remove_file(&self.token_path).map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("failed to remove cached token: {e}"))
+                })
+            } else {
+                Ok(())
+            };
 
-        for folder_id in self.engine.running_folders() {
-            self.engine.stop_folder(folder_id);
-        }
-        self.engine.set_access_token(String::new());
-
-        Self::notify_authentication(&emitter, false).await;
+            for folder_id in self.engine.running_folders() {
+                self.engine.stop_folder(folder_id);
+            }
+            self.engine.set_access_token(String::new());
+            if removal.is_ok() {
+                Self::notify_authentication(&emitter, false).await;
+            }
+            (task, removal)
+        };
+        let cancellation = self
+            .finish_sign_in_cancellation(task, SIGN_IN_CANCEL_TIMEOUT)
+            .await;
+        removal?;
+        cancellation?;
         Ok(())
     }
 
@@ -474,8 +524,9 @@ mod tests {
         let mut state = fixture.service.state.lock().await;
         state.config.sync_folders.push(fixture.folder("cancelled"));
         state.sign_in_generation = 1;
-        state.sign_in = Some(task.abort_handle());
-        state.cancel_sign_in();
+        state.sign_in = Some(task);
+        let cancelled = state.cancel_sign_in().unwrap();
+        assert!(state.sign_in_busy());
         assert!(!state
             .complete_sign_in(
                 1,
@@ -486,7 +537,75 @@ mod tests {
             .unwrap());
         assert!(!fixture.service.token_path.exists());
         assert!(fixture.service.engine.running_folders().is_empty());
-        assert!(task.await.unwrap_err().is_cancelled());
+        drop(state);
+        fixture
+            .service
+            .finish_sign_in_cancellation(Some(cancelled), SIGN_IN_CANCEL_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!fixture.service.state.lock().await.sign_in_busy());
+    }
+
+    #[tokio::test]
+    async fn cancellation_releases_listener_before_allowing_another_sign_in() {
+        let fixture = Fixture::new(AppConfig::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(listener);
+        });
+        let cancelled = {
+            let mut state = fixture.service.state.lock().await;
+            state.sign_in = Some(task);
+            let cancelled = state.cancel_sign_in();
+            assert!(state.sign_in_busy());
+            assert!(std::net::TcpListener::bind(address).is_err());
+            cancelled
+        };
+        fixture
+            .service
+            .finish_sign_in_cancellation(cancelled, SIGN_IN_CANCEL_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!fixture.service.state.lock().await.sign_in_busy());
+        let _replacement = std::net::TcpListener::bind(address).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_timeout_retains_gate_until_task_finishes() {
+        let fixture = Fixture::new(AppConfig::default());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        ready.await.unwrap();
+        let cancelled = {
+            let mut state = fixture.service.state.lock().await;
+            state.sign_in = Some(task);
+            state.cancel_sign_in()
+        };
+        let error = fixture
+            .service
+            .finish_sign_in_cancellation(cancelled, Duration::from_millis(25))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cancellation is still in progress"));
+        let task = {
+            let mut state = fixture.service.state.lock().await;
+            assert!(state.sign_in_busy());
+            state.sign_in.take().unwrap()
+        };
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fixture.service.state.lock().await.sign_in_busy());
     }
 
     #[tokio::test]
@@ -557,7 +676,7 @@ mod tests {
             {
                 let mut state = fixture.service.state.lock().await;
                 state.sign_in_generation = 1;
-                state.sign_in = Some(task.abort_handle());
+                state.sign_in = Some(task);
             }
             let connection = zbus::connection::Builder::session()
                 .unwrap()
@@ -583,8 +702,8 @@ mod tests {
                 .unwrap();
             assert!(!signal.args().unwrap().authenticated);
             assert!(!proxy.is_authenticated().await.unwrap());
-            assert!(task.await.unwrap_err().is_cancelled());
             let mut state = fixture.service.state.lock().await;
+            assert!(!state.sign_in_busy());
             assert!(!state
                 .complete_sign_in(
                     1,

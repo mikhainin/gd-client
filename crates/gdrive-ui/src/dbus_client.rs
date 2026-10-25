@@ -33,7 +33,7 @@ pub enum Request {
 
 #[derive(Debug)]
 pub enum Response {
-    Snapshot(Vec<SyncFolderRow>, bool),
+    Snapshot(Vec<SyncFolderRow>, Result<bool, String>),
     Done,
     DriveFolders(Vec<DriveFolderRow>),
     DarkMode(bool),
@@ -159,6 +159,21 @@ pub async fn execute(request: Request) -> Result<Response, String> {
 }
 
 async fn execute_with_timeout(request: Request, deadline: Duration) -> Result<Response, String> {
+    if matches!(request, Request::Refresh) {
+        let end = tokio::time::Instant::now() + deadline;
+        let connection = bounded_until(end, deadline, connect(deadline)).await?;
+        let proxy = bounded_until(
+            end,
+            deadline,
+            GDrive1Proxy::builder(&connection)
+                .cache_properties(CacheProperties::No)
+                .build(),
+        )
+        .await?;
+        let rows = bounded_until(end, deadline, proxy.list_sync_folders()).await?;
+        let authentication = bounded_until(end, deadline, proxy.is_authenticated()).await;
+        return Ok(Response::Snapshot(rows, authentication));
+    }
     bounded(deadline, call(request, deadline)).await
 }
 
@@ -166,7 +181,15 @@ async fn bounded<T>(
     deadline: Duration,
     future: impl Future<Output = zbus::Result<T>>,
 ) -> Result<T, String> {
-    tokio::time::timeout(deadline, future)
+    bounded_until(tokio::time::Instant::now() + deadline, deadline, future).await
+}
+
+async fn bounded_until<T>(
+    end: tokio::time::Instant,
+    deadline: Duration,
+    future: impl Future<Output = zbus::Result<T>>,
+) -> Result<T, String> {
+    tokio::time::timeout_at(end, future)
         .await
         .map_err(|_| {
             format!(
@@ -177,12 +200,16 @@ async fn bounded<T>(
         .map_err(|e| format!("D-Bus request failed: {e}"))
 }
 
-async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
-    // The outer deadline includes connecting, authentication, activation and all calls.
-    let connection = zbus::connection::Builder::session()?
+async fn connect(deadline: Duration) -> zbus::Result<zbus::Connection> {
+    zbus::connection::Builder::session()?
         .method_timeout(deadline)
         .build()
-        .await?;
+        .await
+}
+
+async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
+    // The outer deadline includes connecting, authentication, activation and all calls.
+    let connection = connect(deadline).await?;
 
     if matches!(request, Request::DarkMode) {
         let reply = connection
@@ -204,10 +231,7 @@ async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
         .build()
         .await?;
     match request {
-        Request::Refresh => Ok(Response::Snapshot(
-            proxy.list_sync_folders().await?,
-            proxy.is_authenticated().await?,
-        )),
+        Request::Refresh => unreachable!("refresh handles partial results separately"),
         Request::AddFolder {
             display_name,
             drive_folder_id,
@@ -254,7 +278,7 @@ async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -293,7 +317,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
-    struct SlowDaemon(Arc<AtomicBool>);
+    struct SlowDaemon(Arc<AtomicBool>, Arc<AtomicU8>);
 
     #[zbus::interface(name = "org.gclient.GDrive1")]
     impl SlowDaemon {
@@ -305,11 +329,33 @@ mod tests {
         }
 
         async fn list_sync_folders(&self) -> Vec<SyncFolderRow> {
-            vec![]
+            if self.1.load(Ordering::SeqCst) == 0 {
+                vec![]
+            } else {
+                vec![(
+                    "folder".into(),
+                    "Configured folder".into(),
+                    "".into(),
+                    "/fixture".into(),
+                    "".into(),
+                    "".into(),
+                    false,
+                    false,
+                )]
+            }
         }
 
-        async fn is_authenticated(&self) -> bool {
-            true
+        async fn is_authenticated(&self) -> zbus::fdo::Result<bool> {
+            match self.1.load(Ordering::SeqCst) {
+                1 => Err(zbus::fdo::Error::Failed(
+                    "fixture authentication read failed".into(),
+                )),
+                2 => {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(true)
+                }
+                _ => Ok(true),
+            }
         }
 
         async fn remove_sync_folder(&self, _id: String) -> zbus::fdo::Result<()> {
@@ -328,18 +374,22 @@ mod tests {
     async fn private_bus_timeout_does_not_prevent_other_requests_or_recovery() {
         assert_eq!(std::env::var("GDRIVE_UI_TEST_BUS").as_deref(), Ok("1"));
         let stall = Arc::new(AtomicBool::new(true));
-        let _service = zbus::connection::Builder::session()
-            .unwrap()
-            .name(gdrive_common::dbus_api::BUS_NAME)
-            .unwrap()
-            .serve_at(
-                gdrive_common::dbus_api::OBJECT_PATH,
-                SlowDaemon(stall.clone()),
-            )
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
+        let auth_mode = Arc::new(AtomicU8::new(0));
+        let _service = bounded(
+            CONTROL_TIMEOUT,
+            zbus::connection::Builder::session()
+                .unwrap()
+                .name(gdrive_common::dbus_api::BUS_NAME)
+                .unwrap()
+                .serve_at(
+                    gdrive_common::dbus_api::OBJECT_PATH,
+                    SlowDaemon(stall.clone(), auth_mode.clone()),
+                )
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
         let start = std::time::Instant::now();
         let (browse, refresh) = tokio::join!(
             execute_with_timeout(
@@ -350,10 +400,10 @@ mod tests {
         );
         assert!(browse.unwrap_err().contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(2));
-        assert!(matches!(refresh, Ok(Response::Snapshot(rows, true)) if rows.is_empty()));
+        assert!(matches!(refresh, Ok(Response::Snapshot(rows, Ok(true))) if rows.is_empty()));
         assert!(matches!(
             execute(Request::Refresh).await,
-            Ok(Response::Snapshot(_, true))
+            Ok(Response::Snapshot(_, Ok(true)))
         ));
         stall.store(false, Ordering::SeqCst);
         assert!(matches!(
@@ -364,6 +414,24 @@ mod tests {
             .await
             .unwrap_err()
             .contains("fixture mutation failed"));
+
+        for mode in [1, 2] {
+            auth_mode.store(mode, Ordering::SeqCst);
+            let response = execute_with_timeout(Request::Refresh, Duration::from_millis(100))
+                .await
+                .unwrap();
+            let Response::Snapshot(rows, Err(error)) = response else {
+                panic!("authentication failure must retain configured folders");
+            };
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, "folder");
+            assert!(error.contains(if mode == 1 {
+                "authentication read failed"
+            } else {
+                "timed out"
+            }));
+        }
+        auth_mode.store(0, Ordering::SeqCst);
 
         let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
         let watcher = tokio::spawn(watch_authentication(move |event| {
@@ -377,7 +445,7 @@ mod tests {
         ));
         assert!(matches!(
             execute(Request::Refresh).await,
-            Ok(Response::Snapshot(_, true))
+            Ok(Response::Snapshot(_, Ok(true)))
         ));
         let interface = _service
             .object_server()

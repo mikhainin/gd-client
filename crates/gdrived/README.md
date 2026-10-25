@@ -26,7 +26,10 @@ current attempt completes. Completion reads the live configuration and starts
 enabled folders while holding the same state lock used by folder mutations,
 so a concurrent disable/remove cannot be undone by a stale sign-in snapshot.
 `SignOut` cancels the pending attempt and invalidates late completions before
-deleting tokens. Signals are emitted in state-change order, with a two-second
+deleting tokens. It awaits cancellation for up to two seconds to release the
+OAuth loopback listener before another sign-in can start. If cleanup exceeds
+that deadline, sign-out reports a timeout and new sign-ins remain rejected
+until the aborted task has actually finished. Signals are emitted in state-change order, with a two-second
 emission deadline; delivery failures are logged and clients can recover by
 querying `IsAuthenticated`.
 
