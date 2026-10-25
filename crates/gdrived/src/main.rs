@@ -67,10 +67,10 @@ async fn main() -> anyhow::Result<()> {
 
     let connection = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        zbus::connection::Builder::session()?
+        zbus::connection::Builder::session()
             .method_timeout(std::time::Duration::from_secs(5))
-            .name(BUS_NAME)?
-            .serve_at(OBJECT_PATH, service)?
+            .name(BUS_NAME)
+            .serve_at(OBJECT_PATH, service)
             .build(),
     )
     .await??;

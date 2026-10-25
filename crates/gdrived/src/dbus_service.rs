@@ -711,15 +711,12 @@ mod tests {
                 state.sign_in = Some(task);
             }
             let connection = zbus::connection::Builder::session()
-                .unwrap()
                 .method_timeout(Duration::from_secs(2))
                 .name(gdrive_common::dbus_api::BUS_NAME)
-                .unwrap()
                 .serve_at(
                     gdrive_common::dbus_api::OBJECT_PATH,
                     fixture.service.clone(),
                 )
-                .unwrap()
                 .build()
                 .await
                 .unwrap();

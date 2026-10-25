@@ -8,7 +8,6 @@ use gdrive_common::dbus_api::{DriveFolderRow, GDrive1Proxy, SyncFolderRow, SyncS
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 use zbus::export::futures_core::Stream;
-use zbus::proxy::CacheProperties;
 
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -83,8 +82,6 @@ async fn sync_status_session(notify: &(impl Fn(SyncStatusEvent) + Sync)) -> Resu
         CONTROL_TIMEOUT,
         GDrive1Proxy::builder(&connection)
             .destination(owner.as_str())
-            .map_err(|error| error.to_string())?
-            .cache_properties(CacheProperties::No)
             .build(),
     )
     .await?;
@@ -130,19 +127,13 @@ async fn authentication_session(
     notify: &(impl Fn(AuthenticationEvent) + Sync),
 ) -> Result<(), String> {
     let connection = bounded(CONTROL_TIMEOUT, async {
-        zbus::connection::Builder::session()?
+        zbus::connection::Builder::session()
             .method_timeout(CONTROL_TIMEOUT)
             .build()
             .await
     })
     .await?;
-    let proxy = bounded(
-        CONTROL_TIMEOUT,
-        GDrive1Proxy::builder(&connection)
-            .cache_properties(CacheProperties::No)
-            .build(),
-    )
-    .await?;
+    let proxy = bounded(CONTROL_TIMEOUT, GDrive1Proxy::new(&connection)).await?;
     let bus = bounded(CONTROL_TIMEOUT, zbus::fdo::DBusProxy::new(&connection)).await?;
     let mut owners = bounded(
         CONTROL_TIMEOUT,
@@ -235,14 +226,7 @@ async fn execute_with_timeout(request: Request, deadline: Duration) -> Result<Re
     if matches!(request, Request::Refresh) {
         let end = tokio::time::Instant::now() + deadline;
         let connection = bounded_until(end, deadline, connect(deadline)).await?;
-        let proxy = bounded_until(
-            end,
-            deadline,
-            GDrive1Proxy::builder(&connection)
-                .cache_properties(CacheProperties::No)
-                .build(),
-        )
-        .await?;
+        let proxy = bounded_until(end, deadline, GDrive1Proxy::new(&connection)).await?;
         let rows = bounded_until(end, deadline, proxy.list_sync_folders()).await?;
         let authentication = bounded_until(end, deadline, proxy.is_authenticated()).await;
         return Ok(Response::Snapshot(rows, authentication));
@@ -274,7 +258,7 @@ async fn bounded_until<T>(
 }
 
 async fn connect(deadline: Duration) -> zbus::Result<zbus::Connection> {
-    zbus::connection::Builder::session()?
+    zbus::connection::Builder::session()
         .method_timeout(deadline)
         .build()
         .await
@@ -294,15 +278,12 @@ async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
                 &("org.freedesktop.appearance", "color-scheme"),
             )
             .await?;
-        let value: zbus::zvariant::OwnedValue = reply.body().deserialize()?;
-        let color_scheme: u32 = zbus::zvariant::Value::from(value).downcast()?;
+        let value: zbus::OwnedVariant = reply.body().deserialize()?;
+        let color_scheme: u32 = zbus::Variant::from(value).downcast()?;
         return Ok(Response::DarkMode(color_scheme == 1));
     }
 
-    let proxy = GDrive1Proxy::builder(&connection)
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await?;
+    let proxy = GDrive1Proxy::new(&connection).await?;
     match request {
         Request::Refresh => unreachable!("refresh handles partial results separately"),
         Request::AddFolder {
@@ -378,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn deadline_includes_a_stalled_connection_handshake() {
-        let (client, _stalled_server) = tokio::net::UnixStream::pair().unwrap();
+        let (client, _stalled_server) = std::os::unix::net::UnixStream::pair().unwrap();
         let start = std::time::Instant::now();
         let error = bounded(
             Duration::from_millis(50),
@@ -391,6 +372,21 @@ mod tests {
     }
 
     struct SlowDaemon(Arc<AtomicBool>, Arc<AtomicU8>);
+
+    struct PortalSettings(Arc<AtomicU8>);
+
+    #[zbus::interface(name = "org.freedesktop.portal.Settings")]
+    impl PortalSettings {
+        async fn read(&self, namespace: &str, key: &str) -> zbus::OwnedVariant {
+            assert_eq!(namespace, "org.freedesktop.appearance");
+            assert_eq!(key, "color-scheme");
+            match self.0.load(Ordering::SeqCst) {
+                0 => 1u32.into(),
+                1 => 2u32.into(),
+                _ => true.into(),
+            }
+        }
+    }
 
     #[zbus::interface(name = "org.gclient.GDrive1")]
     impl SlowDaemon {
@@ -448,17 +444,20 @@ mod tests {
         assert_eq!(std::env::var("GDRIVE_UI_TEST_BUS").as_deref(), Ok("1"));
         let stall = Arc::new(AtomicBool::new(true));
         let auth_mode = Arc::new(AtomicU8::new(0));
+        let color_mode = Arc::new(AtomicU8::new(0));
         let _service = bounded(
             CONTROL_TIMEOUT,
             zbus::connection::Builder::session()
-                .unwrap()
                 .name(gdrive_common::dbus_api::BUS_NAME)
-                .unwrap()
+                .name("org.freedesktop.portal.Desktop")
                 .serve_at(
                     gdrive_common::dbus_api::OBJECT_PATH,
                     SlowDaemon(stall.clone(), auth_mode.clone()),
                 )
-                .unwrap()
+                .serve_at(
+                    "/org/freedesktop/portal/desktop",
+                    PortalSettings(color_mode.clone()),
+                )
                 .build(),
         )
         .await
@@ -491,6 +490,18 @@ mod tests {
             .await
             .unwrap_err()
             .contains("fixture mutation failed"));
+
+        assert!(matches!(
+            execute(Request::DarkMode).await,
+            Ok(Response::DarkMode(true))
+        ));
+        color_mode.store(1, Ordering::SeqCst);
+        assert!(matches!(
+            execute(Request::DarkMode).await,
+            Ok(Response::DarkMode(false))
+        ));
+        color_mode.store(2, Ordering::SeqCst);
+        assert!(execute(Request::DarkMode).await.is_err());
 
         for mode in [1, 2] {
             auth_mode.store(mode, Ordering::SeqCst);
@@ -615,10 +626,8 @@ mod tests {
         let service = bounded(
             CONTROL_TIMEOUT,
             zbus::connection::Builder::session()
-                .unwrap()
                 .method_timeout(CONTROL_TIMEOUT)
                 .name(gdrive_common::dbus_api::BUS_NAME)
-                .unwrap()
                 .serve_at(
                     gdrive_common::dbus_api::OBJECT_PATH,
                     StatusDaemon {
@@ -626,7 +635,6 @@ mod tests {
                         stall: stall.clone(),
                     },
                 )
-                .unwrap()
                 .build(),
         )
         .await
@@ -716,10 +724,8 @@ mod tests {
         let replacement = bounded(
             CONTROL_TIMEOUT,
             zbus::connection::Builder::session()
-                .unwrap()
                 .method_timeout(CONTROL_TIMEOUT)
                 .name(gdrive_common::dbus_api::BUS_NAME)
-                .unwrap()
                 .serve_at(
                     gdrive_common::dbus_api::OBJECT_PATH,
                     StatusDaemon {
@@ -727,7 +733,6 @@ mod tests {
                         stall: stall.clone(),
                     },
                 )
-                .unwrap()
                 .build(),
         )
         .await

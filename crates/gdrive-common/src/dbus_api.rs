@@ -19,9 +19,7 @@ pub type SyncFolderRow = (String, String, String, String, String, String, bool, 
 pub type DriveFolderRow = (String, String);
 
 /// Runtime status, independent of whether a background worker is merely running.
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::Type)]
 pub struct FolderSyncStatus {
     pub folder_id: String,
     pub syncing: bool,
@@ -29,9 +27,7 @@ pub struct FolderSyncStatus {
 }
 
 /// Revisions are monotonic within a daemon lifetime, not across bus owners.
-#[derive(
-    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::Type)]
 pub struct SyncStatus {
     pub revision: u64,
     pub folders: Vec<FolderSyncStatus>,

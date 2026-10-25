@@ -14,7 +14,9 @@ Shared types and utilities used by both `gdrived` and `gdrive-ui`:
   `AuthenticationChanged(b)` after successful sign-in/out. Clients query
   `IsAuthenticated` for initial/reconnected state. Both sides must match it
   exactly, since zbus does not check this across independent crates at
-  compile time.
+  compile time. The workspace uses zbus 6's asynchronous proxy/service APIs
+  on Tokio; D-Bus names and wire types now come from zbus itself rather than
+  the standalone zbus_names/zvariant crates.
   The additive `SyncStatus` method returns a typed snapshot containing a
   monotonic revision and per-folder activity/outstanding error details;
   `SyncStatusChanged(t)` invalidates it. Revisions are scoped to one daemon
