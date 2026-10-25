@@ -51,6 +51,15 @@ install`/`make uninstall` only print the `sudo apt install`/`sudo apt
 remove` commands (never run them — see [`AGENTS.md`](AGENTS.md)); `make
 clean` removes build artifacts.
 
+After building the packages, run this from the repository root:
+
+```sh
+sudo apt install ./target/debian/*.deb
+```
+
+The `./` prefix tells APT to install local package files rather than search
+for package names.
+
 ## Running
 
 1. Set `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` (a Google Cloud OAuth
