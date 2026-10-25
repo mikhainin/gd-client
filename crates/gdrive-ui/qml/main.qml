@@ -204,6 +204,14 @@ ApplicationWindow {
                             font.pixelSize: 11
                             opacity: 0.7
                         }
+                        DriveFolderPath {
+                            objectName: "configuredDriveFolderPath"
+                            width: parent.width
+                            folderId: modelData.driveFolderId
+                            folderPath: modelData.driveFolderPath
+                            font.pixelSize: 11
+                            opacity: 0.7
+                        }
                     }
 
                     Label {
@@ -374,8 +382,7 @@ ApplicationWindow {
         backend: syncManager
         anchors.centerIn: parent
         onFolderSelected: (folderId, folderPath) => {
-            driveFolderIdField.text = folderId
-            driveFolderPathField.text = qsTr("Selected: %1").arg(folderPath)
+            driveFolderSelection.selectFolder(folderId, folderPath)
         }
     }
 
@@ -396,14 +403,14 @@ ApplicationWindow {
         onAccepted: {
             syncManager.addFolder(
                 displayNameField.text,
-                driveFolderIdField.text,
+                driveFolderSelection.folderId,
+                driveFolderSelection.folderPath,
                 localPathField.text,
                 ownerUserField.text,
                 ownerGroupField.text,
                 true)
             displayNameField.text = ""
-            driveFolderIdField.text = ""
-            driveFolderPathField.text = ""
+            driveFolderSelection.reset()
             localPathField.text = ""
         }
 
@@ -416,37 +423,10 @@ ApplicationWindow {
             Label { text: qsTr("Display name") }
             TextField { id: displayNameField; width: parent.width; Accessible.name: qsTr("Display name") }
 
-            Label { text: qsTr("Drive folder id (leave empty for \"My Drive\" root)") }
-            Row {
+            DriveFolderSelection {
+                id: driveFolderSelection
                 width: parent.width
-                spacing: 6
-                TextField {
-                    id: driveFolderIdField
-                    objectName: "driveFolderIdField"
-                    Accessible.name: qsTr("Drive folder id")
-                    width: parent.width - 90
-                    // Manual edits invalidate the last picked path preview
-                    // (the dialog re-sets it right after this, for picks).
-                    onTextChanged: driveFolderPathField.text = ""
-                }
-                AccessibleButton {
-                    objectName: "browseDriveFoldersButton"
-                    text: qsTr("Browse\u2026")
-                    Accessible.name: qsTr("Browse Drive folders")
-                    width: 84
-                    onClicked: driveFolderDialog.open()
-                }
-            }
-            Label {
-                id: driveFolderPathField
-                width: parent.width
-                opacity: 0.7
-                elide: Text.ElideMiddle
-                // Set by the Drive folder browser when a folder is picked;
-                // shows a human-readable path since the field above holds
-                // the (unreadable) Drive folder id actually sent to gdrived.
-                visible: text.length > 0
-                text: ""
+                onBrowseRequested: driveFolderDialog.open()
             }
 
             Label { text: qsTr("Local path") }

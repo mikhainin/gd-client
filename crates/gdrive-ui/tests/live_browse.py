@@ -127,6 +127,17 @@ def main():
 
             wait("Connected to gdrived")
             print("Connected to isolated mock daemon", flush=True)
+            wait("My Drive/Parent/Selected")
+            wait("Drive path unavailable; reselect folder")
+            wait("My Drive")
+            nodes = helper("tree")["nodes"]
+            if any(
+                node["states"]["showing"]
+                and any(value in node["name"] for value in ("opaque-folder-id", "legacy-opaque-id"))
+                for node in nodes
+            ):
+                raise RuntimeError("Configured folder displayed a Drive ID instead of its path")
+            print("Configured folders render saved/root paths and legacy placeholder without IDs", flush=True)
             wait("Sign out")
             authentication("PauseAuthenticationReads", True)
             authentication("SetAuthenticated", False)
@@ -173,7 +184,13 @@ def main():
             press("Open folder Projects")
             wait("No sub-folders here.")
             press("Select this folder")
-            wait("Selected: My Drive / Projects")
+            wait("My Drive/Projects")
+            nodes = helper("tree")["nodes"]
+            if any(
+                node["name"] == "Drive folder id" and node["states"]["showing"]
+                for node in nodes
+            ):
+                raise RuntimeError("Manual Drive ID entry is showing without enabling Advanced")
 
             # A canceled delayed child response must not overwrite a reopened root listing.
             press("Browse Drive folders")

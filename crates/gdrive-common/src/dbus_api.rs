@@ -11,8 +11,19 @@ pub const OBJECT_PATH: &str = "/org/gclient/GDrive1";
 
 /// One row describing a configured sync folder, as returned by
 /// [`GDrive1::list_sync_folders`]:
-/// `(id, display_name, drive_folder_id, local_path, owner_user, owner_group, enabled, running)`.
-pub type SyncFolderRow = (String, String, String, String, String, String, bool, bool);
+/// `(id, display_name, drive_folder_id, drive_folder_path, local_path, owner_user, owner_group, enabled, running)`.
+/// An empty path means the non-root folder's display path is unknown.
+pub type SyncFolderRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    bool,
+);
 
 /// One row describing a Google Drive folder, as returned by
 /// [`GDrive1::list_drive_folders`]: `(id, name)`.
@@ -59,6 +70,7 @@ pub trait GDrive1 {
         &self,
         display_name: &str,
         drive_folder_id: &str,
+        drive_folder_path: &str,
         local_path: &str,
         owner_user: &str,
         owner_group: &str,

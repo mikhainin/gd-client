@@ -12,6 +12,8 @@ fn main() {
             .qml_file("qml/TrayPresentation.qml")
             .qml_file("qml/AccessibleButton.qml")
             .qml_file("qml/SyncFolderSwitch.qml")
+            .qml_file("qml/DriveFolderPath.qml")
+            .qml_file("qml/DriveFolderSelection.qml")
             .qml_file("qml/DriveFolderDialog.qml"),
     )
     .files(["src/cxxqt_object.rs"])

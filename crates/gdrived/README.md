@@ -20,6 +20,15 @@ On startup it:
    interaction; `SignOut` deletes the cached token and stops all running
    folders. Successful sign-in and sign-out emit `AuthenticationChanged(b)`.
 
+`AddSyncFolder` persists the display-only `drive_folder_path` argument alongside
+the Drive ID, and `ListSyncFolders` returns both. Empty or `root` IDs are
+normalized to My Drive; a non-root ID with an empty path keeps its path unknown.
+Existing configurations without paths remain loadable. Paths describe the
+selection at save time, not subsequent remote moves or renames; no extra
+Drive lookup runs when listing configuration. The added path argument/row
+field follows the Drive ID and changes the D-Bus wire signatures: upgrade
+`gdrive-ui` and `gdrived` together and restart the daemon.
+
 `SyncStatus` returns the engine's authoritative in-memory per-folder activity
 and outstanding failures, with a monotonic revision. `SyncStatusChanged(t)`
 notifies clients to re-read it. Subscribers are established before workers
@@ -76,7 +85,7 @@ cargo test -p gdrived
 dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrived -- --ignored
 ```
 
-The private-bus case verifies status snapshots/signals, fatal sync failures,
+The private-bus case verifies Drive ID/path transport, status snapshots/signals, fatal sync failures,
 explicit stop, sign-out signals and cancellation without a real
 Google account or the user's daemon.
 

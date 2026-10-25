@@ -11,9 +11,26 @@ TestCase {
     visible: true
     when: windowShown
 
-    property var dialog
+    property var dialog: null
     readonly property var testBackend: backend
     property int heartbeats: 0
+
+    DriveFolderSelection {
+        id: selectedFolder
+        width: parent.width
+    }
+
+    Connections {
+        target: testCase.dialog
+        function onFolderSelected(folderId, folderPath) {
+            selectedFolder.selectFolder(folderId, folderPath)
+        }
+    }
+
+    Component {
+        id: configuredPathComponent
+        DriveFolderPath { width: 160 }
+    }
 
     Timer {
         interval: 10
@@ -74,6 +91,7 @@ TestCase {
     }
 
     function init() {
+        selectedFolder.reset()
         backend.driveFoldersJson = "[]"
         backend.driveFoldersError = ""
         backend.driveFoldersLoading = false
@@ -157,6 +175,8 @@ TestCase {
         compare(selection.count, 1)
         compare(selection.signalArguments[0][0], "")
         compare(selection.signalArguments[0][1], "My Drive")
+        compare(findChild(selectedFolder, "driveFolderPathField").text, "My Drive")
+        compare(selectedFolder.folderId, "")
         dialog.open()
         tryCompare(dialog, "opened", true)
         backend.complete(backend.generation, [{id: "child", name: "Projects"}], "")
@@ -174,7 +194,91 @@ TestCase {
         mouseClick(findChild(dialog, "selectDriveFolderButton"))
         compare(selection.count, 2)
         compare(selection.signalArguments[1][0], "child")
-        compare(selection.signalArguments[1][1], "My Drive / Projects")
+        compare(selection.signalArguments[1][1], "My Drive/Projects")
+        compare(findChild(selectedFolder, "driveFolderPathField").text, "My Drive/Projects")
+        compare(selectedFolder.folderId, "child")
+        verify(!findChild(selectedFolder, "driveFolderIdField").visible)
+    }
+
+    function test_manual_id_invalidates_path_and_reselection_restores_it() {
+        dialog.close()
+        tryCompare(dialog, "visible", false)
+        selectedFolder.selectFolder("child", "My Drive/Projects")
+        var advanced = findChild(selectedFolder, "advancedDriveFolderToggle")
+        advanced.Accessible.pressAction()
+        var idField = findChild(selectedFolder, "driveFolderIdField")
+        verify(idField.visible)
+        compare(idField.text, "child")
+        idField.forceActiveFocus()
+        keySequence("Ctrl+A")
+        keyClick(Qt.Key_X)
+        compare(selectedFolder.folderId, "x")
+        compare(selectedFolder.folderPath, "")
+        compare(findChild(selectedFolder, "driveFolderPathField").text,
+                "Drive path unavailable; reselect folder")
+        keySequence("Ctrl+A")
+        keyClick(Qt.Key_Backspace)
+        compare(selectedFolder.folderId, "")
+        compare(findChild(selectedFolder, "driveFolderPathField").text, "My Drive")
+        selectedFolder.selectFolder("other", "My Drive/Other")
+        compare(idField.text, "other")
+        verify(!idField.visible)
+        compare(findChild(selectedFolder, "driveFolderPathField").text, "My Drive/Other")
+        selectedFolder.reset()
+        compare(selectedFolder.folderPath, "")
+        compare(idField.text, "")
+        compare(findChild(selectedFolder, "driveFolderPathField").text, "My Drive")
+    }
+
+    function test_cancel_browsing_preserves_previous_selection() {
+        selectedFolder.selectFolder("saved", "My Drive/Saved")
+        dialog.enterFolder("unsaved", "Unsaved")
+        dialog.standardButton(Dialog.Cancel).Accessible.pressAction()
+        tryCompare(dialog, "visible", false)
+        compare(selectedFolder.folderId, "saved")
+        compare(selectedFolder.folderPath, "My Drive/Saved")
+    }
+
+    function test_configured_path_display_data() {
+        return [
+            {tag: "legacy root", id: "", path: "", expected: "My Drive"},
+            {tag: "explicit root", id: "root", path: "Old root name", expected: "My Drive"},
+            {tag: "legacy non-root", id: "opaque-id", path: "",
+                expected: "Drive path unavailable; reselect folder"},
+            {tag: "saved", id: "opaque-id", path: "My Drive/Parent/Selected",
+                expected: "My Drive/Parent/Selected"},
+            {tag: "literal names", id: "opaque-id", path: "My Drive/<b>Photos & files</b>",
+                expected: "My Drive/<b>Photos & files</b>"}
+        ]
+    }
+
+    function test_configured_path_display(data) {
+        var label = createTemporaryObject(configuredPathComponent, testCase,
+            {folderId: data.id, folderPath: data.path})
+        verify(label !== null)
+        compare(label.text, data.expected)
+        compare(label.Accessible.name, data.expected)
+        compare(label.textFormat, Text.PlainText)
+    }
+
+    function test_long_path_tooltip_wraps_within_window() {
+        dialog.close()
+        tryCompare(dialog, "visible", false)
+        var path = "My Drive/" + "LongFolderName".repeat(40) + "/Photos"
+        var label = createTemporaryObject(configuredPathComponent, testCase,
+            {folderId: "opaque-id", folderPath: path, y: selectedFolder.height + 20})
+        verify(label !== null)
+        mouseMove(label, label.width / 2, label.height / 2)
+        var tooltip = findChild(label, "driveFolderPathToolTip")
+        verify(tooltip !== null)
+        tryCompare(tooltip, "visible", true)
+        tryCompare(tooltip, "opened", true)
+        verify(tooltip.width <= testCase.width - 24)
+        compare(tooltip.contentItem.text, path)
+        compare(tooltip.contentItem.wrapMode, Text.Wrap)
+        compare(tooltip.contentItem.textFormat, Text.PlainText)
+        tryVerify(() => tooltip.contentItem.lineCount > 1)
+        verify(!tooltip.contentItem.truncated)
     }
 
     function test_breadcrumb_navigation_discards_superseded_reply() {

@@ -16,7 +16,7 @@ XML = """
 <node>
   <interface name="org.gclient.GDrive1">
     <method name="ListSyncFolders">
-      <arg direction="out" type="a(ssssssbb)"/>
+      <arg direction="out" type="a(sssssssbb)"/>
     </method>
     <method name="IsAuthenticated"><arg direction="out" type="b"/></method>
     <signal name="AuthenticationChanged"><arg type="b"/></signal>
@@ -99,7 +99,14 @@ def main():
             mode = requested
             invocation.return_value(GLib.Variant("()", ()))
         elif method == "ListSyncFolders":
-            invocation.return_value(GLib.Variant("(a(ssssssbb))", ([],)))
+            rows = [
+                ("selected-sync", "Saved selection", "opaque-folder-id",
+                 "My Drive/Parent/Selected", "/fixture/selected", "", "", False, False),
+                ("legacy-sync", "Legacy selection", "legacy-opaque-id",
+                 "", "/fixture/legacy", "", "", False, False),
+                ("root-sync", "Root selection", "", "", "/fixture/root", "", "", False, False),
+            ]
+            invocation.return_value(GLib.Variant("(a(sssssssbb))", (rows,)))
         elif method == "IsAuthenticated":
             if pause_authentication:
                 if len(authentication_reads) >= 100:

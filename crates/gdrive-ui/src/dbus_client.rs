@@ -17,6 +17,7 @@ pub enum Request {
     AddFolder {
         display_name: String,
         drive_folder_id: String,
+        drive_folder_path: String,
         local_path: String,
         owner_user: String,
         owner_group: String,
@@ -289,6 +290,7 @@ async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
         Request::AddFolder {
             display_name,
             drive_folder_id,
+            drive_folder_path,
             local_path,
             owner_user,
             owner_group,
@@ -298,6 +300,7 @@ async fn call(request: Request, deadline: Duration) -> zbus::Result<Response> {
                 .add_sync_folder(
                     &display_name,
                     &drive_folder_id,
+                    &drive_folder_path,
                     &local_path,
                     &owner_user,
                     &owner_group,
@@ -404,7 +407,8 @@ mod tests {
                 vec![(
                     "folder".into(),
                     "Configured folder".into(),
-                    "".into(),
+                    "projects-id".into(),
+                    "My Drive/Projects".into(),
                     "/fixture".into(),
                     "".into(),
                     "".into(),
@@ -429,6 +433,27 @@ mod tests {
 
         async fn remove_sync_folder(&self, _id: String) -> zbus::fdo::Result<()> {
             Err(zbus::fdo::Error::Failed("fixture mutation failed".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn add_sync_folder(
+            &self,
+            display_name: String,
+            drive_folder_id: String,
+            drive_folder_path: String,
+            local_path: String,
+            owner_user: String,
+            owner_group: String,
+            enabled: bool,
+        ) -> String {
+            assert_eq!(display_name, "Projects");
+            assert_eq!(drive_folder_id, "projects-id");
+            assert_eq!(drive_folder_path, "My Drive/Projects");
+            assert_eq!(local_path, "/fixture");
+            assert_eq!(owner_user, "user");
+            assert_eq!(owner_group, "group");
+            assert!(!enabled);
+            "folder".into()
         }
 
         #[zbus(signal)]
@@ -490,6 +515,19 @@ mod tests {
             .await
             .unwrap_err()
             .contains("fixture mutation failed"));
+        assert!(matches!(
+            execute(Request::AddFolder {
+                display_name: "Projects".into(),
+                drive_folder_id: "projects-id".into(),
+                drive_folder_path: "My Drive/Projects".into(),
+                local_path: "/fixture".into(),
+                owner_user: "user".into(),
+                owner_group: "group".into(),
+                enabled: false,
+            })
+            .await,
+            Ok(Response::Done)
+        ));
 
         assert!(matches!(
             execute(Request::DarkMode).await,
@@ -513,6 +551,8 @@ mod tests {
             };
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].0, "folder");
+            assert_eq!(rows[0].2, "projects-id");
+            assert_eq!(rows[0].3, "My Drive/Projects");
             assert!(error.contains(if mode == 1 {
                 "authentication read failed"
             } else {
