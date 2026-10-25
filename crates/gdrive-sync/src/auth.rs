@@ -6,6 +6,8 @@
 //! overrides or build-time application credentials. The Drive client retains
 //! refresh metadata and renews access tokens without browser interaction.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use oauth2::basic::BasicClient;
@@ -133,7 +135,10 @@ pub(crate) async fn refresh_access_token(
         request.request_async(&adapter),
     )
     .await
-    .map_err(|_| SyncError::Timeout("refreshing the OAuth access token"))?
+    .map_err(|source| SyncError::Timeout {
+        operation: "refreshing the OAuth access token",
+        source: Box::new(source),
+    })?
     .map_err(|error| match error {
         RequestTokenError::ServerResponse(response)
             if response.error() == &BasicErrorResponseType::InvalidGrant =>
@@ -143,9 +148,16 @@ pub(crate) async fn refresh_access_token(
         RequestTokenError::ServerResponse(_) => SyncError::OAuth(
             "token refresh rejected; check the daemon's OAuth client configuration".into(),
         ),
-        RequestTokenError::Request(_) => SyncError::OAuth(
-            "token refresh transport failed; check the connection and retry".into(),
-        ),
+        RequestTokenError::Request(ReqwestOAuthError::Reqwest(source)) if source.is_timeout() => {
+            SyncError::Timeout {
+                operation: "refreshing the OAuth access token",
+                source: Box::new(source.without_url()),
+            }
+        }
+        RequestTokenError::Request(ReqwestOAuthError::Reqwest(source)) => {
+            SyncError::OAuthTransport(ReqwestOAuthError::Reqwest(source.without_url()))
+        }
+        RequestTokenError::Request(source) => SyncError::OAuthTransport(source),
         _ => SyncError::OAuth("invalid response from the OAuth token endpoint".into()),
     })?;
     if response.access_token().secret().is_empty()
@@ -180,13 +192,32 @@ pub fn load_token(path: &Path) -> Result<Option<StoredToken>, SyncError> {
 }
 
 pub fn save_token(path: &Path, token: &StoredToken) -> Result<(), SyncError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
     let text = serde_json::to_string_pretty(token)
         .map_err(|e| SyncError::OAuth(format!("failed to serialize token: {e}")))?;
-    std::fs::write(path, text)?;
-    Ok(())
+    let temporary = parent.join(format!(".oauth-token-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if let Err(error) = std::fs::remove_file(&temporary) {
+            tracing::warn!(%error, "failed to remove temporary OAuth token cache");
+        }
+    }
+    result
 }
 
 /// Runs the interactive "installed app" OAuth2 flow: opens the consent URL

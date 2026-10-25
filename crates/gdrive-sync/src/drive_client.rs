@@ -156,7 +156,10 @@ impl DriveClient {
     async fn access_token(&self, rejected: Option<&TokenState>) -> Result<TokenState, SyncError> {
         tokio::time::timeout(REFRESH_TIMEOUT, self.refresh_if_needed(rejected))
             .await
-            .map_err(|_| SyncError::Timeout("refreshing Google Drive credentials"))?
+            .map_err(|source| SyncError::Timeout {
+                operation: "refreshing Google Drive credentials",
+                source: Box::new(source),
+            })?
     }
 
     async fn refresh_if_needed(
@@ -320,7 +323,10 @@ impl DriveClient {
             self.list_files(&query, "nextPageToken, files(id, name)"),
         )
         .await
-        .map_err(|_| SyncError::Timeout("listing Drive folders"))??;
+        .map_err(|source| SyncError::Timeout {
+            operation: "listing Drive folders",
+            source: Box::new(source),
+        })??;
         Ok(folders
             .into_iter()
             .map(|f| DriveFile {
@@ -796,6 +802,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_transport_timeouts_preserve_classification_and_source() {
+        use std::error::Error;
+
+        for delay_body in [false, true] {
+            let server = Server::start(vec![Reply {
+                header_delay: if delay_body {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(250)
+                },
+                body_delay: if delay_body {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::ZERO
+                },
+                ..Reply::json(REFRESH_REPLY)
+            }]);
+            let mut client = server.normal_client();
+            client.oauth_http = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_millis(50))
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let cache = Cache::new(&client, Some(0));
+            let error = client.list_child_folders("root").await.unwrap_err();
+            assert!(matches!(error, SyncError::Timeout { .. }));
+            let source = error
+                .source()
+                .unwrap()
+                .downcast_ref::<reqwest::Error>()
+                .unwrap();
+            assert!(source.is_timeout());
+            assert!(source.url().is_none());
+            assert_eq!(
+                auth::load_token(&cache.0).unwrap().unwrap().access_token,
+                "stale-token"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_token_cache_readers_never_observe_partial_writes() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Barrier,
+        };
+
+        let server = Server::start(vec![]);
+        let client = server.normal_client();
+        let cache = Cache::new(&client, Some(0));
+        let tokens: Vec<_> = ['a', 'b']
+            .into_iter()
+            .map(|value| StoredToken {
+                access_token: value.to_string().repeat(256 * 1024),
+                refresh_token: Some("fixture-refresh-token".into()),
+                expires_at: Some(i64::MAX),
+            })
+            .collect();
+        client.save_token(tokens[0].clone(), &cache.0).unwrap();
+        let barrier = Barrier::new(3);
+        let done = AtomicBool::new(false);
+        let reads = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        assert!(
+                            Instant::now() < deadline,
+                            "token-cache writer did not finish"
+                        );
+                        let token = auth::load_token(&cache.0)
+                            .unwrap()
+                            .expect("cache disappeared");
+                        assert!(tokens
+                            .iter()
+                            .any(|expected| token.access_token == expected.access_token));
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        if done.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                });
+            }
+            barrier.wait();
+            for index in 0..32 {
+                client
+                    .save_token(tokens[index % 2].clone(), &cache.0)
+                    .unwrap();
+            }
+            done.store(true, Ordering::Release);
+        });
+        assert!(reads.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[tokio::test]
     async fn browse_deadline_cancels_stalled_refresh_and_retry_can_recover() {
         let (completed, received) = mpsc::channel();
         let server = Server::start(vec![
@@ -812,7 +917,7 @@ mod tests {
         let start = Instant::now();
         assert!(matches!(
             client.list_child_folders("root").await,
-            Err(SyncError::Timeout(_))
+            Err(SyncError::Timeout { .. })
         ));
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(
@@ -1049,7 +1154,7 @@ mod tests {
             let client = server.client(Duration::from_secs(2), Duration::from_millis(100));
             assert!(matches!(
                 client.list_child_folders("root").await,
-                Err(SyncError::Timeout(_))
+                Err(SyncError::Timeout { .. })
             ));
         }
     }
@@ -1064,7 +1169,7 @@ mod tests {
         let client = server.client(Duration::from_secs(2), Duration::from_millis(350));
         assert!(matches!(
             client.list_child_folders("root").await,
-            Err(SyncError::Timeout(_))
+            Err(SyncError::Timeout { .. })
         ));
         assert_eq!(server.requests.try_iter().count(), 2);
     }

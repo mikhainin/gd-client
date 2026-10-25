@@ -297,7 +297,10 @@ impl GDriveService {
                 }),
             )
             .await
-            .map_err(|_| SyncError::Timeout("sign-in exceeded 10 minutes"))
+            .map_err(|source| SyncError::Timeout {
+                operation: "sign-in exceeded 10 minutes",
+                source: Box::new(source),
+            })
             .and_then(|result| result);
 
             let mut state = service.state.lock().await;
@@ -384,7 +387,7 @@ impl GDriveService {
             SyncError::NotAuthenticated | SyncError::ReauthenticationRequired => {
                 zbus::fdo::Error::AccessDenied(format!("Cannot browse Google Drive: {e}"))
             }
-            SyncError::Timeout(_) => zbus::fdo::Error::Timeout(e.to_string()),
+            SyncError::Timeout { .. } => zbus::fdo::Error::Timeout(e.to_string()),
             SyncError::Http(ref error) if error.is_timeout() => {
                 zbus::fdo::Error::Timeout(format!("failed to list Drive folders: {e}"))
             }

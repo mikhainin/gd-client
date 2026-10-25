@@ -28,8 +28,15 @@ pub enum SyncError {
     #[error("Google Drive credentials expired or were revoked. Sign out and sign in again.")]
     ReauthenticationRequired,
 
-    #[error("timed out while {0}")]
-    Timeout(&'static str),
+    #[error("timed out while {operation}")]
+    Timeout {
+        operation: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("OAuth token refresh transport failed; check the connection and retry")]
+    OAuthTransport(#[source] crate::auth::ReqwestOAuthError),
 
     #[error("OAuth2 error: {0}")]
     OAuth(String),

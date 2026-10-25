@@ -23,6 +23,8 @@ The sync engine, used by the `gdrived` daemon.
   completion with sign-out; `authenticate` remains the obtain-and-save wrapper.
   Access-token refresh reuses the OAuth adapter, preserves an omitted refresh
   token, and accepts a replacement refresh token when Google rotates it.
+  Token persistence writes a private sibling temporary file and atomically
+  replaces the cache, so concurrent authentication readers see complete JSON.
   Interactive sign-in explicitly requests offline access and consent so Google
   issues a refresh token even after an earlier authorization. Missing offline
   access is reported as an error instead of saving a non-renewable session.
@@ -47,6 +49,8 @@ The sync engine, used by the `gdrived` daemon.
   Missing client configuration, revoked refresh tokens, malformed responses,
   and cache-write failures are explicit errors, never empty listings. Refresh
   failures do not log credentials or response bodies.
+  Transport and deadline failures retain their source errors; OAuth connection,
+  response, and body timeouts retain timeout classification through D-Bus.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
   sync folder's local path.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API
