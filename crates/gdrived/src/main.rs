@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     // (with no folders running) and the UI's "Sign in" button drives the
     // interactive OAuth flow via the `SignIn` D-Bus method instead, so
     // startup never blocks on the user completing browser-based consent.
-    let access_token = match load_cached_access_token() {
+    let cached_token = match load_cached_token() {
         Ok(Some(token)) => Some(token),
         Ok(None) => {
             tracing::info!(
@@ -50,8 +50,11 @@ async fn main() -> anyhow::Result<()> {
     let state_db_path = gdrive_common::paths::sync_state_db_file()?;
     let state_db = StateDb::open(&state_db_path)?;
 
-    let authenticated = access_token.is_some();
-    let engine = SyncEngine::new(config.clone(), state_db, access_token.unwrap_or_default());
+    let authenticated = cached_token.is_some();
+    let engine = SyncEngine::new(config.clone(), state_db, String::new());
+    if let Some(token) = cached_token {
+        engine.restore_token(token, auth::default_token_path()?);
+    }
     if authenticated {
         engine.start_all(&config);
     }
@@ -93,12 +96,21 @@ async fn main() -> anyhow::Result<()> {
 /// starting the interactive authentication flow (that's now only triggered
 /// on demand via the D-Bus `SignIn` method - see `dbus_service::sign_in`).
 ///
-/// Token refresh is not yet implemented: once Google Cloud OAuth client
-/// credentials are wired up, this should check `expires_at` and use the
-/// refresh token instead of always trusting the cached access token.
-fn load_cached_access_token() -> anyhow::Result<Option<String>> {
+/// Retains expiry and refresh metadata so Drive requests can renew the session.
+fn load_cached_token() -> anyhow::Result<Option<auth::StoredToken>> {
     let token_path = auth::default_token_path()?;
-    Ok(auth::load_token(&token_path)?.map(|token| token.access_token))
+    Ok(auth::load_token(&token_path)?.inspect(|token| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_secs() as i64)
+            .unwrap_or(0);
+        tracing::debug!(
+            expired = token.expires_at.map(|expires_at| expires_at <= now),
+            has_refresh_token = token.refresh_token.is_some(),
+            oauth_client_configured = auth::OAuthConfig::from_env().is_some(),
+            "loaded cached token metadata"
+        );
+    }))
 }
 
 async fn wait_for_shutdown_signal() {

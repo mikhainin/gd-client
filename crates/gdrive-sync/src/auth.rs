@@ -2,10 +2,9 @@
 //! a local loopback redirect listener).
 //!
 //! Google Cloud OAuth client credentials are required for real
-//! authentication. Per project decision (see AGENTS.md Change Log), this is
-//! stubbed out for now: [`OAuthConfig::client_id`] / `client_secret` must be
-//! supplied via configuration or the `GDRIVE_CLIENT_ID` / `GDRIVE_CLIENT_SECRET`
-//! environment variables before [`authenticate`] can complete.
+//! authentication and token refresh. [`OAuthConfig::from_env`] loads runtime
+//! overrides or build-time application credentials. The Drive client retains
+//! refresh metadata and renews access tokens without browser interaction.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +23,7 @@ use crate::error::SyncError;
 pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+pub(crate) const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Default OAuth client credentials baked into the binary at *build* time
 /// via the `GDRIVE_BUILD_CLIENT_ID` / `GDRIVE_BUILD_CLIENT_SECRET`
@@ -90,6 +89,86 @@ pub struct StoredToken {
     pub expires_at: Option<i64>,
 }
 
+impl StoredToken {
+    pub(crate) fn needs_refresh(&self) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| expires_at <= now_unix_secs() + 30)
+    }
+}
+
+pub(crate) fn refresh_http_client() -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15));
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder.build()
+}
+
+pub(crate) async fn refresh_access_token(
+    config: &OAuthConfig,
+    previous: &StoredToken,
+    token_url: &str,
+    http: reqwest::Client,
+) -> Result<StoredToken, SyncError> {
+    use oauth2::{basic::BasicErrorResponseType, RefreshToken, RequestTokenError};
+
+    let refresh_token = previous
+        .refresh_token
+        .as_ref()
+        .filter(|token| !token.is_empty())
+        .ok_or(SyncError::ReauthenticationRequired)?;
+    let client = BasicClient::new(ClientId::new(config.client_id.clone()))
+        .set_client_secret(ClientSecret::new(config.client_secret.clone()))
+        .set_token_uri(
+            TokenUrl::new(token_url.to_owned())
+                .map_err(|_| SyncError::OAuth("invalid OAuth token endpoint".into()))?,
+        );
+    let adapter = reqwest_http_client(http);
+    let refresh = RefreshToken::new(refresh_token.clone());
+    let request = client.exchange_refresh_token(&refresh);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        request.request_async(&adapter),
+    )
+    .await
+    .map_err(|_| SyncError::Timeout("refreshing the OAuth access token"))?
+    .map_err(|error| match error {
+        RequestTokenError::ServerResponse(response)
+            if response.error() == &BasicErrorResponseType::InvalidGrant =>
+        {
+            SyncError::ReauthenticationRequired
+        }
+        RequestTokenError::ServerResponse(_) => SyncError::OAuth(
+            "token refresh rejected; check the daemon's OAuth client configuration".into(),
+        ),
+        RequestTokenError::Request(_) => SyncError::OAuth(
+            "token refresh transport failed; check the connection and retry".into(),
+        ),
+        _ => SyncError::OAuth("invalid response from the OAuth token endpoint".into()),
+    })?;
+    if response.access_token().secret().is_empty()
+        || response
+            .refresh_token()
+            .is_some_and(|token| token.secret().is_empty())
+    {
+        return Err(SyncError::OAuth(
+            "OAuth token endpoint returned an empty token".into(),
+        ));
+    }
+    Ok(StoredToken {
+        access_token: response.access_token().secret().clone(),
+        refresh_token: response
+            .refresh_token()
+            .map(|token| token.secret().clone())
+            .or_else(|| previous.refresh_token.clone()),
+        expires_at: response
+            .expires_in()
+            .map(|duration| now_unix_secs() + duration.as_secs() as i64),
+    })
+}
+
 pub fn load_token(path: &Path) -> Result<Option<StoredToken>, SyncError> {
     if !path.exists() {
         return Ok(None);
@@ -148,6 +227,8 @@ pub async fn authorize(
     let (auth_url, _csrf_token) = client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new(DRIVE_SCOPE.to_string()))
+        .add_extra_param("access_type", "offline")
+        .add_extra_param("prompt", "consent")
         .set_pkce_challenge(pkce_challenge)
         .url();
 
@@ -179,6 +260,15 @@ pub async fn authorize(
             .map(|d| now_unix_secs() + d.as_secs() as i64),
     };
 
+    if stored
+        .refresh_token
+        .as_ref()
+        .is_none_or(|token| token.is_empty())
+    {
+        return Err(SyncError::OAuth(
+            "Google did not grant offline access; sign in again and complete consent".into(),
+        ));
+    }
     Ok(stored)
 }
 

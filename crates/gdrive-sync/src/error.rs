@@ -25,6 +25,9 @@ pub enum SyncError {
     #[error("not authenticated with Google Drive yet")]
     NotAuthenticated,
 
+    #[error("Google Drive credentials expired or were revoked. Sign out and sign in again.")]
+    ReauthenticationRequired,
+
     #[error("timed out while {0}")]
     Timeout(&'static str),
 
