@@ -98,7 +98,7 @@ pub(crate) struct FolderRun {
 }
 
 impl FolderRun {
-    fn update(&self, update: impl FnOnce(&mut FolderStatus)) {
+    fn update(&self, update: impl FnOnce(&mut FolderStatus) -> bool) {
         self.tracker.update(|state| {
             let Some(folder) = state
                 .folders
@@ -107,27 +107,33 @@ impl FolderRun {
             else {
                 return false;
             };
-            let before = (folder.syncing, folder.errors.clone());
-            update(folder);
-            before != (folder.syncing, folder.errors.clone())
+            update(folder)
         });
     }
 
     pub(crate) fn active(&self) {
-        self.update(|folder| folder.syncing = true);
+        self.update(|folder| !std::mem::replace(&mut folder.syncing, true));
+    }
+
+    pub(crate) fn clear_error(&self, work: &str) {
+        self.update(|folder| folder.errors.remove(work).is_some());
     }
 
     pub(crate) fn finish(&self, work: &str, result: Result<(), String>) {
         self.update(|folder| {
-            folder.syncing = false;
-            match result {
-                Ok(()) => {
-                    folder.errors.remove(work);
-                }
+            let was_syncing = std::mem::take(&mut folder.syncing);
+            let error_changed = match result {
+                Ok(()) => folder.errors.remove(work).is_some(),
                 Err(error) => {
-                    folder.errors.insert(work.to_owned(), error);
+                    if folder.errors.get(work) == Some(&error) {
+                        false
+                    } else {
+                        folder.errors.insert(work.to_owned(), error);
+                        true
+                    }
                 }
-            }
+            };
+            was_syncing || error_changed
         });
     }
 }
@@ -135,15 +141,14 @@ impl FolderRun {
 impl Drop for FolderRun {
     fn drop(&mut self) {
         // Aborted and superseded workers cannot leave activity stuck on.
-        self.update(|folder| {
-            folder.syncing = false;
-            if std::thread::panicking() {
-                folder.errors.insert(
-                    "worker".into(),
-                    "sync task panicked; restart the folder".into(),
-                );
-            }
-        });
+        if std::thread::panicking() {
+            self.finish(
+                "worker",
+                Err("sync task panicked; restart the folder".into()),
+            );
+        } else {
+            self.update(|folder| std::mem::take(&mut folder.syncing));
+        }
     }
 }
 

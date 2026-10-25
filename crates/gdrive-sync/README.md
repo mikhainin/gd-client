@@ -13,7 +13,11 @@ The sync engine, used by the `gdrived` daemon.
   activity covers initial reconciliation and actual application of local/remote
   work, not idle workers or empty polling. Outstanding errors are keyed by
   affected work; only successful reconciliation/retry of that work or explicit
-  stop/restart clears them. Fatal initial failures remain visible after the
+  stop/restart clears them. Vanished local paths with no tracked remote item
+  are reconciled as obsolete, including failed uploads followed by a rename;
+  pending remote deletions and unrelated errors remain outstanding. Status
+  mutations touch only the affected activity flag/error entry, without cloning
+  the outstanding-error map. Fatal initial failures remain visible after the
   task exits. Stop/abort clears activity, and run generations reject updates
   from superseded tasks. Status is in memory, not persisted. Finished tasks
   are excluded from `running_folders`.

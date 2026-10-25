@@ -368,7 +368,15 @@ async fn handle_local_change(
         LocalChangeKind::Created | LocalChangeKind::Modified | LocalChangeKind::Other => {
             let metadata = match tokio::fs::metadata(&change.path).await {
                 Ok(m) => m,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if find_local_state(state_db, folder.id, &rel_path_str)?
+                        .and_then(|entry| entry.drive_file_id)
+                        .is_none()
+                    {
+                        status.clear_error(&format!("local {}", rel_path.display()));
+                    }
+                    return Ok(false);
+                }
                 Err(error) => return Err(error.into()),
             };
 
@@ -558,6 +566,72 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(engine.sync_status().folders.is_empty());
         drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vanished_rename_sources_clear_only_untracked_work_errors() {
+        let root = std::env::temp_dir().join(format!("gclient-rename-{}", Uuid::new_v4()));
+        let db = StateDb::open(&root.join("state.sqlite")).unwrap();
+        let folder = SyncFolder::new("fixture", root.join("files"), "", "");
+        tokio::fs::create_dir(&folder.local_path).await.unwrap();
+        let drive = DriveClient::new(String::new());
+
+        for (name, tracked) in [("untracked.txt", false), ("tracked.txt", true)] {
+            let source = folder.local_path.join(name);
+            tokio::fs::write(&source, b"fixture").await.unwrap();
+            if tracked {
+                db.upsert_file_state(&FileStateEntry {
+                    sync_folder_id: folder.id,
+                    local_rel_path: name.into(),
+                    drive_file_id: Some("remote-file".into()),
+                    is_folder: false,
+                    local_mtime_secs: None,
+                    drive_modified_time: None,
+                    md5_checksum: None,
+                })
+                .unwrap();
+            }
+            let tracker = StatusTracker::default();
+            let status = tracker.start(folder.id, 1);
+            let work = format!("local {name}");
+            status.finish(&work, Err("upload failed".into()));
+            status.finish("local unrelated.txt", Err("another failure".into()));
+            let renamed = format!("renamed-{name}");
+            tokio::fs::rename(&source, folder.local_path.join(&renamed))
+                .await
+                .unwrap();
+            let change = LocalChange {
+                path: source,
+                kind: crate::local_watcher::LocalChangeKind::Modified,
+            };
+            assert!(!handle_local_change(
+                &folder,
+                &drive,
+                &db,
+                "root",
+                &change,
+                nix::unistd::Uid::current(),
+                nix::unistd::Gid::current(),
+                &status,
+            )
+            .await
+            .unwrap());
+            status.finish(&format!("local {renamed}"), Ok(()));
+            let snapshot = tracker.snapshot();
+            let errors = &snapshot.folders[0].errors;
+            assert_eq!(
+                errors.iter().any(|error| error.starts_with(&work)),
+                tracked,
+                "a vanished source only retains work with a pending remote deletion"
+            );
+            assert!(errors
+                .iter()
+                .any(|error| error.starts_with("local unrelated.txt:")));
+            assert!(!snapshot.folders[0].syncing);
+        }
+
+        drop(db);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
