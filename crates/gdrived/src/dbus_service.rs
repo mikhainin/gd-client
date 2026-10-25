@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gdrive_common::dbus_api::{DriveFolderRow, SyncFolderRow};
+use gdrive_common::dbus_api::{DriveFolderRow, SyncFolderRow, SyncStatus};
 use gdrive_common::{AppConfig, SyncFolder};
 use gdrive_sync::auth::{self, OAuthConfig};
 use gdrive_sync::{SyncEngine, SyncError};
@@ -80,6 +80,31 @@ pub struct GDriveService {
 }
 
 impl GDriveService {
+    pub async fn forward_status(
+        connection: zbus::Connection,
+        mut changes: tokio::sync::watch::Receiver<u64>,
+    ) {
+        while changes.changed().await.is_ok() {
+            let revision = *changes.borrow_and_update();
+            match tokio::time::timeout(
+                SIGNAL_TIMEOUT,
+                connection.emit_signal(
+                    None::<&str>,
+                    gdrive_common::dbus_api::OBJECT_PATH,
+                    "org.gclient.GDrive1",
+                    "SyncStatusChanged",
+                    &(revision,),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("failed to emit SyncStatusChanged: {error}"),
+                Err(_) => tracing::warn!("SyncStatusChanged emission timed out"),
+            }
+        }
+    }
+
     pub fn new(
         config: AppConfig,
         config_path: PathBuf,
@@ -149,6 +174,13 @@ impl GDriveService {
 /// signatures here must stay in sync with that trait.
 #[interface(name = "org.gclient.GDrive1")]
 impl GDriveService {
+    fn sync_status(&self) -> SyncStatus {
+        self.engine.sync_status()
+    }
+
+    #[zbus(signal)]
+    async fn sync_status_changed(emitter: &SignalEmitter<'_>, revision: u64) -> zbus::Result<()>;
+
     /// Lists all configured sync folders and whether each is currently active.
     async fn list_sync_folders(&self) -> Vec<SyncFolderRow> {
         let state = self.state.lock().await;
@@ -345,8 +377,8 @@ impl GDriveService {
                 Ok(())
             };
 
-            for folder_id in self.engine.running_folders() {
-                self.engine.stop_folder(folder_id);
+            for folder in &state.config.sync_folders {
+                self.engine.stop_folder(folder.id);
             }
             self.engine.set_access_token(String::new());
             if removal.is_ok() {
@@ -694,6 +726,33 @@ mod tests {
             let proxy = gdrive_common::dbus_api::GDrive1Proxy::new(&connection)
                 .await
                 .unwrap();
+            assert!(proxy.sync_status().await.unwrap().folders.is_empty());
+            let mut status_signals = proxy.receive_sync_status_changed().await.unwrap();
+            let forwarder = tokio::spawn(GDriveService::forward_status(
+                connection.clone(),
+                fixture.service.engine.subscribe_status(),
+            ));
+            let invalid_path = fixture.root.join("not-a-folder");
+            std::fs::write(&invalid_path, b"fixture").unwrap();
+            let folder = SyncFolder::new("fixture", invalid_path, "", "");
+            fixture.service.engine.start_folder(folder.clone());
+            loop {
+                let signal = std::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut status_signals).poll_next(cx)
+                })
+                .await
+                .unwrap();
+                let snapshot = proxy.sync_status().await.unwrap();
+                assert!(snapshot.revision >= signal.args().unwrap().revision);
+                if !snapshot.folders[0].errors.is_empty() {
+                    assert!(!snapshot.folders[0].syncing);
+                    break;
+                }
+            }
+            fixture.service.engine.stop_folder(folder.id);
+            assert!(proxy.sync_status().await.unwrap().folders.is_empty());
+            forwarder.abort();
+            assert!(forwarder.await.unwrap_err().is_cancelled());
             let mut signals = proxy.receive_authentication_changed().await.unwrap();
             assert!(proxy.is_authenticated().await.unwrap());
             proxy.sign_out().await.unwrap();

@@ -7,7 +7,61 @@
 use cxx_qt::{CxxQtType, Threading};
 use serde::Serialize;
 
-use crate::dbus_client::{self, AuthenticationEvent, PendingRequest, Request, Response};
+use crate::dbus_client::{
+    self, AuthenticationEvent, PendingRequest, Request, Response, SyncStatusEvent,
+};
+
+fn summarize_sync_status(snapshot: &gdrive_common::dbus_api::SyncStatus) -> (&'static str, String) {
+    let errors: Vec<_> = snapshot
+        .folders
+        .iter()
+        .flat_map(|folder| {
+            folder
+                .errors
+                .iter()
+                .map(move |error| format!("{}: {error}", folder.folder_id))
+        })
+        .collect();
+    if !errors.is_empty() {
+        ("error", errors.join("\n"))
+    } else if snapshot.folders.iter().any(|folder| folder.syncing) {
+        ("syncing", String::new())
+    } else {
+        ("idle", String::new())
+    }
+}
+
+#[cfg(test)]
+mod tray_status_tests {
+    use super::summarize_sync_status;
+    use gdrive_common::dbus_api::{FolderSyncStatus, SyncStatus};
+
+    #[test]
+    fn one_folders_error_overrides_another_folders_activity() {
+        let mut snapshot = SyncStatus {
+            revision: 4,
+            folders: vec![
+                FolderSyncStatus {
+                    folder_id: "failed".into(),
+                    syncing: false,
+                    errors: vec!["upload denied".into()],
+                },
+                FolderSyncStatus {
+                    folder_id: "active".into(),
+                    syncing: true,
+                    errors: vec![],
+                },
+            ],
+        };
+        let (state, error) = summarize_sync_status(&snapshot);
+        assert_eq!(state, "error");
+        assert!(error.contains("failed: upload denied"));
+        snapshot.folders[0].errors.clear();
+        assert_eq!(summarize_sync_status(&snapshot).0, "syncing");
+        snapshot.folders[1].syncing = false;
+        assert_eq!(summarize_sync_status(&snapshot), ("idle", String::new()));
+    }
+}
 
 /// One row of `foldersJson`, mirroring [`gdrive_common::dbus_api::SyncFolderRow`]
 /// but as a named struct so it serialises to a JSON object per folder (easier
@@ -63,6 +117,8 @@ pub mod qobject {
         #[qproperty(bool, dark_mode, cxx_name = "darkMode")]
         #[qproperty(bool, busy)]
         #[qproperty(bool, refreshing)]
+        #[qproperty(QString, sync_state, cxx_name = "syncState")]
+        #[qproperty(QString, sync_error, cxx_name = "syncError")]
         #[qproperty(QString, drive_folders_json, cxx_name = "driveFoldersJson")]
         #[qproperty(QString, drive_folders_error, cxx_name = "driveFoldersError")]
         #[qproperty(bool, drive_folders_loading, cxx_name = "driveFoldersLoading")]
@@ -159,6 +215,8 @@ pub struct SyncManagerRust {
     dark_mode: bool,
     busy: bool,
     refreshing: bool,
+    sync_state: QString,
+    sync_error: QString,
     drive_folders_json: QString,
     drive_folders_error: QString,
     drive_folders_loading: bool,
@@ -171,6 +229,7 @@ pub struct SyncManagerRust {
     portal: PendingRequest,
     authentication_watch: PendingRequest,
     authentication_revision: u64,
+    sync_status_watch: PendingRequest,
 }
 
 impl Default for SyncManagerRust {
@@ -183,6 +242,8 @@ impl Default for SyncManagerRust {
             dark_mode: false,
             busy: false,
             refreshing: false,
+            sync_state: QString::from("starting"),
+            sync_error: QString::from("Waiting for daemon sync status"),
             drive_folders_json: QString::from("[]"),
             drive_folders_error: QString::default(),
             drive_folders_loading: false,
@@ -195,6 +256,7 @@ impl Default for SyncManagerRust {
             portal: PendingRequest::default(),
             authentication_watch: PendingRequest::default(),
             authentication_revision: 0,
+            sync_status_watch: PendingRequest::default(),
         }
     }
 }
@@ -219,6 +281,26 @@ impl qobject::SyncManager {
             return;
         }
         self.as_mut().rust_mut().initialized = true;
+        let qt_thread = self.qt_thread();
+        match dbus_client::spawn(dbus_client::watch_sync_status(move |event| {
+            if let Err(error) = qt_thread.queue(move |mut object| {
+                let (state, error) = match event {
+                    SyncStatusEvent::Snapshot(snapshot) => summarize_sync_status(&snapshot),
+                    SyncStatusEvent::Unavailable(error) => ("unavailable", error),
+                };
+                object.as_mut().set_sync_state(QString::from(state));
+                object.as_mut().set_sync_error(QString::from(error));
+            }) {
+                tracing::debug!("could not deliver sync status to Qt: {error:?}");
+            }
+        })) {
+            Ok(handle) => self.as_mut().rust_mut().sync_status_watch.attach(handle),
+            Err(error) => {
+                tracing::warn!("could not watch sync status: {error}");
+                self.as_mut().set_sync_state(QString::from("unavailable"));
+                self.as_mut().set_sync_error(QString::from(error));
+            }
+        }
         let qt_thread = self.qt_thread();
         match dbus_client::spawn(dbus_client::watch_authentication(move |event| {
             if let Err(error) = qt_thread.queue(move |mut object| {

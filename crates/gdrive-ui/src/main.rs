@@ -3,6 +3,7 @@
 //! `gdrived`; this binary only talks to it over D-Bus (see
 //! `dbus_client`/`cxxqt_object::SyncManager`) and renders `qml/main.qml`.
 
+mod app_icon;
 pub mod cxxqt_object;
 mod dbus_client;
 
@@ -25,6 +26,8 @@ fn main() {
     QQuickStyle::set_fallback_style(&QString::from("Fusion"));
 
     let mut app = QGuiApplication::new();
+    QGuiApplication::set_desktop_file_name(&QString::from("org.gclient.gdrive-ui"));
+    app_icon::configure();
     let mut engine = QQmlApplicationEngine::new();
 
     if let Some(engine) = engine.as_mut() {
