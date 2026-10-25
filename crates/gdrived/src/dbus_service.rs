@@ -194,6 +194,7 @@ impl GDriveService {
                     f.id.to_string(),
                     f.display_name.clone(),
                     f.drive_folder_id.clone().unwrap_or_default(),
+                    f.drive_folder_path.clone().unwrap_or_default(),
                     f.local_path.to_string_lossy().to_string(),
                     f.owner_user.clone(),
                     f.owner_group.clone(),
@@ -211,6 +212,7 @@ impl GDriveService {
         &self,
         display_name: String,
         drive_folder_id: String,
+        drive_folder_path: String,
         local_path: String,
         owner_user: String,
         owner_group: String,
@@ -222,10 +224,17 @@ impl GDriveService {
             owner_user,
             owner_group,
         );
-        folder.drive_folder_id = if drive_folder_id.is_empty() {
+        folder.drive_folder_id = if drive_folder_id.is_empty() || drive_folder_id == "root" {
             None
         } else {
             Some(drive_folder_id)
+        };
+        folder.drive_folder_path = if folder.drive_folder_id.is_none() {
+            Some("My Drive".into())
+        } else if drive_folder_path.is_empty() {
+            None
+        } else {
+            Some(drive_folder_path)
         };
         folder.enabled = enabled;
         let id = folder.id;
@@ -491,6 +500,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_paths_survive_persistence_and_listing_without_changing_drive_ids() {
+        let fixture = Fixture::new(AppConfig::default());
+        for (index, (drive_id, path, expected_id, expected_path)) in [
+            (
+                "photos-id",
+                "My Drive/Parent/Photos",
+                Some("photos-id"),
+                Some("My Drive/Parent/Photos"),
+            ),
+            ("manual-id", "", Some("manual-id"), None),
+            ("", "", None, Some("My Drive")),
+            ("root", "ignored", None, Some("My Drive")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = fixture
+                .service
+                .add_sync_folder(
+                    "Display name".into(),
+                    drive_id.into(),
+                    path.into(),
+                    fixture
+                        .root
+                        .join(format!("folder-{index}"))
+                        .to_string_lossy()
+                        .into(),
+                    "".into(),
+                    "".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let loaded = AppConfig::load_from(&fixture.service.config_path).unwrap();
+            let folder = &loaded.sync_folders[index];
+            assert_eq!(folder.id.to_string(), id);
+            assert_eq!(folder.display_name, "Display name");
+            assert_eq!(folder.drive_folder_id.as_deref(), expected_id);
+            assert_eq!(folder.drive_folder_path.as_deref(), expected_path);
+        }
+        let reloaded = Fixture::new(AppConfig::load_from(&fixture.service.config_path).unwrap());
+        let rows = reloaded.service.list_sync_folders().await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].2, "photos-id");
+        assert_eq!(rows[0].3, "My Drive/Parent/Photos");
+        assert_eq!(rows[1].2, "manual-id");
+        assert_eq!(rows[1].3, "");
+        assert_eq!(rows[2].2, "");
+        assert_eq!(rows[2].3, "My Drive");
+        assert_eq!(rows[3].2, "");
+        assert_eq!(rows[3].3, "My Drive");
+    }
+
+    #[tokio::test]
     async fn sign_in_uses_live_config_and_later_mutations_cannot_be_undone() {
         let fixture = Fixture::new(AppConfig::default());
         let disabled = fixture.folder("disabled");
@@ -514,6 +577,7 @@ mod tests {
             .service
             .add_sync_folder(
                 "added".into(),
+                "".into(),
                 "".into(),
                 fixture.root.join("added").to_string_lossy().into(),
                 "".into(),
@@ -685,6 +749,7 @@ mod tests {
             .add_sync_folder(
                 "failed".into(),
                 "".into(),
+                "".into(),
                 fixture.root.join("failed").to_string_lossy().into(),
                 "".into(),
                 "".into(),
@@ -727,6 +792,23 @@ mod tests {
             let proxy = gdrive_common::dbus_api::GDrive1Proxy::new(&connection)
                 .await
                 .unwrap();
+            let id = proxy
+                .add_sync_folder(
+                    "Photos",
+                    "photos-id",
+                    "My Drive/Parent/Photos",
+                    "/fixture/photos",
+                    "",
+                    "",
+                    false,
+                )
+                .await
+                .unwrap();
+            let rows = proxy.list_sync_folders().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, id);
+            assert_eq!(rows[0].2, "photos-id");
+            assert_eq!(rows[0].3, "My Drive/Parent/Photos");
             assert!(proxy.sync_status().await.unwrap().folders.is_empty());
             let mut status_signals = proxy.receive_sync_status_changed().await.unwrap();
             let forwarder = tokio::spawn(GDriveService::forward_status(

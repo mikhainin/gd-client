@@ -137,11 +137,11 @@ Dialog {
             enabled: !dialog.loading && !dialog.errorMessage
             text: qsTr("Select \"%1\"").arg(dialog.currentFolder().name)
             Accessible.name: qsTr("Select this folder")
-            Accessible.description: dialog.pathStack.map(entry => entry.name).join(" / ")
+            Accessible.description: dialog.pathStack.map(entry => entry.name).join("/")
             onClicked: {
                 dialog.folderSelected(
                     dialog.currentFolder().id,
-                    dialog.pathStack.map(entry => entry.name).join(" / "))
+                    dialog.pathStack.map(entry => entry.name).join("/"))
                 dialog.close()
             }
         }

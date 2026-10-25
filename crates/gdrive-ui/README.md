@@ -17,6 +17,8 @@ Qt6/QML desktop control panel for `gdrived`, built with
   alongside base QtQuick Controls) in favour of plain `Row`/`Column`.
 - `qml/DriveFolderDialog.qml` — asynchronous Drive folder browser, also
   exercised directly by the Qt Quick tests.
+- `qml/DriveFolderSelection.qml` and `qml/DriveFolderPath.qml` — pending
+  ID/path selection and the shared readable path display.
 - `qml/TrayPresentation.qml` — tray icon and tooltip selection from explicit
   connection, authentication, and engine-status properties.
 - `build.rs` — builds the QML module (`org.gclient.gdrive_ui`) via
@@ -39,6 +41,26 @@ cargo run -p gdrive-ui
 
 Requires `gdrived` to be running for the "Connected to gdrived" status and
 folder list to populate; the UI itself holds no sync state.
+
+## Drive folder paths
+
+The Add dialog displays `My Drive/Parent/Selected folder` after browsing, with
+`My Drive` for root. The opaque ID stays separate and is used for syncing.
+**Advanced: enter Drive folder ID** exposes manual entry; changing that ID
+invalidates the previously selected path. Canceling the browser preserves the
+pending selection, and adding a folder resets it to root.
+
+Configured folders show the saved remote path alongside their display name
+and local destination. Long paths are elided, with full text available through
+accessibility and hover. Legacy and manually entered non-root folders without
+a saved path show **Drive path unavailable; reselect folder**, not the ID.
+Select through Browse when adding a folder to save its path; this change does
+not introduce editing of existing entries or automatic path lookups.
+Paths are selection-time snapshots, so remote moves/renames do not update them.
+
+The added path argument in `AddSyncFolder` and field in `ListSyncFolders`
+change their D-Bus signatures. Upgrade the UI and daemon together and restart
+the daemon; mixed versions are unsupported and surface D-Bus errors.
 
 ## Application identity and tray status
 
@@ -129,6 +151,11 @@ ownership changes, subscription cleanup, and portal color-scheme variants
 The Qt tests use a controllable backend double for loading, errors,
 retry, cancellation, late replies, breadcrumbs, and root/nested selection;
 they also measure GUI heartbeat/cancel responsiveness while work is pending.
+The production path/selection controls are tested for readable nested/root
+paths, legacy/manual unknown paths, native manual input invalidation,
+reselection/reset, cancellation, and literal folder names. Private-bus tests
+verify ID/path transport; daemon/configuration tests cover persistence and
+loading old configuration without a path.
 Switch tests cover native and accessible input, failed updates, and subsequent
 backend changes without losing the checked-state binding.
 Tray tests cover state precedence, transitions, unavailable status, and decoding

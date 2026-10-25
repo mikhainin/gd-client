@@ -27,6 +27,10 @@ pub struct SyncFolder {
     /// `None` for "My Drive" root.
     pub drive_folder_id: Option<String>,
 
+    /// Display-only path captured when selected, not updated after Drive moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_folder_path: Option<String>,
+
     /// Local destination directory that this Drive folder is mirrored into.
     pub local_path: PathBuf,
 
@@ -53,6 +57,7 @@ impl SyncFolder {
             id: Uuid::new_v4(),
             display_name: display_name.into(),
             drive_folder_id: None,
+            drive_folder_path: None,
             local_path,
             owner_user: owner_user.into(),
             owner_group: owner_group.into(),
@@ -125,6 +130,8 @@ mod tests {
             "user",
             "user",
         ));
+        cfg.sync_folders[0].drive_folder_id = Some("photos-id".into());
+        cfg.sync_folders[0].drive_folder_path = Some("My Drive/Photos".into());
 
         let dir = std::env::temp_dir().join(format!("gdrive-client-test-{}", Uuid::new_v4()));
         let path = dir.join("config.toml");
@@ -132,6 +139,28 @@ mod tests {
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(cfg, loaded);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_folder_without_path_keeps_its_drive_id() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [[sync_folders]]
+            id = "00000000-0000-0000-0000-000000000001"
+            display_name = "Photos"
+            drive_folder_id = "photos-id"
+            local_path = "/fixture/photos"
+            owner_user = ""
+            owner_group = ""
+            enabled = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.sync_folders[0].drive_folder_id.as_deref(),
+            Some("photos-id")
+        );
+        assert_eq!(config.sync_folders[0].drive_folder_path, None);
     }
 
     #[test]

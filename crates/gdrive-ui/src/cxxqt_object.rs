@@ -73,6 +73,8 @@ struct SyncFolderView {
     display_name: String,
     #[serde(rename = "driveFolderId")]
     drive_folder_id: String,
+    #[serde(rename = "driveFolderPath")]
+    drive_folder_path: String,
     #[serde(rename = "localPath")]
     local_path: String,
     #[serde(rename = "ownerUser")]
@@ -100,7 +102,7 @@ pub mod qobject {
 
     extern "RustQt" {
         /// Bridges `gdrived`'s sync folders to QML: `foldersJson` is a JSON
-        /// array of objects (id, displayName, driveFolderId, localPath,
+        /// array of objects (id, displayName, driveFolderId, driveFolderPath, localPath,
         /// ownerUser, ownerGroup, enabled, running), refreshed by calling
         /// `refresh()`; `statusMessage` reports the outcome of the last
         /// operation (including D-Bus/connection errors). `darkMode` is
@@ -138,6 +140,7 @@ pub mod qobject {
             self: Pin<&mut Self>,
             display_name: &QString,
             drive_folder_id: &QString,
+            drive_folder_path: &QString,
             local_path: &QString,
             owner_user: &QString,
             owner_group: &QString,
@@ -355,6 +358,7 @@ impl qobject::SyncManager {
                                 id,
                                 display_name,
                                 drive_folder_id,
+                                drive_folder_path,
                                 local_path,
                                 owner_user,
                                 owner_group,
@@ -365,6 +369,7 @@ impl qobject::SyncManager {
                                     id,
                                     display_name,
                                     drive_folder_id,
+                                    drive_folder_path,
                                     local_path,
                                     owner_user,
                                     owner_group,
@@ -475,10 +480,12 @@ impl qobject::SyncManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_folder(
         self: Pin<&mut Self>,
         display_name: &QString,
         drive_folder_id: &QString,
+        drive_folder_path: &QString,
         local_path: &QString,
         owner_user: &QString,
         owner_group: &QString,
@@ -488,6 +495,7 @@ impl qobject::SyncManager {
             Request::AddFolder {
                 display_name: display_name.to_string(),
                 drive_folder_id: drive_folder_id.to_string(),
+                drive_folder_path: drive_folder_path.to_string(),
                 local_path: local_path.to_string(),
                 owner_user: owner_user.to_string(),
                 owner_group: owner_group.to_string(),

@@ -5,6 +5,10 @@ Shared types and utilities used by both `gdrived` and `gdrive-ui`:
 - `config` — `AppConfig` and `SyncFolder`, the persisted TOML configuration
   model (`~/.config/gdrive-client/config.toml`). Each `SyncFolder` pairs one
   local directory with one Google Drive folder (or "My Drive" root).
+  The optional `drive_folder_path` stores a selection-time display path such
+  as `My Drive/Parent/Photos`; syncing still uses `drive_folder_id`.
+  Older configurations without a path remain loadable. Stored paths are
+  not automatically updated after remote moves or renames.
 - `paths` — XDG-based filesystem locations (config file, data directory,
   sync-state DB, cached OAuth token).
 - `dbus_api` — the `org.gclient.GDrive1` D-Bus interface contract: bus name,
@@ -22,5 +26,8 @@ Shared types and utilities used by both `gdrived` and `gdrive-ui`:
   `SyncStatusChanged(t)` invalidates it. Revisions are scoped to one daemon
   lifetime/bus owner. Clients subscribe before reading, re-read after
   invalidation, poll to recover lost notifications, and reset revision tracking
-  on owner change. Existing folder-row and method signatures are unchanged.
+  on owner change. `AddSyncFolder` takes `drive_folder_path` immediately after
+  `drive_folder_id`; `ListSyncFolders` rows include it in the same position.
+  An empty path means an unknown display path. These changed wire signatures
+  require upgrading the UI and daemon together and restarting the daemon.
 - `error` — the shared `CommonError` type.
