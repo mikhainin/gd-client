@@ -41,9 +41,9 @@ impl ServiceState {
             return Ok(false);
         }
         self.sign_in = None;
-        auth::save_token(token_path, &token)
+        engine
+            .save_token(token, token_path)
             .map_err(|e| zbus::fdo::Error::Failed(format!("failed to save token: {e}")))?;
-        engine.set_access_token(token.access_token);
         engine.start_all(&self.config);
         Ok(true)
     }
@@ -329,7 +329,10 @@ impl GDriveService {
                 }),
             )
             .await
-            .map_err(|_| SyncError::Timeout("sign-in exceeded 10 minutes"))
+            .map_err(|source| SyncError::Timeout {
+                operation: "sign-in exceeded 10 minutes",
+                source: Box::new(source),
+            })
             .and_then(|result| result);
 
             let mut state = service.state.lock().await;
@@ -369,6 +372,7 @@ impl GDriveService {
         let (task, removal) = {
             let mut state = self.state.lock().await;
             let task = state.cancel_sign_in();
+            self.engine.set_access_token(String::new());
             let removal = if self.token_path.exists() {
                 std::fs::remove_file(&self.token_path).map_err(|e| {
                     zbus::fdo::Error::Failed(format!("failed to remove cached token: {e}"))
@@ -380,7 +384,6 @@ impl GDriveService {
             for folder in &state.config.sync_folders {
                 self.engine.stop_folder(folder.id);
             }
-            self.engine.set_access_token(String::new());
             if removal.is_ok() {
                 Self::notify_authentication(&emitter, false).await;
             }
@@ -400,6 +403,7 @@ impl GDriveService {
         &self,
         parent_id: String,
     ) -> zbus::fdo::Result<Vec<DriveFolderRow>> {
+        tracing::debug!("received ListDriveFolders request");
         let parent_id = if parent_id.is_empty() {
             "root"
         } else {
@@ -412,10 +416,10 @@ impl GDriveService {
         .await
         .map_err(|_| zbus::fdo::Error::Timeout("listing Drive folders exceeded 27 seconds".into()))?
         .map_err(|e| match e {
-            SyncError::NotAuthenticated => zbus::fdo::Error::AccessDenied(
-                "Sign in to Google Drive before browsing folders".into(),
-            ),
-            SyncError::Timeout(_) => zbus::fdo::Error::Timeout(e.to_string()),
+            SyncError::NotAuthenticated | SyncError::ReauthenticationRequired => {
+                zbus::fdo::Error::AccessDenied(format!("Cannot browse Google Drive: {e}"))
+            }
+            SyncError::Timeout { .. } => zbus::fdo::Error::Timeout(e.to_string()),
             SyncError::Http(ref error) if error.is_timeout() => {
                 zbus::fdo::Error::Timeout(format!("failed to list Drive folders: {e}"))
             }

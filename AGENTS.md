@@ -32,6 +32,11 @@ This is a Rust project.
 - This applies transitively: if a UI-thread call (e.g. a `#[qinvokable]` on a Qt/QML `QObject`) blocks on a D-Bus call, which in turn blocks on an HTTP call, every link in that chain needs its own timeout - a timeout deep in the chain does not make the calls above it safe on its own, since blocking UI-thread calls should also not be left to block for the full duration of a slow-but-not-infinite timeout (prefer moving such calls off the UI thread as well).
 - When adding a new network or IPC call, always set a timeout and verify the failure path (what happens when it fires) rather than assuming the underlying library already handles it.
 
+## Error handling
+
+- Always preserve the error chain when wrapping or adding context to an error, so its underlying cause remains traceable through `std::error::Error::source` (for example, use `#[source]`, `#[from]`, or `anyhow::Context`). Do not replace a source error with a string or discard it in a generic error message.
+- Preserve actionable classifications such as timeouts across error boundaries. Keep user-facing messages and routine logs free of credentials or sensitive response bodies; retaining a source is not permission to expose it.
+
 ## Verifying the Qt/QML UI visually
 
 - Use the repository's `.github/skills/gdrive-ui-testing` skill for semantic Qt UI interaction through AT-SPI and display-independent Qt Quick tests. Launch owned accessibility test instances with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; do not assume X11 is available or change real sync-folder settings during smoke tests.
