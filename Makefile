@@ -48,7 +48,7 @@ install: deb
 	@echo "This target only prints the install command - it does not run it for you."
 	@echo "Run the following yourself:"
 	@echo
-	@echo "  sudo apt install $(DEB_DIR)/*.deb"
+	@echo "  sudo apt install ./$(DEB_DIR)/*.deb"
 	@echo
 	@echo "(apt resolves/installs any missing dependencies, e.g. Qt6 QML modules; use dpkg -i + apt --fix-broken install -f as an alternative)"
 
