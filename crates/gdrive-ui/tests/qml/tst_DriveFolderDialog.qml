@@ -261,6 +261,26 @@ TestCase {
         compare(label.textFormat, Text.PlainText)
     }
 
+    function test_long_path_tooltip_wraps_within_window() {
+        dialog.close()
+        tryCompare(dialog, "visible", false)
+        var path = "My Drive/" + "LongFolderName".repeat(40) + "/Photos"
+        var label = createTemporaryObject(configuredPathComponent, testCase,
+            {folderId: "opaque-id", folderPath: path, y: selectedFolder.height + 20})
+        verify(label !== null)
+        mouseMove(label, label.width / 2, label.height / 2)
+        var tooltip = findChild(label, "driveFolderPathToolTip")
+        verify(tooltip !== null)
+        tryCompare(tooltip, "visible", true)
+        tryCompare(tooltip, "opened", true)
+        verify(tooltip.width <= testCase.width - 24)
+        compare(tooltip.contentItem.text, path)
+        compare(tooltip.contentItem.wrapMode, Text.Wrap)
+        compare(tooltip.contentItem.textFormat, Text.PlainText)
+        tryVerify(() => tooltip.contentItem.lineCount > 1)
+        verify(!tooltip.contentItem.truncated)
+    }
+
     function test_breadcrumb_navigation_discards_superseded_reply() {
         var old = backend.generation
         dialog.enterFolder("child", "Projects")

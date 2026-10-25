@@ -52,7 +52,8 @@ pending selection, and adding a folder resets it to root.
 
 Configured folders show the saved remote path alongside their display name
 and local destination. Long paths are elided, with full text available through
-accessibility and hover. Legacy and manually entered non-root folders without
+accessibility and a window-width-bounded, wrapped hover tooltip (including
+long unbroken folder names). Legacy and manually entered non-root folders without
 a saved path show **Drive path unavailable; reselect folder**, not the ID.
 Select through Browse when adding a folder to save its path; this change does
 not introduce editing of existing entries or automatic path lookups.
