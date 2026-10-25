@@ -63,9 +63,9 @@ async fn main() -> anyhow::Result<()> {
         engine.clone(),
     );
 
-    let _connection = zbus::connection::Builder::session()?
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, service)?
+    let _connection = zbus::connection::Builder::session()
+        .name(BUS_NAME)
+        .serve_at(OBJECT_PATH, service)
         .build()
         .await?;
     tracing::info!(

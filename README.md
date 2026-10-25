@@ -29,8 +29,8 @@ sync state itself.
 
 ## Building
 
-Requires a recent stable Rust toolchain (edition 2021, `rust-version = "1.85"`
-in the workspace `Cargo.toml`).
+Requires Rust 1.89 or newer (edition 2021, `rust-version = "1.89"`
+in the workspace `Cargo.toml`), including the minimum required by zbus 6.
 
 ```sh
 cargo build --workspace

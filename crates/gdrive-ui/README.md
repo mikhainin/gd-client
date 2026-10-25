@@ -88,7 +88,8 @@ QT_QPA_PLATFORM=offscreen QT_QUICK_CONTROLS_STYLE=Fusion \
 
 Run these from the workspace root. The ignored Rust test deliberately uses
 a private D-Bus session to test a stalled daemon, authentication signals, daemon
-ownership changes, and subscription cleanup without touching the user's daemon.
+ownership changes, subscription cleanup, and portal color-scheme variants
+(including invalid types) without touching the user's daemon or desktop portal.
 The Qt tests use a controllable backend double for loading, errors,
 retry, cancellation, late replies, breadcrumbs, and root/nested selection;
 they also measure GUI heartbeat/cancel responsiveness while work is pending.
