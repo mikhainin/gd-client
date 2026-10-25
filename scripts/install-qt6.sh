@@ -7,6 +7,7 @@ set -euo pipefail
 sudo apt update
 sudo apt install -y \
   qt6-base-dev qt6-declarative-dev qt6-base-dev-tools \
+  libqt6svg6 \
   qml6-module-qtquick qml6-module-qtquick-controls \
   qml6-module-qtquick-templates \
   qml6-module-qtqml-workerscript qml6-module-qtquick-window \

@@ -15,4 +15,10 @@ Shared types and utilities used by both `gdrived` and `gdrive-ui`:
   `IsAuthenticated` for initial/reconnected state. Both sides must match it
   exactly, since zbus does not check this across independent crates at
   compile time.
+  The additive `SyncStatus` method returns a typed snapshot containing a
+  monotonic revision and per-folder activity/outstanding error details;
+  `SyncStatusChanged(t)` invalidates it. Revisions are scoped to one daemon
+  lifetime/bus owner. Clients subscribe before reading, re-read after
+  invalidation, poll to recover lost notifications, and reset revision tracking
+  on owner change. Existing folder-row and method signatures are unchanged.
 - `error` — the shared `CommonError` type.

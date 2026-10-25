@@ -8,6 +8,17 @@ The sync engine, used by the `gdrived` daemon.
   polls Drive's Changes API for remote changes. Emits `SyncEvent`s
   (`FolderStarted`, `InitialSyncComplete`, `LocalChangeUploaded`,
   `RemoteChangeApplied`, `Error`) consumed by `gdrived` for logging.
+  `sync_status` supplies authoritative runtime snapshots and `subscribe_status`
+  supplies coalesced revision notifications for D-Bus forwarding. Per-folder
+  activity covers initial reconciliation and actual application of local/remote
+  work, not idle workers or empty polling. Outstanding errors are keyed by
+  affected work; only successful reconciliation/retry of that work or explicit
+  stop/restart clears them. Fatal initial failures remain visible after the
+  task exits. Stop/abort clears activity, and run generations reject updates
+  from superseded tasks. Status is in memory, not persisted. Finished tasks
+  are excluded from `running_folders`.
+  Remote-deletion failures and local metadata failures other than a vanished
+  path propagate as sync errors rather than being silently ignored.
 - `auth` — Google OAuth2 flow (via the `oauth2` crate) and cached token
   storage. Reads `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` from the
   environment at runtime (letting anyone bring their own OAuth client),

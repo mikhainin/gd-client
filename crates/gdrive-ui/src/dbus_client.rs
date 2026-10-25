@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use gdrive_common::dbus_api::{DriveFolderRow, GDrive1Proxy, SyncFolderRow};
+use gdrive_common::dbus_api::{DriveFolderRow, GDrive1Proxy, SyncFolderRow, SyncStatus};
 use tokio::runtime::Runtime;
 use tokio::task::AbortHandle;
 use zbus::export::futures_core::Stream;
@@ -42,6 +42,79 @@ pub enum Response {
 pub enum AuthenticationEvent {
     Ready,
     Changed(bool),
+}
+
+#[derive(Debug)]
+pub enum SyncStatusEvent {
+    Snapshot(SyncStatus),
+    Unavailable(String),
+}
+
+pub async fn watch_sync_status(notify: impl Fn(SyncStatusEvent) + Send + Sync + 'static) {
+    loop {
+        if let Err(error) = sync_status_session(&notify).await {
+            tracing::warn!("sync status unavailable: {error}");
+            notify(SyncStatusEvent::Unavailable(error));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+async fn sync_status_session(notify: &(impl Fn(SyncStatusEvent) + Sync)) -> Result<(), String> {
+    let connection = bounded(CONTROL_TIMEOUT, connect(CONTROL_TIMEOUT)).await?;
+    let bus = bounded(CONTROL_TIMEOUT, zbus::fdo::DBusProxy::new(&connection)).await?;
+    let mut owners = bounded(
+        CONTROL_TIMEOUT,
+        bus.receive_name_owner_changed_with_args(&[(0, gdrive_common::dbus_api::BUS_NAME)]),
+    )
+    .await?;
+    let owner = bounded(CONTROL_TIMEOUT, async {
+        bus.get_name_owner(
+            gdrive_common::dbus_api::BUS_NAME
+                .try_into()
+                .expect("valid bus name"),
+        )
+        .await
+        .map_err(zbus::Error::from)
+    })
+    .await?;
+    // Bind to this unique owner: a restarted daemon's revision starts over.
+    let proxy = bounded(
+        CONTROL_TIMEOUT,
+        GDrive1Proxy::builder(&connection)
+            .destination(owner.as_str())
+            .map_err(|error| error.to_string())?
+            .cache_properties(CacheProperties::No)
+            .build(),
+    )
+    .await?;
+    let mut signals = bounded(CONTROL_TIMEOUT, proxy.receive_sync_status_changed()).await?;
+    let mut poll = tokio::time::interval(Duration::from_secs(3));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await;
+    let mut revision = None;
+    loop {
+        let snapshot = tokio::select! {
+            biased;
+            _ = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) =>
+                return Err("daemon owner changed; reconnecting".into()),
+            result = bounded(CONTROL_TIMEOUT, proxy.sync_status()) => result?,
+        };
+        if revision.is_none_or(|last| snapshot.revision > last) {
+            revision = Some(snapshot.revision);
+            notify(SyncStatusEvent::Snapshot(snapshot));
+        }
+        tokio::select! {
+            biased;
+            _ = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) =>
+                return Err("daemon owner changed; reconnecting".into()),
+            signal = std::future::poll_fn(|cx| std::pin::Pin::new(&mut signals).poll_next(cx)) => {
+                let signal = signal.ok_or("sync status signal stream closed")?;
+                signal.args().map_err(|error| format!("invalid SyncStatusChanged signal: {error}"))?;
+            }
+            _ = poll.tick() => {}
+        }
+    }
 }
 
 pub async fn watch_authentication(notify: impl Fn(AuthenticationEvent) + Send + Sync + 'static) {
@@ -390,6 +463,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let unavailable = sync_status_session(&|_| panic!("older daemon must not report idle"))
+            .await
+            .unwrap_err();
+        assert!(unavailable.contains("UnknownMethod"), "{unavailable}");
         let start = std::time::Instant::now();
         let (browse, refresh) = tokio::join!(
             execute_with_timeout(
@@ -509,5 +586,170 @@ mod tests {
         );
         watcher.abort();
         assert!(watcher.await.unwrap_err().is_cancelled());
+    }
+
+    struct StatusDaemon {
+        status: Arc<std::sync::Mutex<SyncStatus>>,
+        stall: Arc<AtomicBool>,
+    }
+
+    #[zbus::interface(name = "org.gclient.GDrive1")]
+    impl StatusDaemon {
+        async fn sync_status(&self) -> SyncStatus {
+            if self.stall.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            self.status.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated bus and serialized ignored tests"]
+    async fn private_bus_sync_status_recovers_signals_polling_restart_and_timeouts() {
+        assert_eq!(std::env::var("GDRIVE_UI_TEST_BUS").as_deref(), Ok("1"));
+        let status = Arc::new(std::sync::Mutex::new(SyncStatus {
+            revision: 1,
+            folders: vec![],
+        }));
+        let stall = Arc::new(AtomicBool::new(false));
+        let service = bounded(
+            CONTROL_TIMEOUT,
+            zbus::connection::Builder::session()
+                .unwrap()
+                .method_timeout(CONTROL_TIMEOUT)
+                .name(gdrive_common::dbus_api::BUS_NAME)
+                .unwrap()
+                .serve_at(
+                    gdrive_common::dbus_api::OBJECT_PATH,
+                    StatusDaemon {
+                        status: status.clone(),
+                        stall: stall.clone(),
+                    },
+                )
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = tokio::spawn(watch_sync_status(move |event| {
+            let _ = events.send(event);
+        }));
+        async fn next(
+            events: &mut tokio::sync::mpsc::UnboundedReceiver<SyncStatusEvent>,
+        ) -> SyncStatusEvent {
+            tokio::time::timeout(Duration::from_secs(9), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        assert!(matches!(
+            next(&mut received).await,
+            SyncStatusEvent::Snapshot(SyncStatus { revision: 1, .. })
+        ));
+        {
+            let mut value = status.lock().unwrap();
+            value.revision = 2;
+            value
+                .folders
+                .push(gdrive_common::dbus_api::FolderSyncStatus {
+                    folder_id: "fixture".into(),
+                    syncing: true,
+                    errors: vec![],
+                });
+        }
+        bounded(
+            CONTROL_TIMEOUT,
+            service.emit_signal(
+                None::<&str>,
+                gdrive_common::dbus_api::OBJECT_PATH,
+                "org.gclient.GDrive1",
+                "SyncStatusChanged",
+                &(2u64,),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 2 && value.folders[0].syncing)
+        );
+        {
+            let mut value = status.lock().unwrap();
+            value.revision = 3;
+            value.folders[0].syncing = false;
+            value.folders[0].errors.push("upload failed".into());
+        }
+        // No signal: periodic snapshots recover a lost notification.
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 3 && value.folders[0].errors == ["upload failed"])
+        );
+        status.lock().unwrap().revision = 2;
+        bounded(
+            CONTROL_TIMEOUT,
+            service.emit_signal(
+                None::<&str>,
+                gdrive_common::dbus_api::OBJECT_PATH,
+                "org.gclient.GDrive1",
+                "SyncStatusChanged",
+                &(2u64,),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), received.recv())
+                .await
+                .is_err(),
+            "obsolete snapshot must not replace newer errors"
+        );
+        bounded(
+            CONTROL_TIMEOUT,
+            service.release_name(gdrive_common::dbus_api::BUS_NAME),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            next(&mut received).await,
+            SyncStatusEvent::Unavailable(_)
+        ));
+        status.lock().unwrap().revision = 0;
+        let replacement = bounded(
+            CONTROL_TIMEOUT,
+            zbus::connection::Builder::session()
+                .unwrap()
+                .method_timeout(CONTROL_TIMEOUT)
+                .name(gdrive_common::dbus_api::BUS_NAME)
+                .unwrap()
+                .serve_at(
+                    gdrive_common::dbus_api::OBJECT_PATH,
+                    StatusDaemon {
+                        status: status.clone(),
+                        stall: stall.clone(),
+                    },
+                )
+                .unwrap()
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 0)
+        );
+        stall.store(true, Ordering::SeqCst);
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Unavailable(error) if error.contains("timed out"))
+        );
+        stall.store(false, Ordering::SeqCst);
+        assert!(
+            matches!(next(&mut received).await, SyncStatusEvent::Snapshot(value) if value.revision == 0)
+        );
+        watcher.abort();
+        assert!(watcher.await.unwrap_err().is_cancelled());
+        bounded(
+            CONTROL_TIMEOUT,
+            replacement.release_name(gdrive_common::dbus_api::BUS_NAME),
+        )
+        .await
+        .unwrap();
     }
 }
