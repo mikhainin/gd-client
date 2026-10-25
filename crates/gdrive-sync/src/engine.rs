@@ -79,12 +79,25 @@ impl SyncEngine {
         self.events.subscribe()
     }
 
-    /// Replaces the Drive API access token used by all future (and already
-    /// running) requests, e.g. after a fresh sign-in via the D-Bus `SignIn`
-    /// call. Does not by itself start any folders - call [`Self::start_all`]
-    /// afterwards for those that are enabled but not yet running.
+    /// Replaces a bare Drive API access token and discards refresh metadata.
+    /// An empty token invalidates refreshes in flight. Does not start folders;
+    /// OAuth sign-in and startup use save/restore to retain refresh metadata.
     pub fn set_access_token(&self, access_token: impl Into<String>) {
         self.drive.set_access_token(access_token);
+    }
+
+    /// Restores cached tokens, including refresh metadata, before starting sync.
+    pub fn restore_token(&self, token: crate::auth::StoredToken, path: PathBuf) {
+        self.drive.restore_token(token, path);
+    }
+
+    /// Saves a new session without allowing an older refresh to overwrite it.
+    pub fn save_token(
+        &self,
+        token: crate::auth::StoredToken,
+        path: &std::path::Path,
+    ) -> Result<(), SyncError> {
+        self.drive.save_token(token, path)
     }
 
     /// Lists the direct sub-folders of a Drive folder (`folder_id = "root"`

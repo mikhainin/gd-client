@@ -21,6 +21,11 @@ The sync engine, used by the `gdrived` daemon.
   our `reqwest::Client` instead.
   `authorize` obtains tokens without persisting them so the daemon can coordinate
   completion with sign-out; `authenticate` remains the obtain-and-save wrapper.
+  Access-token refresh reuses the OAuth adapter, preserves an omitted refresh
+  token, and accepts a replacement refresh token when Google rotates it.
+  Interactive sign-in explicitly requests offline access and consent so Google
+  issues a refresh token even after an earlier authorization. Missing offline
+  access is reported as an error instead of saving a non-renewable session.
 - `drive_client` — thin async wrapper around the Google Drive v3 REST API
   (list children, download/upload/create/delete, list changes). Requests have
   a 10-second connection timeout and a 30-minute total HTTP timeout covering
@@ -31,6 +36,17 @@ The sync engine, used by the `gdrived` daemon.
   `list_child_folders` supplies the known folder MIME type with other metadata
   defaulted; sync's `list_children` still fetches all children and full sync
   metadata. Parent ids are escaped as Drive query literals.
+  Every Drive operation shares token refresh: cached expiry triggers renewal
+  30 seconds early, and HTTP 401 triggers at most one refresh/replay (including
+  caches with unknown expiry). Concurrent operations share one refresh; tokens
+  are persisted before installation. A sign-out or newer sign-in invalidates
+  in-flight refreshes so they cannot overwrite or recreate the token cache.
+  OAuth uses a separate prebuilt, no-redirect HTTP client with a 5-second
+  connection and 15-second request/body limit; refresh including lock waiting
+  is bounded to 20 seconds and remains inside the 25-second browse deadline.
+  Missing client configuration, revoked refresh tokens, malformed responses,
+  and cache-write failures are explicit errors, never empty listings. Refresh
+  failures do not log credentials or response bodies.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
   sync folder's local path.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API

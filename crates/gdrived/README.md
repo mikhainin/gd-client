@@ -33,6 +33,14 @@ until the aborted task has actually finished. Signals are emitted in state-chang
 emission deadline; delivery failures are logged and clients can recover by
 querying `IsAuthenticated`.
 
+Cached OAuth expiry and refresh tokens are retained at startup and after sign-in.
+All Drive calls renew expired credentials automatically, persist renewed tokens,
+and retry an unauthorized request once. OAuth client credentials are needed for
+refresh as well as initial sign-in, using the same runtime/build-time sources.
+Revoked or missing refresh tokens return an actionable sign-out/sign-in error.
+Such sessions need one fresh browser consent; token refresh cannot repair a
+revoked grant. Interactive sign-in requests offline access for a renewable session.
+
 `ListDriveFolders` browses direct, non-trashed Drive subfolders, fetching all
 pages with a server-side folder filter. Its whole-operation timeout is
 27 seconds (the underlying Drive browse deadline is 25 seconds), leaving
@@ -41,6 +49,13 @@ headroom for the UI's 30-second deadline. Missing authentication returns
 `org.freedesktop.DBus.Error.Timeout`, and API/transport failures return
 `org.freedesktop.DBus.Error.Failed` with diagnostic context. Only a successful
 empty listing returns an empty folder list; failures never masquerade as one.
+Expired/revoked credentials that cannot be renewed also return `AccessDenied`.
+
+For diagnosis, set
+`RUST_LOG=warn,gdrived=trace,gdrive_sync=trace,reqwest::connect=debug`.
+Application diagnostics report cache expiry/configuration availability, listing
+page/status/count, and refresh progress without tokens, OAuth response bodies,
+or folder names. Avoid global HTTP trace logging, which can expose credentials.
 
 Authentication and configuration regressions use temporary state and tokens:
 
