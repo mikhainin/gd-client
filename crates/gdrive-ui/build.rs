@@ -6,7 +6,21 @@
 use cxx_qt_build::{CxxQtBuilder, QmlModule};
 
 fn main() {
-    CxxQtBuilder::new_qml_module(QmlModule::new("org.gclient.gdrive_ui").qml_file("qml/main.qml"))
-        .files(["src/cxxqt_object.rs"])
-        .build();
+    CxxQtBuilder::new_qml_module(
+        QmlModule::new("org.gclient.gdrive_ui")
+            .qml_file("qml/main.qml")
+            .qml_file("qml/TrayPresentation.qml")
+            .qml_file("qml/AccessibleButton.qml")
+            .qml_file("qml/SyncFolderSwitch.qml")
+            .qml_file("qml/DriveFolderDialog.qml"),
+    )
+    .files(["src/cxxqt_object.rs"])
+    .file("src/app_icon.rs")
+    .qrc_resources([
+        "icons/org.gclient.gdrive-ui.svg",
+        "icons/syncing.svg",
+        "icons/error.svg",
+        "icons/disconnected.svg",
+    ])
+    .build();
 }

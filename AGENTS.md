@@ -6,11 +6,12 @@ Guidance for AI agents (and human contributors) working in this repository.
 
 This is a Rust project.
 
-## Change logging
+## Documentation
 
-- Every meaningful change must be recorded either in this file (under "Change Log" below) or in the corresponding documentation file for the affected crate/module (e.g. its own README.md).
+- There is no changelog. Do not append change-log-style, dated entries anywhere.
+- Every meaningful change must instead be reflected by editing the relevant existing section in this file, or in the corresponding documentation file for the affected crate/module (e.g. its own README.md), so the docs always describe only the current state of the project.
 - "Meaningful" means anything that affects behavior, architecture, dependencies, configuration, or public interfaces — not typo fixes or formatting-only edits.
-- When a change belongs to a specific documented area (e.g. a crate's own README), record it there instead of duplicating it here, and add a one-line pointer here if it's significant.
+- When a change belongs to a specific documented area (e.g. a crate's own README), edit it there; add or update a dedicated section in this file only for guidance that applies across the whole repository.
 
 ## Dependency management
 
@@ -23,9 +24,18 @@ This is a Rust project.
 ## Running commands
 
 - Do not prefix commands (e.g. `cargo run`, daemon binaries) with the `timeout` shell command. Use the tool's own async/background/long-running command support instead to observe and then stop a process.
+- Never run `sudo apt` (or any other privileged package installation command) yourself, even with explicit user approval of *what* to install. Always give the user the exact command and ask them to run it themselves.
+
+## Network and IPC calls must always have a timeout
+
+- Every network call (HTTP requests, e.g. via `reqwest`) and every IPC call (e.g. D-Bus calls, whether via `zbus` async or `zbus::blocking`) MUST have an explicit, bounded timeout. Never rely on a client/proxy's default settings without verifying a timeout is actually set - many defaults (e.g. a bare `reqwest::Client::new()`, or a default `zbus` proxy/connection) have NO timeout and can hang indefinitely.
+- This applies transitively: if a UI-thread call (e.g. a `#[qinvokable]` on a Qt/QML `QObject`) blocks on a D-Bus call, which in turn blocks on an HTTP call, every link in that chain needs its own timeout - a timeout deep in the chain does not make the calls above it safe on its own, since blocking UI-thread calls should also not be left to block for the full duration of a slow-but-not-infinite timeout (prefer moving such calls off the UI thread as well).
+- When adding a new network or IPC call, always set a timeout and verify the failure path (what happens when it fires) rather than assuming the underlying library already handles it.
 
 ## Verifying the Qt/QML UI visually
 
+- Use the repository's `.github/skills/gdrive-ui-testing` skill for semantic Qt UI interaction through AT-SPI and display-independent Qt Quick tests. Launch owned accessibility test instances with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; do not assume X11 is available or change real sync-folder settings during smoke tests.
+- If any testing tool or package is missing, give the user its exact installation command and wait for them to install it; do not install it yourself.
 - To screenshot the running `gdrive-ui` window, do not try to raise/focus it via `wmctrl`/`xdotool`/KWin scripting - just run `sleep 5 && spectacle -a -b -n -o /path/to/file.png` right after launching it, which captures the active window directly (`-a`), in the background (`-b`), with no capture-start sound (`-n`).
 
 ## License compliance tooling

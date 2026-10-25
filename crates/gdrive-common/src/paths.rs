@@ -13,8 +13,7 @@ const ORGANIZATION: &str = "g-client";
 const APPLICATION: &str = "gdrive-client";
 
 fn project_dirs() -> Result<ProjectDirs, CommonError> {
-    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-        .ok_or(CommonError::NoHomeDirectory)
+    ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION).ok_or(CommonError::NoHomeDirectory)
 }
 
 /// Path to the persisted TOML configuration file

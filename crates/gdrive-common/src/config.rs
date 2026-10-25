@@ -43,7 +43,12 @@ pub struct SyncFolder {
 }
 
 impl SyncFolder {
-    pub fn new(display_name: impl Into<String>, local_path: PathBuf, owner_user: impl Into<String>, owner_group: impl Into<String>) -> Self {
+    pub fn new(
+        display_name: impl Into<String>,
+        local_path: PathBuf,
+        owner_user: impl Into<String>,
+        owner_group: impl Into<String>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             display_name: display_name.into(),
@@ -131,7 +136,8 @@ mod tests {
 
     #[test]
     fn missing_file_yields_default() {
-        let loaded = AppConfig::load_from(Path::new("/nonexistent/gdrive-client/config.toml")).unwrap();
+        let loaded =
+            AppConfig::load_from(Path::new("/nonexistent/gdrive-client/config.toml")).unwrap();
         assert_eq!(loaded, AppConfig::default());
     }
 }

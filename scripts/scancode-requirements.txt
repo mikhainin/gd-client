@@ -1,0 +1,5 @@
+# Tested together on Python 3.12. Plugincode 32 uses class-marked hooks,
+# which Pluggy 1.7 no longer discovers.
+scancode-toolkit==32.5.0
+plugincode==32.0.0
+pluggy==1.6.0

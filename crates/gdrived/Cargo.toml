@@ -12,6 +12,26 @@ repository.workspace = true
 name = "gdrived"
 path = "src/main.rs"
 
+[package.metadata.deb]
+maintainer = "g-client contributors"
+copyright = "2026, g-client contributors"
+license-file = ["../../LICENSE-APACHE", "5"]
+extended-description = """\
+Background daemon that keeps configured local folders in sync with Google \
+Drive and exposes status/control over a D-Bus interface \
+(org.gclient.GDrive1) so front-ends such as gdrive-ui (or tools like \
+busctl) can list/add/remove/enable sync folders without talking to the \
+sync engine directly."""
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/gdrived", "usr/bin/", "755"],
+    ["../../packaging/org.gclient.GDrive1.service", "usr/share/dbus-1/services/", "644"],
+    ["../../packaging/gdrived.service", "usr/lib/systemd/user/", "644"],
+    ["../../README.md", "usr/share/doc/gdrived/README.md", "644"],
+]
+
 [dependencies]
 gdrive-common = { workspace = true }
 gdrive-sync = { workspace = true }

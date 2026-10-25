@@ -14,6 +14,29 @@ pub const OBJECT_PATH: &str = "/org/gclient/GDrive1";
 /// `(id, display_name, drive_folder_id, local_path, owner_user, owner_group, enabled, running)`.
 pub type SyncFolderRow = (String, String, String, String, String, String, bool, bool);
 
+/// One row describing a Google Drive folder, as returned by
+/// [`GDrive1::list_drive_folders`]: `(id, name)`.
+pub type DriveFolderRow = (String, String);
+
+/// Runtime status, independent of whether a background worker is merely running.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type,
+)]
+pub struct FolderSyncStatus {
+    pub folder_id: String,
+    pub syncing: bool,
+    pub errors: Vec<String>,
+}
+
+/// Revisions are monotonic within a daemon lifetime, not across bus owners.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type,
+)]
+pub struct SyncStatus {
+    pub revision: u64,
+    pub folders: Vec<FolderSyncStatus>,
+}
+
 /// The `org.gclient.GDrive1` D-Bus interface exposed by `gdrived`, letting
 /// clients (e.g. `gdrive-ui`) list, add, remove and toggle sync folders
 /// without touching the configuration file or sync engine directly.
@@ -25,6 +48,13 @@ pub type SyncFolderRow = (String, String, String, String, String, String, bool, 
 pub trait GDrive1 {
     /// Lists all configured sync folders and whether each is currently active.
     fn list_sync_folders(&self) -> zbus::Result<Vec<SyncFolderRow>>;
+
+    /// Authoritative activity and outstanding failures, including initial sync.
+    fn sync_status(&self) -> zbus::Result<SyncStatus>;
+
+    /// Invalidates the cached snapshot; clients re-read `SyncStatus`.
+    #[zbus(signal)]
+    fn sync_status_changed(&self, revision: u64) -> zbus::Result<()>;
 
     /// Adds a new sync folder and, if `enabled` is true, starts synchronising
     /// it immediately. Returns the new folder's generated id.
@@ -45,4 +75,30 @@ pub trait GDrive1 {
     /// Enables or disables a sync folder, starting/stopping its background
     /// synchronisation task accordingly.
     fn set_folder_enabled(&self, id: &str, enabled: bool) -> zbus::Result<()>;
+
+    /// Returns whether a Google account is currently authenticated (i.e. a
+    /// cached OAuth token exists), based on which the UI shows a "Sign in"
+    /// or "Sign out" control.
+    fn is_authenticated(&self) -> zbus::Result<bool>;
+
+    /// Starts the interactive Google OAuth sign-in flow: opens the consent
+    /// URL in the user's default browser and returns immediately (it does
+    /// *not* wait for the flow to finish, since that can take an arbitrary
+    /// amount of time). Successful completion emits
+    /// [`Self::authentication_changed`]. Once signed in, the currently enabled
+    /// sync folders are started.
+    fn sign_in(&self) -> zbus::Result<()>;
+
+    /// Forgets the cached OAuth token and stops all running sync folders.
+    fn sign_out(&self) -> zbus::Result<()>;
+
+    /// Authentication changed after successful sign-in or sign-out.
+    /// Fetch [`Self::is_authenticated`] for initial state and after reconnecting.
+    #[zbus(signal)]
+    fn authentication_changed(&self, authenticated: bool) -> zbus::Result<()>;
+
+    /// Lists the direct sub-folders of a Google Drive folder, for the
+    /// "browse Drive folder" picker in the UI. Pass an empty string (or
+    /// `"root"`) for the top level of "My Drive".
+    fn list_drive_folders(&self, parent_id: &str) -> zbus::Result<Vec<DriveFolderRow>>;
 }

@@ -1,0 +1,11 @@
+{
+  "expected_expressions": {
+    "AGENTS.md": ["mit or apache-2.0"],
+    "Cargo.toml": ["mit or apache-2.0"],
+    "README.md": ["apache-2.0 and mit", "mit and apache-2.0", "mit or apache-2.0"],
+    "crates/gdrive-ui/Cargo.toml": ["unknown-license-reference and apache-2.0"],
+    "crates/gdrived/Cargo.toml": ["unknown-license-reference and apache-2.0"]
+  },
+  "packaging_manifests": ["crates/gdrive-ui/Cargo.toml", "crates/gdrived/Cargo.toml"],
+  "own_copyright": "copyright 2026, g-client contributors"
+}

@@ -40,7 +40,8 @@ notify = { version = "8.2.0" }
 bytes = { version = "1.12.1" }
 nix = { version = "0.31.3", features = ["user"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-zbus = { version = "5.19.0" }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
+libc = { version = "0.2.189" }
 
 cxx = { version = "1.0" }
 cxx-qt = { version = "0.10.0" }

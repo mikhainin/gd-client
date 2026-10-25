@@ -42,6 +42,15 @@ system (see [`scripts/install-qt6.sh`](scripts/install-qt6.sh) for the
 Debian/Ubuntu package list). Run that script directly on your development
 machine, not inside a restricted sandbox.
 
+A root [`Makefile`](Makefile) wraps the common build/package/install flow:
+
+A root `Makefile` wraps the common workflows: `make build`/`make test` run
+the `cargo` commands above; `make deb` runs `cargo deb -p gdrived`/
+`cargo deb -p gdrive-ui` to produce `target/debian/*.deb` packages; `make
+install`/`make uninstall` only print the `sudo apt install`/`sudo apt
+remove` commands (never run them — see [`AGENTS.md`](AGENTS.md)); `make
+clean` removes build artifacts.
+
 ## Running
 
 1. Set `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` (a Google Cloud OAuth
@@ -79,7 +88,7 @@ Following the XDG base directory spec (see
 ## Repository conventions
 
 See [`AGENTS.md`](AGENTS.md) for contributor/agent guidance, including the
-change-logging convention and how to verify the Qt/QML UI visually.
+documentation-editing convention and how to verify the Qt/QML UI visually.
 
 ## Alternatives
 
@@ -113,3 +122,18 @@ Dependency licenses are checked with [`cargo-deny`](https://github.com/EmbarkStu
 is scanned for embedded license/copyright text with
 [`scripts/scancode-scan.sh`](scripts/scancode-scan.sh) (ScanCode Toolkit).
 Both run in CI on every push/PR — see [`AGENTS.md`](AGENTS.md#license-compliance-tooling).
+
+ScanCode's tested compatibility versions are pinned in
+[`scripts/scancode-requirements.txt`](scripts/scancode-requirements.txt).
+Plugincode 32 uses class-marked hooks that Pluggy 1.7 no longer discovers,
+so this scanner uses Pluggy 1.6. The bootstrap checks these requirements on
+every invocation, repairing incompatible existing `.venv-scancode`
+environments as well as setting up fresh ones. Running the scan script can
+install or change packages inside that venv; agents must ask the user to
+perform any needed local installation rather than doing it themselves.
+The bootstrap's offline regression tests use a fake installer and scanner:
+`./scripts/test-scancode-bootstrap.py`.
+The report checker fails on scan errors and unexpected source notices. Its
+path-specific baseline in `.github/scancode-policy.json` recognizes only the project's own license mentions and
+the two Debian package manifests' license-file/copyright metadata; it does not
+globally exempt source files or third-party copyrights.

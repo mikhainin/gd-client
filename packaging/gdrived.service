@@ -1,0 +1,15 @@
+[Unit]
+Description=g-client Google Drive sync daemon
+Documentation=https://github.com/mikhainin/g-client
+
+[Service]
+# Optional: put GDRIVE_CLIENT_ID/GDRIVE_CLIENT_SECRET here so the daemon can
+# run the interactive OAuth flow (needed since D-Bus/systemd activation
+# doesn't inherit your shell's exported environment variables). The leading
+# "-" makes this file optional.
+EnvironmentFile=-%h/.config/gdrived/env
+ExecStart=/usr/bin/gdrived
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

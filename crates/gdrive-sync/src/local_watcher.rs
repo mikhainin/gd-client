@@ -36,18 +36,22 @@ pub struct LocalWatcher {
 impl LocalWatcher {
     /// Starts watching `root` recursively, sending [`LocalChange`] events to
     /// `sender` as they occur.
-    pub fn watch(root: &Path, sender: mpsc::UnboundedSender<LocalChange>) -> Result<Self, SyncError> {
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
-            Ok(event) => {
-                for path in event.paths.clone() {
-                    let kind = classify(&event.kind);
-                    let _ = sender.send(LocalChange { path, kind });
+    pub fn watch(
+        root: &Path,
+        sender: mpsc::UnboundedSender<LocalChange>,
+    ) -> Result<Self, SyncError> {
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+                Ok(event) => {
+                    for path in event.paths.clone() {
+                        let kind = classify(&event.kind);
+                        let _ = sender.send(LocalChange { path, kind });
+                    }
                 }
-            }
-            Err(err) => {
-                tracing::warn!("local filesystem watch error: {err}");
-            }
-        })?;
+                Err(err) => {
+                    tracing::warn!("local filesystem watch error: {err}");
+                }
+            })?;
 
         watcher.watch(root, RecursiveMode::Recursive)?;
 
