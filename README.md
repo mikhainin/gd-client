@@ -3,146 +3,83 @@
 A small Google Drive sync suite for Linux, split into a background daemon
 and a Qt6/QML front-end, built as a Rust workspace.
 
-## Motivation
+Choose local directories to pair with Google Drive folders or "My Drive".
+The daemon handles syncing; the UI manages folders, sign-in, and status.
 
-Google ships official Google Drive clients for Windows and macOS, but not
-for Linux. There are good general-purpose tools and third-party apps that
-can fill the gap, but sometimes you just want something small and focused.
+## Current limitations
 
-`g-client` is that: a lightweight background daemon plus a simple native Qt
-UI, doing one job — keeping a few chosen local folders and Drive folders in
-sync.
-
-## Crates
-
-| Crate | Description |
-| --- | --- |
-| [`gdrive-common`](crates/gdrive-common) | Shared config model (`AppConfig`, `SyncFolder`), filesystem paths, and the `org.gclient.GDrive1` D-Bus interface contract. |
-| [`gdrive-sync`](crates/gdrive-sync) | The sync engine: OAuth2 auth, Drive API client, local filesystem watcher, SQLite-backed state tracking, and file ownership handling. |
-| [`gdrived`](crates/gdrived) | Background daemon binary. Loads configuration, runs the sync engine for every enabled folder, and exposes control over D-Bus. |
-| [`gdrive-ui`](crates/gdrive-ui) | Qt6/QML desktop UI (via [cxx-qt](https://github.com/KDAB/cxx-qt)) that talks to `gdrived` over D-Bus to list/add/remove/enable sync folders. |
-
-Each sync folder pairs one local directory with one Google Drive folder
-(or "My Drive" root). `gdrived` keeps enabled folders synchronised
-continuously; `gdrive-ui` is just a control panel for `gdrived` and holds no
-sync state itself.
+**Experimental: use disposable folders and keep independent backups.**
+Sync can overwrite local files, and deleting tracked local items permanently
+deletes them from Drive, bypassing the trash. Remote discovery, conflict
+handling, moves/renames, and Google document export are incomplete; see
+[sync limitations](crates/gdrive-sync/README.md#current-limitations).
 
 ## Building
 
-Requires Rust 1.89 or newer (edition 2021, `rust-version = "1.89"`
-in the workspace `Cargo.toml`), including the minimum required by zbus 6.
+Requires Rust 1.89+, a C++ build toolchain, and Qt6 development libraries
+and QML modules. On Debian/Ubuntu, run
+[`scripts/install-qt6.sh`](scripts/install-qt6.sh) yourself to install the
+system prerequisites (it invokes `sudo apt`).
+
+Build Debian packages and install them from the repository root:
 
 ```sh
-cargo build --workspace
-cargo test --workspace
-```
-
-`gdrive-ui` additionally requires Qt6 + QML modules to be installed on the
-system (see [`scripts/install-qt6.sh`](scripts/install-qt6.sh) for the
-Debian/Ubuntu package list). Run that script directly on your development
-machine, not inside a restricted sandbox.
-
-A root [`Makefile`](Makefile) wraps the common build/package/install flow:
-
-A root `Makefile` wraps the common workflows: `make build`/`make test` run
-the `cargo` commands above; `make deb` runs `cargo deb -p gdrived`/
-`cargo deb -p gdrive-ui` to produce `target/debian/*.deb` packages; `make
-install`/`make uninstall` only print the `sudo apt install`/`sudo apt
-remove` commands (never run them — see [`AGENTS.md`](AGENTS.md)); `make
-clean` removes build artifacts.
-
-After building the packages, run this from the repository root:
-
-```sh
+cargo install cargo-deb
+make deb
 sudo apt install ./target/debian/*.deb
 ```
 
-The `./` prefix tells APT to install local package files rather than search
-for package names.
+For development, use `cargo build --workspace` and `cargo test --workspace`.
+Without Qt, build only the daemon with `cargo build -p gdrived`.
+See the [`Makefile`](Makefile) for release/package targets and the
+[UI README](crates/gdrive-ui/README.md#ui-testing) for UI-specific tests.
 
 ## Running
 
-1. Set `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` (a Google Cloud OAuth
-   client) in the environment so `gdrived` can run the interactive OAuth
-   flow on first use — see [`gdrive-sync`'s auth module](crates/gdrive-sync/src/auth.rs).
-2. Start the daemon:
-   ```sh
-   cargo run -p gdrived
-   ```
-   It loads (or creates) `~/.config/gdrive-client/config.toml`, tries to
-   authenticate, and serves the `org.gclient.GDrive1` interface on the
-   session D-Bus bus regardless of whether authentication succeeded, so the
-   UI can always start.
-3. Start the UI:
-   ```sh
-   cargo run -p gdrive-ui
-   ```
-   Use it to add a sync folder (local path + optional Drive folder id),
-   enable it, and `gdrived` will start syncing it.
+Unless your build embeds an OAuth client, configure both `GDRIVE_CLIENT_ID`
+and `GDRIVE_CLIENT_SECRET` for the daemon. Packaged installs use
+`~/.config/gdrived/env`, not shell exports. See
+[OAuth setup](crates/gdrived/README.md#oauth-client-configuration) for Google
+Cloud requirements, runtime overrides, and build-time defaults.
 
-You can also drive `gdrived` directly without the UI, e.g.:
+Launch **g-client Google Drive Sync** from the application menu or run
+`gdrive-ui`; packaged installs activate the daemon on demand. From source,
+run these in separate terminals in your desktop session:
 
 ```sh
-busctl --user call org.gclient.GDrive1 /org/gclient/GDrive1 org.gclient.GDrive1 ListSyncFolders
+cargo run -p gdrived
+cargo run -p gdrive-ui
 ```
+
+Click **Sign in**, complete browser consent, then add a local path and
+select a Drive folder (or leave its id empty for "My Drive"). New folders
+are enabled immediately. Startup alone does not initiate sign-in.
+Closing the window hides it to the tray; **Quit** exits only the UI.
 
 ## Data locations
 
-Following the XDG base directory spec (see
-[`gdrive-common::paths`](crates/gdrive-common/src/paths.rs)):
-
 - Config: `~/.config/gdrive-client/config.toml`
-- Sync state DB + cached OAuth token: `~/.local/share/gdrive-client/`
+- Sync database and OAuth token: `~/.local/share/gdrive-client/`
 
-## Repository conventions
+These respect `XDG_CONFIG_HOME` and `XDG_DATA_HOME`; the packaged daemon's
+OAuth environment file does not.
 
-See [`AGENTS.md`](AGENTS.md) for contributor/agent guidance, including the
-documentation-editing convention and how to verify the Qt/QML UI visually.
+## Documentation
 
-## Alternatives
+| Component | Details |
+| --- | --- |
+| [`gdrived`](crates/gdrived) | Daemon, OAuth setup, D-Bus control, diagnostics |
+| [`gdrive-ui`](crates/gdrive-ui) | Qt6/QML UI, tray status, testing |
+| [`gdrive-sync`](crates/gdrive-sync) | Sync engine, auth, Drive API, limitations |
+| [`gdrive-common`](crates/gdrive-common) | Shared configuration, paths, D-Bus contract |
 
-If `g-client` doesn't fit your needs, there are other solid ways to work
-with Google Drive on Linux:
+See [`AGENTS.md`](AGENTS.md) for contributor guidance and license checks.
 
-- **[rclone](https://rclone.org/)** — a mature, extremely versatile
-  command-line tool supporting dozens of cloud storage backends (not just
-  Drive), with powerful sync/mount/encryption options for advanced use
-  cases.
-- **[Insync](https://www.insynchq.com/)** — a polished, actively maintained
-  commercial GUI client with broad desktop integration (file manager
-  overlays, selective sync, multiple accounts) and official Linux support.
-- **[odrive](https://www.odrive.com/)** — a commercial "sync on demand"
-  client that keeps a lightweight local placeholder for cloud files,
-  useful when your Drive is much larger than your local disk.
-- **The Google Drive web app** — no installation at all, works anywhere,
-  and always reflects Google's latest features first.
-
-Each of these has years of polish behind it; `g-client` simply aims to be a
-small, transparent, native alternative for people who want a minimal tool
-they can read, build, and run themselves.
+Alternatives include [rclone](https://rclone.org/),
+[Insync](https://www.insynchq.com/), [odrive](https://www.odrive.com/),
+and the Google Drive web app.
 
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
-
-Dependency licenses are checked with [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny)
-(`cargo deny check`, config in [`deny.toml`](deny.toml)), and our own source
-is scanned for embedded license/copyright text with
-[`scripts/scancode-scan.sh`](scripts/scancode-scan.sh) (ScanCode Toolkit).
-Both run in CI on every push/PR — see [`AGENTS.md`](AGENTS.md#license-compliance-tooling).
-
-ScanCode's tested compatibility versions are pinned in
-[`scripts/scancode-requirements.txt`](scripts/scancode-requirements.txt).
-Plugincode 32 uses class-marked hooks that Pluggy 1.7 no longer discovers,
-so this scanner uses Pluggy 1.6. The bootstrap checks these requirements on
-every invocation, repairing incompatible existing `.venv-scancode`
-environments as well as setting up fresh ones. Running the scan script can
-install or change packages inside that venv; agents must ask the user to
-perform any needed local installation rather than doing it themselves.
-The bootstrap's offline regression tests use a fake installer and scanner:
-`./scripts/test-scancode-bootstrap.py`.
-The report checker fails on scan errors and unexpected source notices. Its
-path-specific baseline in `.github/scancode-policy.json` recognizes only the project's own license mentions and
-the two Debian package manifests' license-file/copyright metadata; it does not
-globally exempt source files or third-party copyrights.

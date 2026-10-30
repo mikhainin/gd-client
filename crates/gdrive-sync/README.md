@@ -75,5 +75,16 @@ The sync engine, used by the `gdrived` daemon.
 - `ownership` — resolves configured owner user/group names to numeric
   uid/gid and applies them to synced files.
 
-Conflict resolution is currently "last writer wins" based on modified time;
-directory moves/renames are handled as remove+recreate.
+## Current limitations
+
+There is no conflict-copy or reliable modified-time conflict arbitration.
+The initial pull can overwrite existing local files and does not upload
+local-only files; local watching starts only after it completes. Remote
+polling skips untracked Drive items until the worker's next initial pull,
+so disable/re-enable the folder to discover newly created remote items.
+Moves/renames are not reliably reconciled. Google Docs/Sheets/Slides export
+is not implemented.
+
+Local deletion of a tracked item permanently deletes it from Drive,
+bypassing the trash; remote deletions remove local items too. Use disposable
+folders and independent backups rather than treating sync as a backup.
