@@ -290,7 +290,7 @@ impl DriveClient {
                 "received Drive listing response"
             );
             let response = check_status(response).await?;
-            let parsed: FileListResponse<T> = response.json().await?;
+            let parsed: FileListResponse<T> = response_json(response).await?;
             files.extend(parsed.files);
             tracing::debug!(
                 page,
@@ -345,10 +345,12 @@ impl DriveClient {
     /// Fetches a starting page token for the Changes API, to be persisted
     /// and used with [`Self::list_changes`] on subsequent polls.
     pub async fn get_start_page_token(&self) -> Result<String, SyncError> {
-        let request = self.http.get(format!("{API_BASE}/changes/startPageToken"));
+        let request = self
+            .http
+            .get(format!("{}/changes/startPageToken", self.api_base));
         let response = self.send(request).await?;
         let response = check_status(response).await?;
-        let parsed: StartPageTokenResponse = response.json().await?;
+        let parsed: StartPageTokenResponse = response_json(response).await?;
         Ok(parsed.start_page_token)
     }
 
@@ -360,13 +362,13 @@ impl DriveClient {
         let mut new_start_token = None;
 
         loop {
-            let request = self.http.get(format!("{API_BASE}/changes")).query(&[
+            let request = self.http.get(format!("{}/changes", self.api_base)).query(&[
                 ("pageToken", token.as_str()),
                 ("fields", "nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, parents, modifiedTime, trashed, md5Checksum, size))"),
             ]);
             let response = self.send(request).await?;
             let response = check_status(response).await?;
-            let parsed: ChangeListResponse = response.json().await?;
+            let parsed: ChangeListResponse = response_json(response).await?;
             changes.extend(parsed.changes);
 
             if let Some(next) = parsed.next_page_token {
@@ -398,18 +400,18 @@ impl DriveClient {
             .json(&body);
         let response = self.send(request).await?;
         let response = check_status(response).await?;
-        Ok(response.json().await?)
+        response_json(response).await
     }
 
     /// Downloads a file's raw content.
     pub async fn download_file(&self, file_id: &str) -> Result<bytes::Bytes, SyncError> {
         let request = self
             .http
-            .get(format!("{API_BASE}/files/{file_id}"))
+            .get(format!("{}/files/{file_id}", self.api_base))
             .query(&[("alt", "media")]);
         let response = self.send(request).await?;
         let response = check_status(response).await?;
-        Ok(response.bytes().await?)
+        response_bytes(response).await
     }
 
     /// Uploads (or updates, when `file_id` is `Some`) file content using a
@@ -432,7 +434,7 @@ impl DriveClient {
                     .body(content);
                 let response = self.send(request).await?;
                 let response = check_status(response).await?;
-                Ok(response.json().await?)
+                response_json(response).await
             }
             None => {
                 let metadata = serde_json::json!({
@@ -466,7 +468,7 @@ impl DriveClient {
                     .body(body);
                 let response = self.send(request).await?;
                 let response = check_status(response).await?;
-                Ok(response.json().await?)
+                response_json(response).await
             }
         }
     }
@@ -491,6 +493,23 @@ fn http_client(connect_timeout: Duration, request_timeout: Duration) -> reqwest:
         .expect("failed to construct Drive HTTP client")
 }
 
+async fn response_bytes(response: reqwest::Response) -> Result<bytes::Bytes, SyncError> {
+    response.bytes().await.map_err(response_body_error)
+}
+
+fn response_body_error(error: reqwest::Error) -> SyncError {
+    if error.is_timeout() {
+        SyncError::Http(error)
+    } else {
+        SyncError::HttpBody(error.without_url())
+    }
+}
+
+async fn response_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, SyncError> {
+    let body = response_bytes(response).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
 fn query_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
@@ -502,13 +521,13 @@ async fn check_status(response: reqwest::Response) -> Result<reqwest::Response, 
         Err(SyncError::ReauthenticationRequired)
     } else {
         let status = response.status();
-        let text = response.text().await?;
+        let text = response.text().await.map_err(response_body_error)?;
         Err(SyncError::Api(format!("HTTP {status}: {text}")))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         collections::HashMap,
@@ -519,41 +538,50 @@ mod tests {
         time::Instant,
     };
 
-    struct Reply {
+    pub(crate) struct Reply {
         status: u16,
         body: &'static str,
-        header_delay: Duration,
+        pub(crate) header_delay: Duration,
         body_delay: Duration,
         completed: Option<mpsc::Sender<()>>,
+        truncate_at: Option<usize>,
     }
 
     impl Reply {
-        fn json(body: &'static str) -> Self {
+        pub(crate) fn json(body: &'static str) -> Self {
             Self {
                 status: 200,
                 body,
                 header_delay: Duration::ZERO,
                 body_delay: Duration::ZERO,
                 completed: None,
+                truncate_at: None,
+            }
+        }
+
+        pub(crate) fn truncated(body: &'static str) -> Self {
+            Self {
+                truncate_at: Some(body.len() / 2),
+                ..Self::json(body)
             }
         }
     }
 
-    struct Server {
+    pub(crate) struct Server {
         base: String,
         requests: mpsc::Receiver<String>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
     impl Server {
-        fn start(replies: Vec<Reply>) -> Self {
+        pub(crate) fn start(replies: Vec<Reply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let (sender, requests) = mpsc::channel();
             let worker = thread::spawn(move || {
                 for reply in replies {
-                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let deadline = Instant::now() + Duration::from_secs(10);
                     let mut stream = loop {
                         match listener.accept() {
                             Ok((stream, _)) => break stream,
@@ -602,7 +630,8 @@ mod tests {
                         continue;
                     }
                     thread::sleep(reply.body_delay);
-                    let _ = stream.write_all(reply.body.as_bytes());
+                    let body = reply.body.as_bytes();
+                    let _ = stream.write_all(&body[..reply.truncate_at.unwrap_or(body.len())]);
                     if let Some(completed) = reply.completed {
                         completed.send(()).unwrap();
                     }
@@ -615,7 +644,11 @@ mod tests {
             }
         }
 
-        fn client(&self, request_timeout: Duration, folder_timeout: Duration) -> DriveClient {
+        pub(crate) fn client(
+            &self,
+            request_timeout: Duration,
+            folder_timeout: Duration,
+        ) -> DriveClient {
             DriveClient {
                 http: http_client(Duration::from_secs(1), request_timeout),
                 oauth_http: auth::refresh_http_client().unwrap(),
@@ -1099,11 +1132,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_listing_is_a_transport_failure_and_can_recover() {
+        use std::error::Error;
+
+        let server = Server::start(vec![
+            Reply::truncated(r#"{"files":[]}"#),
+            Reply::json(r#"{"files":[]}"#),
+        ]);
+        let client = server.normal_client();
+        let error = client.list_children("root").await.unwrap_err();
+        assert!(matches!(error, SyncError::HttpBody(_)));
+        assert!(error
+            .source()
+            .unwrap()
+            .downcast_ref::<reqwest::Error>()
+            .is_some());
+        assert!(client.list_children("root").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_refresh_body_preserves_transport_source_and_can_recover() {
+        use std::error::Error;
+
+        let server = Server::start(vec![
+            Reply::truncated(REFRESH_REPLY),
+            Reply::json(REFRESH_REPLY),
+            Reply::json(r#"{"files":[]}"#),
+        ]);
+        let client = server.normal_client();
+        let cache = Cache::new(&client, Some(0));
+        let error = client.list_children("root").await.unwrap_err();
+        assert!(matches!(
+            error,
+            SyncError::OAuthTransport(auth::ReqwestOAuthError::Body(_))
+        ));
+        let source = error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<reqwest::Error>()
+            .unwrap();
+        assert!(source.url().is_none());
+        assert_eq!(
+            auth::load_token(&cache.0).unwrap().unwrap().access_token,
+            "stale-token"
+        );
+        assert!(client.list_children("root").await.unwrap().is_empty());
+        assert_eq!(
+            auth::load_token(&cache.0).unwrap().unwrap().access_token,
+            "fresh-token"
+        );
+    }
+
+    #[tokio::test]
     async fn malformed_response_is_not_an_empty_success() {
         let server = Server::start(vec![Reply::json(r#"{"unexpected":[]}"#)]);
         assert!(matches!(
             server.normal_client().list_child_folders("root").await,
-            Err(SyncError::Http(_))
+            Err(SyncError::Json(_))
         ));
     }
 

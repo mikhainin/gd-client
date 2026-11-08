@@ -19,6 +19,12 @@ pub enum SyncError {
     #[error("Drive API request failed: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("Drive response body transfer failed")]
+    HttpBody(#[source] reqwest::Error),
+
+    #[error("invalid Drive JSON response")]
+    Json(#[from] serde_json::Error),
+
     #[error("Drive API returned an error: {0}")]
     Api(String),
 

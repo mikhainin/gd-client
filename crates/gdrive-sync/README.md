@@ -17,8 +17,19 @@ The sync engine, used by the `gdrived` daemon.
   are reconciled as obsolete, including failed uploads followed by a rename;
   pending remote deletions and unrelated errors remain outstanding. Status
   mutations touch only the affected activity flag/error entry, without cloning
-  the outstanding-error map. Fatal initial failures remain visible after the
-  task exits. Stop/abort clears activity, and run generations reject updates
+  the outstanding-error map. Initial sync retries connection failures and
+  timeouts (including OAuth refresh transport failures) after the configured
+  polling interval, with a five-second minimum in production. Each attempt
+  persists the change cursor before the first recursive pull and retains it
+  across retries, so deletions during a partial pull or retry wait are replayed
+  by polling. No separate internet probe is used. Already-recorded downloads
+  are skipped, and the completion count includes downloads from failed attempts.
+  Waiting workers remain running but are not marked active; their error clears
+  after initialization succeeds. Authentication, API, malformed-response and
+  local failures remain fatal during initialization and visible after the
+  task exits. Established workers already retry remote polls after failures,
+  retaining the last successful change cursor. Stop/abort cancels pending
+  retries and clears activity, and run generations reject updates
   from superseded tasks. Status is in memory, not persisted. Finished tasks
   are excluded from `running_folders`.
   Remote-deletion failures and local metadata failures other than a vanished
@@ -66,6 +77,10 @@ The sync engine, used by the `gdrived` daemon.
   failures do not log credentials or response bodies.
   Transport and deadline failures retain their source errors; OAuth connection,
   response, and body timeouts retain timeout classification through D-Bus.
+  Drive JSON parsing happens only after the complete body is transferred:
+  interrupted bodies retain a retryable transport classification, while invalid
+  JSON/schema responses remain fatal. OAuth body transfers are likewise distinct
+  from malformed token responses; source errors are preserved without body text.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
   sync folder's local path.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API
