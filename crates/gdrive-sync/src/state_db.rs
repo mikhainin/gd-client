@@ -5,8 +5,10 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::drive_client::DriveFile;
 use crate::error::SyncError;
 
 // `Connection` is `Send` but not `Sync` (it caches prepared statements in a
@@ -54,6 +56,13 @@ impl StateDb {
 
             CREATE INDEX IF NOT EXISTS idx_file_state_drive_id
                 ON file_state (sync_folder_id, drive_file_id);
+
+            CREATE TABLE IF NOT EXISTS pending_local_changes (
+                sync_folder_id TEXT NOT NULL,
+                local_rel_path TEXT NOT NULL,
+                upload_json TEXT,
+                PRIMARY KEY (sync_folder_id, local_rel_path)
+            );
             "#,
         )?;
         Ok(())
@@ -109,7 +118,8 @@ impl StateDb {
         local_rel_path: &str,
     ) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
-            "DELETE FROM file_state WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+            "DELETE FROM file_state WHERE sync_folder_id = ?1 AND
+             (local_rel_path = ?2 OR substr(local_rel_path, 1, length(?2) + 1) = ?2 || '/')",
             params![sync_folder_id.to_string(), local_rel_path],
         )?;
         Ok(())
@@ -150,6 +160,98 @@ impl StateDb {
             Ok(None)
         }
     }
+
+    pub fn queue_local_change(&self, folder_id: Uuid, rel_path: &str) -> Result<(), SyncError> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO pending_local_changes (sync_folder_id, local_rel_path) VALUES (?1, ?2)
+             ON CONFLICT(sync_folder_id, local_rel_path) DO NOTHING",
+            params![folder_id.to_string(), rel_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_local_paths(&self, folder_id: Uuid) -> Result<Vec<String>, SyncError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT local_rel_path FROM pending_local_changes WHERE sync_folder_id = ?1 ORDER BY local_rel_path",
+        )?;
+        let paths = stmt
+            .query_map([folder_id.to_string()], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(paths)
+    }
+
+    pub fn pending_upload(
+        &self,
+        folder_id: Uuid,
+        rel_path: &str,
+    ) -> Result<Option<PendingUpload>, SyncError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT upload_json FROM pending_local_changes WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+        )?;
+        let mut rows = stmt.query(params![folder_id.to_string(), rel_path])?;
+        let json: Option<String> = match rows.next()? {
+            Some(row) => row.get(0)?,
+            None => None,
+        };
+        json.map(|json| serde_json::from_str(&json).map_err(SyncError::from))
+            .transpose()
+    }
+
+    pub fn set_pending_upload(
+        &self,
+        folder_id: Uuid,
+        rel_path: &str,
+        upload: Option<&PendingUpload>,
+    ) -> Result<(), SyncError> {
+        self.queue_local_change(folder_id, rel_path)?;
+        let json = upload.map(serde_json::to_string).transpose()?;
+        self.conn.lock().unwrap().execute(
+            "UPDATE pending_local_changes SET upload_json = ?3 WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+            params![folder_id.to_string(), rel_path, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_local_change(&self, folder_id: Uuid, rel_path: &str) -> Result<(), SyncError> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM pending_local_changes WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+            params![folder_id.to_string(), rel_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_pending_local_change(
+        &self,
+        folder_id: Uuid,
+        rel_path: &str,
+    ) -> Result<bool, SyncError> {
+        Ok(self.pending_local_paths(folder_id)?.iter().any(|pending| {
+            pending == rel_path
+                || Path::new(pending).starts_with(rel_path)
+                || Path::new(rel_path).starts_with(pending)
+        }))
+    }
+
+    pub fn has_pending_local_write(
+        &self,
+        folder_id: Uuid,
+        rel_path: &str,
+    ) -> Result<bool, SyncError> {
+        Ok(self
+            .pending_local_paths(folder_id)?
+            .iter()
+            .any(|pending| Path::new(rel_path).starts_with(pending)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingUpload {
+    pub file_id: String,
+    pub previous_drive_id: Option<String>,
+    pub is_folder: bool,
+    pub uploaded: Option<DriveFile>,
 }
 
 #[derive(Debug, Clone)]

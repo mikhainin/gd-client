@@ -9,8 +9,9 @@ The daemon handles syncing; the UI manages folders, sign-in, and status.
 ## Current limitations
 
 **Experimental: use disposable folders and keep independent backups.**
-Sync can overwrite local files, and deleting tracked local items permanently
-deletes them from Drive, bypassing the trash. Remote discovery, conflict
+Sync can overwrite local files. Local deletions move Drive items to Trash;
+local edits upload replacements before trashing the previous copies.
+Remote discovery, conflict
 handling, moves/renames, and Google document export are incomplete; see
 [sync limitations](crates/gdrive-sync/README.md#current-limitations).
 

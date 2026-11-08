@@ -43,8 +43,10 @@ impl LocalWatcher {
         let mut watcher =
             notify::recommended_watcher(move |res: notify::Result<Event>| match res {
                 Ok(event) => {
+                    let Some(kind) = classify(&event.kind) else {
+                        return;
+                    };
                     for path in event.paths.clone() {
-                        let kind = classify(&event.kind);
                         let _ = sender.send(LocalChange { path, kind });
                     }
                 }
@@ -59,11 +61,31 @@ impl LocalWatcher {
     }
 }
 
-fn classify(kind: &EventKind) -> LocalChangeKind {
+fn classify(kind: &EventKind) -> Option<LocalChangeKind> {
     match kind {
-        EventKind::Create(_) => LocalChangeKind::Created,
-        EventKind::Modify(_) => LocalChangeKind::Modified,
-        EventKind::Remove(_) => LocalChangeKind::Removed,
-        _ => LocalChangeKind::Other,
+        EventKind::Create(_) => Some(LocalChangeKind::Created),
+        EventKind::Modify(notify::event::ModifyKind::Metadata(_)) | EventKind::Access(_) => None,
+        EventKind::Modify(_) => Some(LocalChangeKind::Modified),
+        EventKind::Remove(_) => Some(LocalChangeKind::Removed),
+        _ => Some(LocalChangeKind::Other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+
+    #[test]
+    fn access_and_ownership_events_are_ignored_but_content_changes_are_forwarded() {
+        assert!(classify(&EventKind::Access(AccessKind::Read)).is_none());
+        assert!(classify(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Ownership
+        )))
+        .is_none());
+        assert!(matches!(
+            classify(&EventKind::Modify(ModifyKind::Data(DataChange::Content))),
+            Some(LocalChangeKind::Modified)
+        ));
     }
 }

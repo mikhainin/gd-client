@@ -24,6 +24,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(25);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Clone)]
 struct TokenState {
@@ -60,6 +61,7 @@ pub struct DriveClient {
     oauth_config: Option<OAuthConfig>,
     token_endpoint: String,
     api_base: String,
+    upload_base: String,
     folder_list_timeout: Duration,
 }
 
@@ -129,6 +131,7 @@ impl DriveClient {
             oauth_config: OAuthConfig::from_env(),
             token_endpoint: auth::GOOGLE_TOKEN_URL.into(),
             api_base: API_BASE.to_owned(),
+            upload_base: UPLOAD_BASE.to_owned(),
             folder_list_timeout: FOLDER_LIST_TIMEOUT,
         }
     }
@@ -384,15 +387,22 @@ impl DriveClient {
     }
 
     /// Creates a folder on Drive under `parent_id` (or `"root"`).
-    pub async fn create_folder(&self, name: &str, parent_id: &str) -> Result<DriveFile, SyncError> {
+    pub async fn create_folder(
+        &self,
+        file_id: &str,
+        name: &str,
+        parent_id: &str,
+    ) -> Result<DriveFile, SyncError> {
         let body = serde_json::json!({
+            "id": file_id,
             "name": name,
             "mimeType": FOLDER_MIME_TYPE,
             "parents": [parent_id],
         });
         let request = self
             .http
-            .post(format!("{API_BASE}/files"))
+            .post(format!("{}/files", self.api_base))
+            .timeout(METADATA_TIMEOUT)
             .query(&[(
                 "fields",
                 "id, name, mimeType, parents, modifiedTime, trashed",
@@ -414,69 +424,103 @@ impl DriveClient {
         response_bytes(response).await
     }
 
-    /// Uploads (or updates, when `file_id` is `Some`) file content using a
+    /// Creates a file with a pre-generated ID using a
     /// simple (non-resumable) upload. Suitable for small-to-medium files;
     /// large files should use the resumable upload protocol instead (not
     /// yet implemented here).
     pub async fn upload_file(
         &self,
-        file_id: Option<&str>,
+        file_id: &str,
         name: &str,
         parent_id: &str,
         content: Vec<u8>,
     ) -> Result<DriveFile, SyncError> {
-        match file_id {
-            Some(id) => {
-                let request = self
-                    .http
-                    .patch(format!("{UPLOAD_BASE}/files/{id}"))
-                    .query(&[("uploadType", "media")])
-                    .body(content);
-                let response = self.send(request).await?;
-                let response = check_status(response).await?;
-                response_json(response).await
-            }
-            None => {
-                let metadata = serde_json::json!({
-                    "name": name,
-                    "parents": [parent_id],
-                });
-                let boundary = "gdrive_client_boundary";
-                let mut body = Vec::new();
-                body.extend_from_slice(
-                    format!(
-                        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
-                    )
-                    .as_bytes(),
-                );
-                body.extend_from_slice(metadata.to_string().as_bytes());
-                body.extend_from_slice(
-                    format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n")
-                        .as_bytes(),
-                );
-                body.extend_from_slice(&content);
-                body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+        let metadata = serde_json::json!({
+            "id": file_id,
+            "name": name,
+            "parents": [parent_id],
+        });
+        let boundary = "gdrive_client_boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(metadata.to_string().as_bytes());
+        body.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(&content);
+        body.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
 
-                let request = self
-                    .http
-                    .post(format!("{UPLOAD_BASE}/files"))
-                    .query(&[("uploadType", "multipart")])
-                    .header(
-                        "Content-Type",
-                        format!("multipart/related; boundary={boundary}"),
-                    )
-                    .body(body);
-                let response = self.send(request).await?;
-                let response = check_status(response).await?;
-                response_json(response).await
-            }
-        }
+        let request = self
+            .http
+            .post(format!("{}/files", self.upload_base))
+            .query(&[
+                ("uploadType", "multipart"),
+                (
+                    "fields",
+                    "id,name,mimeType,parents,modifiedTime,md5Checksum,size,trashed",
+                ),
+            ])
+            .header(
+                "Content-Type",
+                format!("multipart/related; boundary={boundary}"),
+            )
+            .body(body);
+        let response = self.send(request).await?;
+        let response = check_status(response).await?;
+        response_json(response).await
     }
 
-    /// Permanently deletes a file/folder from Drive (bypassing the trash).
-    pub async fn delete_file(&self, file_id: &str) -> Result<(), SyncError> {
-        let request = self.http.delete(format!("{API_BASE}/files/{file_id}"));
+    pub async fn generate_file_id(&self) -> Result<String, SyncError> {
+        #[derive(Deserialize)]
+        struct Ids {
+            ids: Vec<String>,
+        }
+        let request = self
+            .http
+            .get(format!("{}/files/generateIds", self.api_base))
+            .timeout(METADATA_TIMEOUT)
+            .query(&[("count", "1"), ("space", "drive"), ("type", "files")]);
+        let response = check_status(self.send(request).await?).await?;
+        let ids: Ids = response_json(response).await?;
+        ids.ids
+            .into_iter()
+            .next()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| SyncError::Api("Drive returned no generated file ID".into()))
+    }
+
+    /// Recovers a create whose response was lost. Only a confirmed 404 means absent.
+    pub async fn get_file(&self, file_id: &str) -> Result<Option<DriveFile>, SyncError> {
+        let request = self
+            .http
+            .get(format!("{}/files/{file_id}", self.api_base))
+            .timeout(METADATA_TIMEOUT)
+            .query(&[(
+                "fields",
+                "id,name,mimeType,parents,modifiedTime,md5Checksum,size,trashed",
+            )]);
         let response = self.send(request).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        response_json(check_status(response).await?).await.map(Some)
+    }
+
+    /// Moves a file/folder to Trash; retrying an already-trashed item is safe.
+    pub async fn trash_file(&self, file_id: &str) -> Result<(), SyncError> {
+        let request = self
+            .http
+            .patch(format!("{}/files/{file_id}", self.api_base))
+            .timeout(METADATA_TIMEOUT)
+            .json(&serde_json::json!({ "trashed": true }));
+        let response = self.send(request).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         check_status(response).await?;
         Ok(())
     }
@@ -565,11 +609,18 @@ pub(crate) mod tests {
                 ..Self::json(body)
             }
         }
+
+        pub(crate) fn error(status: u16) -> Self {
+            Self {
+                status,
+                ..Self::json("{}")
+            }
+        }
     }
 
     pub(crate) struct Server {
         base: String,
-        requests: mpsc::Receiver<String>,
+        pub(crate) requests: mpsc::Receiver<String>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
@@ -660,6 +711,7 @@ pub(crate) mod tests {
                 }),
                 token_endpoint: format!("{}/token", self.base),
                 api_base: self.base.clone(),
+                upload_base: self.base.clone(),
                 folder_list_timeout: folder_timeout,
             }
         }
