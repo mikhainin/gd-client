@@ -13,6 +13,12 @@ pub enum SyncError {
     #[error("local filesystem watcher error: {0}")]
     Notify(#[from] notify::Error),
 
+    #[error("local filenames must be valid UTF-8; the path was not changed or normalized")]
+    LocalPathEncoding(#[from] std::str::Utf8Error),
+
+    #[error("local path is outside the sync folder")]
+    LocalPathPrefix(#[from] std::path::StripPrefixError),
+
     #[error("SQLite state store error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 

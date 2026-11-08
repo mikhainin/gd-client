@@ -40,11 +40,19 @@ The sync engine, used by the `gdrived` daemon.
   until that path succeeds; stopping a worker cancels attempts but preserves
   its queue for the next start. Pending paths are protected from startup pulls
   and remote polling; tracked local edits found before a remote write are
-  queued instead of overwritten.
+  queued instead of overwritten. Missing legacy checksum baselines are treated
+  conservatively as local work, not evidence that a file is unchanged.
+  Remote directory removal first checks descendant disk state and queues edited
+  or untracked children. Deferred changes retain the previous change cursor
+  until the blocking local work resolves, so reverting a failed local edit does
+  not lose an intervening remote update.
   Local edits create a new Drive file before moving the previous file to Trash.
   Drive-generated IDs and staged upload metadata are persisted before retirement:
   a retry can recover a create whose response was lost, or finish a failed trash
-  operation without uploading another copy. Local deletions also use Trash.
+  operation without uploading another copy. Retirement checks live replacement
+  metadata rather than trusting the stored response. If that copy is gone or
+  trashed, the previous copy is preserved and a fresh upload is queued.
+  Local deletions also use Trash.
   MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
   suppress uploads of unchanged files and daemon-generated download events.
 - `auth` — Google OAuth2 flow (via the `oauth2` crate) and cached token
@@ -103,7 +111,13 @@ The sync engine, used by the `gdrived` daemon.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
   sync folder's local path. Read/access and metadata-only events, including
   ownership changes made by the daemon, are ignored; content changes remain
-  queued and reconciled.
+  queued and reconciled. The watcher callback persists paths independently of
+  the transfer loop, before sending a wake-up notification. Queue revisions
+  prevent finishing an older attempt from deleting newer events for that path.
+  Paths retain literal filename characters, including Linux backslashes.
+  The text-backed path store accepts UTF-8 names; unsupported byte sequences
+  are explicit watcher errors, never lossy aliases to another file. Watcher
+  errors and persistence failures remain visible until stop/restart.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API
   page tokens and per-file sync state (Drive id, checksum, etc.), keyed by
   `sync_folder_id`. `Connection` is wrapped in a `Mutex` since it isn't

@@ -36,7 +36,9 @@ impl StateDb {
     }
 
     fn migrate(&self) -> Result<(), SyncError> {
-        self.conn.lock().unwrap().execute_batch(
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        transaction.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS sync_folder_state (
                 sync_folder_id     TEXT PRIMARY KEY,
@@ -61,10 +63,23 @@ impl StateDb {
                 sync_folder_id TEXT NOT NULL,
                 local_rel_path TEXT NOT NULL,
                 upload_json TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (sync_folder_id, local_rel_path)
             );
             "#,
         )?;
+        let has_revision: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('pending_local_changes') WHERE name = 'revision')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_revision {
+            transaction.execute(
+                "ALTER TABLE pending_local_changes ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -164,7 +179,7 @@ impl StateDb {
     pub fn queue_local_change(&self, folder_id: Uuid, rel_path: &str) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO pending_local_changes (sync_folder_id, local_rel_path) VALUES (?1, ?2)
-             ON CONFLICT(sync_folder_id, local_rel_path) DO NOTHING",
+             ON CONFLICT(sync_folder_id, local_rel_path) DO UPDATE SET revision = revision + 1",
             params![folder_id.to_string(), rel_path],
         )?;
         Ok(())
@@ -205,10 +220,10 @@ impl StateDb {
         rel_path: &str,
         upload: Option<&PendingUpload>,
     ) -> Result<(), SyncError> {
-        self.queue_local_change(folder_id, rel_path)?;
         let json = upload.map(serde_json::to_string).transpose()?;
         self.conn.lock().unwrap().execute(
-            "UPDATE pending_local_changes SET upload_json = ?3 WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+            "INSERT INTO pending_local_changes (sync_folder_id, local_rel_path, upload_json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(sync_folder_id, local_rel_path) DO UPDATE SET upload_json = excluded.upload_json",
             params![folder_id.to_string(), rel_path, json],
         )?;
         Ok(())
@@ -218,6 +233,34 @@ impl StateDb {
         self.conn.lock().unwrap().execute(
             "DELETE FROM pending_local_changes WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
             params![folder_id.to_string(), rel_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_local_revision(
+        &self,
+        folder_id: Uuid,
+        rel_path: &str,
+    ) -> Result<Option<i64>, SyncError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT revision FROM pending_local_changes WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+        )?;
+        let mut rows = stmt.query(params![folder_id.to_string(), rel_path])?;
+        rows.next()?
+            .map(|row| row.get(0).map_err(SyncError::from))
+            .transpose()
+    }
+
+    pub fn complete_local_revision(
+        &self,
+        folder_id: Uuid,
+        rel_path: &str,
+        revision: i64,
+    ) -> Result<(), SyncError> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM pending_local_changes WHERE sync_folder_id = ?1 AND local_rel_path = ?2 AND revision = ?3",
+            params![folder_id.to_string(), rel_path, revision],
         )?;
         Ok(())
     }
@@ -282,6 +325,80 @@ fn row_to_entry(row: &rusqlite::Row) -> Result<FileStateEntry, SyncError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completing_an_older_attempt_does_not_drop_a_newer_watcher_event() {
+        let root = std::env::temp_dir().join(format!("gdrive-queue-revision-{}", Uuid::new_v4()));
+        let db = StateDb::open(&root.join("state.sqlite")).unwrap();
+        let id = Uuid::new_v4();
+        db.queue_local_change(id, "file.txt").unwrap();
+        let revision = db.pending_local_revision(id, "file.txt").unwrap().unwrap();
+        db.set_pending_upload(id, "file.txt", None).unwrap();
+        assert_eq!(
+            db.pending_local_revision(id, "file.txt").unwrap(),
+            Some(revision)
+        );
+        db.queue_local_change(id, "file.txt").unwrap();
+        db.complete_local_revision(id, "file.txt", revision)
+            .unwrap();
+        assert_eq!(db.pending_local_paths(id).unwrap(), vec!["file.txt"]);
+        let latest = db.pending_local_revision(id, "file.txt").unwrap().unwrap();
+        db.complete_local_revision(id, "file.txt", latest).unwrap();
+        assert!(db.pending_local_paths(id).unwrap().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_pending_queue_is_migrated_without_losing_upload_stages() {
+        let root = std::env::temp_dir().join(format!("gdrive-queue-migration-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("state.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pending_local_changes (
+                sync_folder_id TEXT NOT NULL, local_rel_path TEXT NOT NULL,
+                upload_json TEXT, PRIMARY KEY (sync_folder_id, local_rel_path)
+             );",
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        let upload = PendingUpload {
+            file_id: "recoverable-id".into(),
+            previous_drive_id: Some("old-id".into()),
+            is_folder: false,
+            uploaded: None,
+        };
+        conn.execute(
+            "INSERT INTO pending_local_changes VALUES (?1, ?2, ?3)",
+            params![
+                id.to_string(),
+                r"report\2026.txt",
+                serde_json::to_string(&upload).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let db = StateDb::open(&path).unwrap();
+        assert_eq!(
+            db.pending_local_revision(id, r"report\2026.txt").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.pending_upload(id, r"report\2026.txt")
+                .unwrap()
+                .unwrap()
+                .file_id,
+            "recoverable-id"
+        );
+        db.queue_local_change(id, r"report\2026.txt").unwrap();
+        assert_eq!(
+            db.pending_local_revision(id, r"report\2026.txt").unwrap(),
+            Some(2)
+        );
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stores_and_retrieves_page_token() {

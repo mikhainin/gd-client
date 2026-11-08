@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::drive_client::{DriveClient, DriveFile, FOLDER_MIME_TYPE};
 use crate::error::SyncError;
-use crate::local_watcher::{LocalChange, LocalWatcher};
+use crate::local_watcher::{path_key, LocalChange, LocalWatcher};
 use crate::ownership::{apply_ownership, resolve_owner};
 use crate::state_db::{FileStateEntry, PendingUpload, StateDb};
 use crate::sync_status::{FolderRun, StatusTracker};
@@ -267,8 +267,13 @@ async fn run_folder(
     });
 
     // 2. Watch local changes and push them to Drive.
-    let (local_tx, mut local_rx) = mpsc::unbounded_channel::<LocalChange>();
-    let _watcher = LocalWatcher::watch(&folder.local_path, local_tx)?;
+    let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Result<LocalChange, SyncError>>();
+    let _watcher = LocalWatcher::watch(
+        &folder.local_path,
+        folder.id,
+        Arc::clone(&state_db),
+        local_tx,
+    )?;
     status.finish("initial sync", Ok(()));
 
     let mut poll_timer = tokio::time::interval(poll_interval);
@@ -277,14 +282,14 @@ async fn run_folder(
     loop {
         tokio::select! {
             Some(change) = local_rx.recv() => {
-                let result = async {
-                    if let Ok(rel_path) = change.path.strip_prefix(&folder.local_path) {
-                        if !rel_path.as_os_str().is_empty() {
-                            state_db.queue_local_change(folder.id, &rel_path.to_string_lossy().replace('\\', "/"))?;
-                        }
-                    }
-                    retry_local_changes(&folder, &drive, &state_db, &root_folder_id, (owner_uid, owner_gid), &events, status).await
-                }.await;
+                let result = match change {
+                    Ok(_) => retry_local_changes(&folder, &drive, &state_db, &root_folder_id, (owner_uid, owner_gid), &events, status).await,
+                    Err(error) => {
+                        status.finish("local watcher", Err(error.to_string()));
+                        let _ = events.send(SyncEvent::Error { folder_id: Some(folder.id), message: error.to_string() });
+                        continue;
+                    },
+                };
                 if let Err(err) = result {
                     status.finish("local retry queue", Err(err.to_string()));
                     let _ = events.send(SyncEvent::Error { folder_id: Some(folder.id), message: err.to_string() });
@@ -315,6 +320,9 @@ async fn retry_local_changes(
     status: &FolderRun,
 ) -> Result<(), SyncError> {
     for rel_path in state_db.pending_local_paths(folder.id)? {
+        let Some(revision) = state_db.pending_local_revision(folder.id, &rel_path)? else {
+            continue;
+        };
         let change = LocalChange {
             path: folder.local_path.join(&rel_path),
             kind: crate::local_watcher::LocalChangeKind::Other,
@@ -333,7 +341,14 @@ async fn retry_local_changes(
         .await;
         match result {
             Ok(applied) => {
-                state_db.complete_local_change(folder.id, &rel_path)?;
+                let existing = state_db.find_by_local_path(folder.id, &rel_path)?;
+                let changed_again = match existing {
+                    Some(existing) => local_file_changed(&change.path, &existing).await?,
+                    None => tokio::fs::try_exists(&change.path).await?,
+                };
+                if !changed_again {
+                    state_db.complete_local_revision(folder.id, &rel_path, revision)?;
+                }
                 status.finish(&work, Ok(()));
                 if applied {
                     let _ = events.send(SyncEvent::LocalChangeUploaded {
@@ -398,6 +413,12 @@ async fn initial_pull(
         }
 
         if child.mime_type == FOLDER_MIME_TYPE {
+            if let Some(existing) = state_db.find_by_drive_id(folder.id, &child.id)? {
+                if local_file_changed(&local_path, &existing).await? {
+                    state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
+                    continue;
+                }
+            }
             tokio::fs::create_dir_all(&local_path).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, true)?;
@@ -433,6 +454,14 @@ async fn initial_pull(
 }
 
 async fn local_file_changed(path: &Path, existing: &FileStateEntry) -> Result<bool, SyncError> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() != existing.is_folder {
+        return Ok(true);
+    }
     if existing.is_folder {
         return Ok(false);
     }
@@ -440,10 +469,44 @@ async fn local_file_changed(path: &Path, existing: &FileStateEntry) -> Result<bo
         Ok(content) => Ok(existing
             .md5_checksum
             .as_ref()
-            .is_some_and(|checksum| checksum != &format!("{:x}", md5::compute(content)))),
+            .is_none_or(|checksum| checksum != &format!("{:x}", md5::compute(content)))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+
+async fn queue_dirty_descendants(
+    folder: &SyncFolder,
+    state_db: &StateDb,
+    directory: &Path,
+) -> Result<bool, SyncError> {
+    let mut directories = vec![directory.to_path_buf()];
+    let mut dirty = false;
+    while let Some(directory) = directories.pop() {
+        let mut entries = match tokio::fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let relative = path.strip_prefix(&folder.local_path)?;
+            let key = path_key(relative)?;
+            let existing = state_db.find_by_local_path(folder.id, &key)?;
+            let changed = match existing {
+                Some(existing) => local_file_changed(&path, &existing).await?,
+                None => true,
+            };
+            if changed {
+                state_db.queue_local_change(folder.id, &key)?;
+                dirty = true;
+            }
+            if entry.file_type().await?.is_dir() {
+                directories.push(path);
+            }
+        }
+    }
+    Ok(dirty)
 }
 
 fn needs_download(
@@ -490,7 +553,7 @@ async fn handle_local_change(
     let Ok(rel_path) = change.path.strip_prefix(&folder.local_path) else {
         return Ok(false);
     };
-    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+    let rel_path_str = path_key(rel_path)?;
     if rel_path_str.is_empty() {
         return Ok(false);
     }
@@ -550,8 +613,9 @@ async fn handle_local_change(
     }
     let name = rel_path
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .map(|name| path_key(Path::new(name)))
+        .transpose()?
+        .ok_or_else(|| SyncError::Api("local file has no name".into()))?;
     let parent_drive_id = parent_drive_folder_id(folder, state_db, root_folder_id, rel_path)?;
 
     status.active();
@@ -598,11 +662,14 @@ async fn finish_upload(
     rel_path: &str,
     upload: &PendingUpload,
 ) -> Result<(), SyncError> {
-    let uploaded = upload
-        .uploaded
-        .as_ref()
-        .ok_or_else(|| SyncError::Api("pending upload has no completed file".into()))?;
-    if uploaded.id != upload.file_id || uploaded.trashed {
+    let uploaded = drive.get_file(&upload.file_id).await?;
+    let Some(uploaded) = uploaded.filter(|file| !file.trashed) else {
+        state_db.set_pending_upload(folder.id, rel_path, None)?;
+        return Err(SyncError::Api(
+            "replacement is missing or trashed; previous Drive copy was preserved and a new upload will be retried".into(),
+        ));
+    };
+    if uploaded.id != upload.file_id {
         return Err(SyncError::Api(
             "pending replacement is unavailable or has an unexpected ID".into(),
         ));
@@ -610,7 +677,7 @@ async fn finish_upload(
     if let Some(previous) = &upload.previous_drive_id {
         drive.trash_file(previous).await?;
     }
-    record_state(folder.id, state_db, rel_path, uploaded, upload.is_folder)?;
+    record_state(folder.id, state_db, rel_path, &uploaded, upload.is_folder)?;
     state_db.set_pending_upload(folder.id, rel_path, None)?;
     Ok(())
 }
@@ -635,7 +702,7 @@ fn parent_drive_folder_id(
     match rel_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         None => Ok(root_folder_id.to_string()),
         Some(parent_rel) => {
-            let parent_rel_str = parent_rel.to_string_lossy().replace('\\', "/");
+            let parent_rel_str = path_key(parent_rel)?;
             match state_db.find_by_local_path(folder.id, &parent_rel_str)? {
                 Some(entry) if entry.is_folder && entry.drive_file_id.is_some() => {
                     Ok(entry.drive_file_id.unwrap())
@@ -666,6 +733,7 @@ async fn poll_remote_changes(
 
     let (changes, new_token) = drive.list_changes(&page_token).await?;
 
+    let mut deferred = false;
     for change in changes {
         let Some(existing) = state_db.find_by_drive_id(folder.id, &change.file_id)? else {
             // We don't know this file yet (created elsewhere, or outside
@@ -677,11 +745,20 @@ async fn poll_remote_changes(
 
         let local_path = folder.local_path.join(&existing.local_rel_path);
         if state_db.has_pending_local_change(folder.id, &existing.local_rel_path)? {
+            deferred = true;
             continue;
         }
         if local_file_changed(&local_path, &existing).await? {
             state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
+            deferred = true;
             continue;
+        }
+        if existing.is_folder {
+            let dirty = queue_dirty_descendants(folder, state_db, &local_path).await?;
+            if dirty || state_db.has_pending_local_change(folder.id, &existing.local_rel_path)? {
+                deferred = true;
+                continue;
+            }
         }
 
         if change.removed || change.file.as_ref().map(|f| f.trashed).unwrap_or(true) {
@@ -705,6 +782,7 @@ async fn poll_remote_changes(
             let content = drive.download_file(&remote_file.id).await?;
             if local_file_changed(&local_path, &existing).await? {
                 state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
+                deferred = true;
                 continue;
             }
             tokio::fs::write(&local_path, &content).await?;
@@ -723,7 +801,9 @@ async fn poll_remote_changes(
         }
     }
 
-    state_db.set_page_token(folder.id, &new_token)?;
+    if !deferred {
+        state_db.set_page_token(folder.id, &new_token)?;
+    }
     Ok(())
 }
 
@@ -799,6 +879,7 @@ mod tests {
             Reply::error(503),
             Reply::error(404),
             Reply::json(UPLOADED_NEW),
+            Reply::json(UPLOADED_NEW),
             Reply::json("{}"),
         ]);
         let (root, folder, mut engine) = local_fixture(&server, b"new").await;
@@ -846,8 +927,9 @@ mod tests {
         assert!(requests[0].starts_with("GET /files/new-id?"));
         assert!(requests[1].starts_with("POST /files?"));
         assert!(requests[1].contains(r#""id":"new-id""#));
-        assert!(requests[2].starts_with("PATCH /files/old-id "));
-        assert!(requests[2].contains(r#""trashed":true"#));
+        assert!(requests[2].starts_with("GET /files/new-id?"));
+        assert!(requests[3].starts_with("PATCH /files/old-id "));
+        assert!(requests[3].contains(r#""trashed":true"#));
         drop(status);
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
@@ -858,7 +940,9 @@ mod tests {
         let server = Server::start(vec![
             Reply::json(r#"{"ids":["new-id"]}"#),
             Reply::json(UPLOADED_NEW),
+            Reply::json(UPLOADED_NEW),
             Reply::error(503),
+            Reply::json(UPLOADED_NEW),
             Reply::json("{}"),
         ]);
         let (root, folder, mut engine) = local_fixture(&server, b"new").await;
@@ -873,12 +957,13 @@ mod tests {
             .is_some());
         let requests: Vec<_> = server.requests.try_iter().collect();
         assert!(requests[1].starts_with("POST /files?"));
-        assert!(requests[2].starts_with("PATCH /files/old-id "));
+        assert!(requests[3].starts_with("PATCH /files/old-id "));
         engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
         retry_fixture(&folder, &engine, &status).await;
         let requests: Vec<_> = server.requests.try_iter().collect();
-        assert_eq!(requests.len(), 1, "retry must not create another copy");
-        assert!(requests[0].starts_with("PATCH /files/old-id "));
+        assert_eq!(requests.len(), 2, "retry must not create another copy");
+        assert!(requests[0].starts_with("GET /files/new-id?"));
+        assert!(requests[1].starts_with("PATCH /files/old-id "));
         assert!(engine
             .state_db
             .pending_local_paths(folder.id)
@@ -896,6 +981,7 @@ mod tests {
             Reply::json(r#"{"ids":["new-id"]}"#),
             Reply::truncated(UPLOADED_NEW),
             Reply::json(UPLOADED_NEW),
+            Reply::json(UPLOADED_NEW),
             Reply::json("{}"),
         ]);
         let (root, folder, engine) = local_fixture(&server, b"new").await;
@@ -909,7 +995,8 @@ mod tests {
             1
         );
         assert!(requests[2].starts_with("GET /files/new-id?"));
-        assert!(requests[3].starts_with("PATCH /files/old-id "));
+        assert!(requests[3].starts_with("GET /files/new-id?"));
+        assert!(requests[4].starts_with("PATCH /files/old-id "));
         assert!(engine
             .state_db
             .pending_local_paths(folder.id)
@@ -1076,7 +1163,11 @@ mod tests {
             Reply::json(
                 r#"{"id":"parent-id","name":"dir","mimeType":"application/vnd.google-apps.folder"}"#,
             ),
+            Reply::json(
+                r#"{"id":"parent-id","name":"dir","mimeType":"application/vnd.google-apps.folder"}"#,
+            ),
             Reply::json(r#"{"ids":["new-id"]}"#),
+            Reply::json(UPLOADED_NEW),
             Reply::json(UPLOADED_NEW),
         ]);
         let (root, folder, engine) = local_fixture(&server, b"old").await;
@@ -1110,7 +1201,421 @@ mod tests {
         assert!(engine.sync_status().folders[0].errors.is_empty());
         let requests: Vec<_> = server.requests.try_iter().collect();
         assert!(requests[1].starts_with("POST /files?"));
-        assert!(requests[3].contains(r#""parents":["parent-id"]"#));
+        assert!(requests[4].contains(r#""parents":["parent-id"]"#));
+        drop(status);
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backslash_filename_is_replayed_verbatim_not_as_a_directory() {
+        const UPLOADED: &str = r#"{"id":"new-id","name":"report\\2026.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}"#;
+        let server = Server::start(vec![
+            Reply::json(r#"{"ids":["new-id"]}"#),
+            Reply::json(UPLOADED),
+            Reply::json(UPLOADED),
+            Reply::json("{}"),
+        ]);
+        let (root, folder, engine) = local_fixture(&server, b"new").await;
+        let name = r"report\2026.txt";
+        tokio::fs::rename(
+            folder.local_path.join("file.txt"),
+            folder.local_path.join(name),
+        )
+        .await
+        .unwrap();
+        let mut entry = engine
+            .state_db
+            .find_by_local_path(folder.id, "file.txt")
+            .unwrap()
+            .unwrap();
+        engine
+            .state_db
+            .remove_file_state(folder.id, "file.txt")
+            .unwrap();
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        entry.local_rel_path = path_key(Path::new(name)).unwrap();
+        engine.state_db.upsert_file_state(&entry).unwrap();
+        engine
+            .state_db
+            .queue_local_change(folder.id, &entry.local_rel_path)
+            .unwrap();
+        let status = engine.status.start(folder.id, 1);
+        retry_fixture(&folder, &engine, &status).await;
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            engine
+                .state_db
+                .find_by_local_path(folder.id, name)
+                .unwrap()
+                .unwrap()
+                .drive_file_id
+                .as_deref(),
+            Some("new-id")
+        );
+        assert!(!folder.local_path.join("report").exists());
+        let requests: Vec<_> = server.requests.try_iter().collect();
+        assert!(requests[1].contains(r#""name":"report\\2026.txt""#));
+        assert!(requests[3].starts_with("PATCH /files/old-id "));
+        drop(status);
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_checksum_preserves_offline_edit_during_initial_pull() {
+        let server = Server::start(vec![Reply::json(
+            r#"{"files":[{"id":"old-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}]}"#,
+        )]);
+        let (root, folder, engine) = local_fixture(&server, b"offline edit").await;
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        let mut entry = engine
+            .state_db
+            .find_by_local_path(folder.id, "file.txt")
+            .unwrap()
+            .unwrap();
+        entry.md5_checksum = None;
+        engine.state_db.upsert_file_state(&entry).unwrap();
+        let mut synced = 0;
+        initial_pull(
+            &folder,
+            &engine.drive,
+            &engine.state_db,
+            "root",
+            "",
+            (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+            &mut synced,
+        )
+        .await
+        .unwrap();
+        assert_eq!(synced, 0);
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("file.txt"))
+                .await
+                .unwrap(),
+            b"offline edit"
+        );
+        assert_eq!(
+            engine.state_db.pending_local_paths(folder.id).unwrap(),
+            vec!["file.txt"]
+        );
+        assert_eq!(server.requests.try_iter().count(), 1);
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_or_trashed_replacement_never_retires_the_surviving_old_copy() {
+        for gone in [
+            Reply::error(404),
+            Reply::json(
+                r#"{"id":"new-id","name":"file.txt","mimeType":"text/plain","trashed":true}"#,
+            ),
+        ] {
+            let server = Server::start(vec![gone]);
+            let (root, folder, engine) = local_fixture(&server, b"new").await;
+            engine
+                .state_db
+                .set_pending_upload(
+                    folder.id,
+                    "file.txt",
+                    Some(&PendingUpload {
+                        file_id: "new-id".into(),
+                        previous_drive_id: Some("old-id".into()),
+                        is_folder: false,
+                        uploaded: Some(serde_json::from_str(UPLOADED_NEW).unwrap()),
+                    }),
+                )
+                .unwrap();
+            let status = engine.status.start(folder.id, 1);
+            retry_fixture(&folder, &engine, &status).await;
+            let requests: Vec<_> = server.requests.try_iter().collect();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET /files/new-id?"));
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_local_path(folder.id, "file.txt")
+                    .unwrap()
+                    .unwrap()
+                    .drive_file_id
+                    .as_deref(),
+                Some("old-id")
+            );
+            assert_eq!(
+                engine.state_db.pending_local_paths(folder.id).unwrap(),
+                vec!["file.txt"]
+            );
+            assert!(engine
+                .state_db
+                .pending_upload(folder.id, "file.txt")
+                .unwrap()
+                .is_none());
+            assert!(!engine.sync_status().folders[0].errors.is_empty());
+            drop(status);
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_deletion_protects_offline_and_in_flight_child_edits() {
+        for edit_in_flight in [false, true] {
+            let mut removal = Reply::json(
+                r#"{"changes":[{"fileId":"dir-id","removed":true}],"newStartPageToken":"removed"}"#,
+            );
+            removal.header_delay = Duration::from_millis(200);
+            let server = Server::start(vec![removal]);
+            let (root, folder, engine) = local_fixture(&server, b"old").await;
+            let directory = folder.local_path.join("dir");
+            tokio::fs::create_dir(&directory).await.unwrap();
+            tokio::fs::rename(
+                folder.local_path.join("file.txt"),
+                directory.join("file.txt"),
+            )
+            .await
+            .unwrap();
+            let mut child = engine
+                .state_db
+                .find_by_local_path(folder.id, "file.txt")
+                .unwrap()
+                .unwrap();
+            engine
+                .state_db
+                .remove_file_state(folder.id, "file.txt")
+                .unwrap();
+            engine
+                .state_db
+                .complete_local_change(folder.id, "file.txt")
+                .unwrap();
+            child.local_rel_path = "dir/file.txt".into();
+            engine.state_db.upsert_file_state(&child).unwrap();
+            let mut parent = child.clone();
+            parent.local_rel_path = "dir".into();
+            parent.drive_file_id = Some("dir-id".into());
+            parent.is_folder = true;
+            parent.md5_checksum = None;
+            engine.state_db.upsert_file_state(&parent).unwrap();
+            let mut replaced_directory = parent.clone();
+            replaced_directory.local_rel_path = "dir/former-directory".into();
+            replaced_directory.drive_file_id = Some("former-dir-id".into());
+            engine
+                .state_db
+                .upsert_file_state(&replaced_directory)
+                .unwrap();
+            tokio::fs::write(
+                directory.join("former-directory"),
+                b"replaced directory locally",
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(directory.join("local-only.txt"), b"created offline")
+                .await
+                .unwrap();
+            if !edit_in_flight {
+                tokio::fs::write(directory.join("file.txt"), b"edited offline")
+                    .await
+                    .unwrap();
+            }
+            engine.state_db.set_page_token(folder.id, "start").unwrap();
+            let status = engine.status.start(folder.id, 1);
+            let (result, ()) = tokio::join!(
+                poll_remote_changes(
+                    &folder,
+                    &engine.drive,
+                    &engine.state_db,
+                    nix::unistd::Uid::current(),
+                    nix::unistd::Gid::current(),
+                    &engine.events,
+                    &status
+                ),
+                async {
+                    if edit_in_flight {
+                        tokio::time::timeout(Duration::from_secs(2), async {
+                            while server.requests.try_recv().is_err() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        tokio::fs::write(directory.join("file.txt"), b"edited offline")
+                            .await
+                            .unwrap();
+                    }
+                }
+            );
+            result.unwrap();
+            assert_eq!(
+                tokio::fs::read(directory.join("file.txt")).await.unwrap(),
+                b"edited offline"
+            );
+            assert_eq!(
+                tokio::fs::read(directory.join("local-only.txt"))
+                    .await
+                    .unwrap(),
+                b"created offline"
+            );
+            assert_eq!(
+                engine.state_db.pending_local_paths(folder.id).unwrap(),
+                vec!["dir/file.txt", "dir/former-directory", "dir/local-only.txt"]
+            );
+            assert!(engine
+                .state_db
+                .find_by_drive_id(folder.id, "dir-id")
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                engine
+                    .state_db
+                    .get_page_token(folder.id)
+                    .unwrap()
+                    .as_deref(),
+                Some("start")
+            );
+            drop(status);
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_persists_local_only_file_before_transfer_cancellation() {
+        let mut stalled = Reply::json("old");
+        stalled.header_delay = Duration::from_secs(1);
+        let server = Server::start(vec![stalled]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let watcher = LocalWatcher::watch(
+            &folder.local_path,
+            folder.id,
+            Arc::clone(&engine.state_db),
+            sender,
+        )
+        .unwrap();
+        let drive = Arc::clone(&engine.drive);
+        let transfer = tokio::spawn(async move { drive.download_file("old-id").await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.requests.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let name = r"created\offline.txt";
+        tokio::fs::write(folder.local_path.join(name), b"local only")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !engine
+                .state_db
+                .pending_local_paths(folder.id)
+                .unwrap()
+                .iter()
+                .any(|path| path == name)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !transfer.is_finished(),
+            "queue intake must not wait for the transfer"
+        );
+        transfer.abort();
+        assert!(transfer.await.unwrap_err().is_cancelled());
+        drop(watcher);
+        drop(receiver);
+        let reopened = StateDb::open(&root.join("state.sqlite")).unwrap();
+        assert_eq!(reopened.pending_local_paths(folder.id).unwrap(), vec![name]);
+        drop(reopened);
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_remote_edit_replays_when_failed_local_upload_is_reverted() {
+        const REMOTE_EDIT: &str = r#"{"changes":[{"fileId":"old-id","removed":false,"file":{"id":"old-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}}],"newStartPageToken":"updated"}"#;
+        let server = Server::start(vec![
+            Reply::error(503),
+            Reply::json(REMOTE_EDIT),
+            Reply::json(REMOTE_EDIT),
+            Reply::json("new"),
+        ]);
+        let (root, folder, engine) = local_fixture(&server, b"new").await;
+        let status = engine.status.start(folder.id, 1);
+        engine.state_db.set_page_token(folder.id, "start").unwrap();
+        retry_fixture(&folder, &engine, &status).await;
+        assert!(!engine.sync_status().folders[0].errors.is_empty());
+        poll_remote_changes(
+            &folder,
+            &engine.drive,
+            &engine.state_db,
+            nix::unistd::Uid::current(),
+            nix::unistd::Gid::current(),
+            &engine.events,
+            &status,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref(),
+            Some("start")
+        );
+        tokio::fs::write(folder.local_path.join("file.txt"), b"old")
+            .await
+            .unwrap();
+        retry_fixture(&folder, &engine, &status).await;
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .is_empty());
+        poll_remote_changes(
+            &folder,
+            &engine.drive,
+            &engine.state_db,
+            nix::unistd::Uid::current(),
+            nix::unistd::Gid::current(),
+            &engine.events,
+            &status,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("file.txt"))
+                .await
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref(),
+            Some("updated")
+        );
+        let requests: Vec<_> = server.requests.try_iter().collect();
+        assert!(requests[2].contains("pageToken=start"));
         drop(status);
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
@@ -1126,6 +1631,7 @@ mod tests {
                 r#"{"files":[{"id":"old-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"149603e6c03516362a8da23f624db945"}]}"#,
             ),
             Reply::error(404),
+            Reply::json(UPLOADED_NEW),
             Reply::json(UPLOADED_NEW),
             Reply::json("{}"),
             Reply::json(r#"{"changes":[],"newStartPageToken":"polled"}"#),
