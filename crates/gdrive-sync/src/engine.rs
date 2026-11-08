@@ -218,28 +218,28 @@ async fn run_folder(
         .unwrap_or_else(|| "root".to_string());
 
     // Retry Drive access itself rather than probing an unrelated internet host.
-    let synced = loop {
+    let mut synced = 0;
+    loop {
         status.active();
         let result = async {
-            let synced = initial_pull(
+            if state_db.get_page_token(folder.id)?.is_none() {
+                let token = drive.get_start_page_token().await?;
+                state_db.set_page_token(folder.id, &token)?;
+            }
+            initial_pull(
                 &folder,
                 &drive,
                 &state_db,
                 &root_folder_id,
                 "",
-                owner_uid,
-                owner_gid,
+                (owner_uid, owner_gid),
+                &mut synced,
             )
-            .await?;
-            if state_db.get_page_token(folder.id)?.is_none() {
-                let token = drive.get_start_page_token().await?;
-                state_db.set_page_token(folder.id, &token)?;
-            }
-            Ok::<_, SyncError>(synced)
+            .await
         }
         .await;
         match result {
-            Ok(synced) => break synced,
+            Ok(()) => break,
             Err(error) if is_connection_failure(&error) => {
                 status.finish("initial sync", Err(error.to_string()));
                 let _ = events.send(SyncEvent::Error {
@@ -250,7 +250,7 @@ async fn run_folder(
             }
             Err(error) => return Err(error),
         }
-    };
+    }
     let _ = events.send(SyncEvent::InitialSyncComplete {
         folder_id: folder.id,
         files_synced: synced,
@@ -295,9 +295,11 @@ fn is_connection_failure(error: &SyncError) -> bool {
     };
     match error {
         SyncError::Http(error) => transport_failure(error),
+        SyncError::HttpBody(_) => true,
         SyncError::OAuthTransport(crate::auth::ReqwestOAuthError::Reqwest(error)) => {
             transport_failure(error)
         }
+        SyncError::OAuthTransport(crate::auth::ReqwestOAuthError::Body(_)) => true,
         SyncError::Timeout { .. } => true,
         _ => false,
     }
@@ -312,10 +314,10 @@ async fn initial_pull(
     state_db: &StateDb,
     drive_folder_id: &str,
     local_rel_prefix: &str,
-    owner_uid: nix::unistd::Uid,
-    owner_gid: nix::unistd::Gid,
-) -> Result<usize, SyncError> {
-    let mut synced = 0usize;
+    owner: (nix::unistd::Uid, nix::unistd::Gid),
+    synced: &mut usize,
+) -> Result<(), SyncError> {
+    let (owner_uid, owner_gid) = owner;
     let children = drive.list_children(drive_folder_id).await?;
 
     for child in children {
@@ -330,8 +332,8 @@ async fn initial_pull(
             tokio::fs::create_dir_all(&local_path).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, true)?;
-            synced += Box::pin(initial_pull(
-                folder, drive, state_db, &child.id, &rel_path, owner_uid, owner_gid,
+            Box::pin(initial_pull(
+                folder, drive, state_db, &child.id, &rel_path, owner, synced,
             ))
             .await?;
         } else {
@@ -342,11 +344,11 @@ async fn initial_pull(
             tokio::fs::write(&local_path, &content).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, false)?;
-            synced += 1;
+            *synced += 1;
         }
     }
 
-    Ok(synced)
+    Ok(())
 }
 
 fn needs_download(
@@ -581,14 +583,14 @@ mod tests {
     #[tokio::test]
     async fn initial_connection_timeout_retries_and_downloads_after_recovery() {
         let mut stalled = Reply::json(r#"{"files":[]}"#);
-        stalled.header_delay = Duration::from_millis(150);
+        stalled.header_delay = Duration::from_millis(750);
         let server = Server::start(vec![
             stalled,
+            Reply::json(r#"{"startPageToken":"recovered"}"#),
             Reply::json(
                 r#"{"files":[{"id":"remote-file","name":"file.txt","mimeType":"text/plain","md5Checksum":"changed"}]}"#,
             ),
             Reply::json("updated while offline"),
-            Reply::json(r#"{"startPageToken":"recovered"}"#),
             Reply::json(r#"{"changes":[],"newStartPageToken":"polled"}"#),
         ]);
         let root = std::env::temp_dir().join(format!("gclient-recovery-{}", Uuid::new_v4()));
@@ -599,7 +601,7 @@ mod tests {
             String::new(),
         );
         engine.poll_interval_secs = 0;
-        engine.drive = Arc::new(server.client(Duration::from_millis(50), Duration::from_secs(2)));
+        engine.drive = Arc::new(server.client(Duration::from_millis(250), Duration::from_secs(2)));
         let mut events = engine.subscribe();
         engine.start_folder(folder.clone());
 
@@ -626,12 +628,6 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            tokio::fs::read(folder.local_path.join("file.txt"))
-                .await
-                .unwrap(),
-            b"updated while offline"
-        );
         tokio::time::timeout(Duration::from_secs(2), async {
             while engine
                 .state_db
@@ -645,9 +641,103 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(
+            engine.sync_status().folders[0].errors.is_empty(),
+            "{:?}",
+            engine.sync_status()
+        );
+        engine.stop_folder(folder.id);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("file.txt"))
+                .await
+                .unwrap(),
+            b"updated while offline"
+        );
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_pull_counts_downloads_and_replays_deletions_during_retry() {
+        let server = Server::start(vec![
+            Reply::json(r#"{"startPageToken":"before-pull"}"#),
+            Reply::json(
+                r#"{"files":[{"id":"a","name":"deleted.txt","mimeType":"text/plain","md5Checksum":"a"},{"id":"b","name":"retained.txt","mimeType":"text/plain","md5Checksum":"b"}]}"#,
+            ),
+            Reply::json("downloaded before interruption"),
+            Reply::truncated("interrupted download"),
+            Reply::json(
+                r#"{"files":[{"id":"b","name":"retained.txt","mimeType":"text/plain","md5Checksum":"b"}]}"#,
+            ),
+            Reply::json("downloaded after recovery"),
+            Reply::json(
+                r#"{"changes":[{"fileId":"a","removed":true}],"newStartPageToken":"polled"}"#,
+            ),
+        ]);
+        let root =
+            std::env::temp_dir().join(format!("gclient-partial-recovery-{}", Uuid::new_v4()));
+        let folder = SyncFolder::new("fixture", root.join("files"), "", "");
+        let mut engine = SyncEngine::new(
+            AppConfig::default(),
+            StateDb::open(&root.join("state.sqlite")).unwrap(),
+            String::new(),
+        );
+        engine.poll_interval_secs = 0;
+        engine.drive = Arc::new(server.client(Duration::from_secs(1), Duration::from_secs(2)));
+        let mut events = engine.subscribe();
+        engine.start_folder(folder.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(events.recv().await.unwrap(), SyncEvent::Error { .. }) {}
+        })
+        .await
+        .unwrap();
+        assert!(folder.local_path.join("deleted.txt").exists());
+        assert!(!folder.local_path.join("retained.txt").exists());
+        assert_eq!(
+            engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref(),
+            Some("before-pull")
+        );
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let SyncEvent::InitialSyncComplete { files_synced, .. } =
+                    events.recv().await.unwrap()
+                {
+                    assert_eq!(files_synced, 2);
+                    break;
+                }
+            }
+            while engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref()
+                != Some("polled")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!folder.local_path.join("deleted.txt").exists());
+        assert!(engine
+            .state_db
+            .find_by_drive_id(folder.id, "a")
+            .unwrap()
+            .is_none());
         assert!(engine.sync_status().folders[0].errors.is_empty());
         engine.stop_folder(folder.id);
         tokio::task::yield_now().await;
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("retained.txt"))
+                .await
+                .unwrap(),
+            b"downloaded after recovery"
+        );
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
@@ -655,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_folder_cancels_initial_connection_retry() {
         let mut stalled = Reply::json(r#"{"files":[]}"#);
-        stalled.header_delay = Duration::from_millis(150);
+        stalled.header_delay = Duration::from_millis(750);
         let server = Server::start(vec![stalled]);
         let root = std::env::temp_dir().join(format!("gclient-offline-stop-{}", Uuid::new_v4()));
         let folder = SyncFolder::new("fixture", root.join("files"), "", "");
@@ -664,7 +754,7 @@ mod tests {
             StateDb::open(&root.join("state.sqlite")).unwrap(),
             String::new(),
         );
-        engine.drive = Arc::new(server.client(Duration::from_millis(50), Duration::from_secs(2)));
+        engine.drive = Arc::new(server.client(Duration::from_millis(250), Duration::from_secs(2)));
         let mut events = engine.subscribe();
         engine.start_folder(folder.clone());
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -690,7 +780,10 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_initial_listing_is_fatal_not_a_connection_retry() {
-        let server = Server::start(vec![Reply::json(r#"{"unexpected":[]}"#)]);
+        let server = Server::start(vec![
+            Reply::json(r#"{"startPageToken":"before-pull"}"#),
+            Reply::json(r#"{"unexpected":[]}"#),
+        ]);
         let root = std::env::temp_dir().join(format!("gclient-invalid-list-{}", Uuid::new_v4()));
         let folder = SyncFolder::new("fixture", root.join("files"), "", "");
         let mut engine = SyncEngine::new(

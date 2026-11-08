@@ -20,8 +20,10 @@ The sync engine, used by the `gdrived` daemon.
   the outstanding-error map. Initial sync retries connection failures and
   timeouts (including OAuth refresh transport failures) after the configured
   polling interval, with a five-second minimum in production. Each attempt
-  checks Drive access by retrying the recursive pull and cursor initialization;
-  no separate internet probe is used. Already-recorded downloads are skipped.
+  persists the change cursor before the first recursive pull and retains it
+  across retries, so deletions during a partial pull or retry wait are replayed
+  by polling. No separate internet probe is used. Already-recorded downloads
+  are skipped, and the completion count includes downloads from failed attempts.
   Waiting workers remain running but are not marked active; their error clears
   after initialization succeeds. Authentication, API, malformed-response and
   local failures remain fatal during initialization and visible after the
@@ -75,6 +77,10 @@ The sync engine, used by the `gdrived` daemon.
   failures do not log credentials or response bodies.
   Transport and deadline failures retain their source errors; OAuth connection,
   response, and body timeouts retain timeout classification through D-Bus.
+  Drive JSON parsing happens only after the complete body is transferred:
+  interrupted bodies retain a retryable transport classification, while invalid
+  JSON/schema responses remain fatal. OAuth body transfers are likewise distinct
+  from malformed token responses; source errors are preserved without body text.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
   sync folder's local path.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API

@@ -157,6 +157,15 @@ pub(crate) async fn refresh_access_token(
         RequestTokenError::Request(ReqwestOAuthError::Reqwest(source)) => {
             SyncError::OAuthTransport(ReqwestOAuthError::Reqwest(source.without_url()))
         }
+        RequestTokenError::Request(ReqwestOAuthError::Body(source)) if source.is_timeout() => {
+            SyncError::Timeout {
+                operation: "reading the OAuth access token response",
+                source: Box::new(source.without_url()),
+            }
+        }
+        RequestTokenError::Request(ReqwestOAuthError::Body(source)) => {
+            SyncError::OAuthTransport(ReqwestOAuthError::Body(source.without_url()))
+        }
         RequestTokenError::Request(source) => SyncError::OAuthTransport(source),
         _ => SyncError::OAuth("invalid response from the OAuth token endpoint".into()),
     })?;
@@ -359,6 +368,8 @@ pub fn default_token_path() -> Result<PathBuf, SyncError> {
 pub enum ReqwestOAuthError {
     #[error("HTTP request failed: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error("HTTP response body transfer failed")]
+    Body(#[source] reqwest::Error),
     #[error("invalid HTTP request/response: {0}")]
     Http(#[from] oauth2::http::Error),
 }
@@ -390,7 +401,11 @@ fn reqwest_http_client(
             for (name, value) in response.headers().iter() {
                 builder = builder.header(name, value);
             }
-            let body = response.bytes().await?.to_vec();
+            let body = response
+                .bytes()
+                .await
+                .map_err(ReqwestOAuthError::Body)?
+                .to_vec();
             Ok(builder.body(body)?)
         })
     }
