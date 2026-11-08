@@ -345,7 +345,9 @@ impl DriveClient {
     /// Fetches a starting page token for the Changes API, to be persisted
     /// and used with [`Self::list_changes`] on subsequent polls.
     pub async fn get_start_page_token(&self) -> Result<String, SyncError> {
-        let request = self.http.get(format!("{API_BASE}/changes/startPageToken"));
+        let request = self
+            .http
+            .get(format!("{}/changes/startPageToken", self.api_base));
         let response = self.send(request).await?;
         let response = check_status(response).await?;
         let parsed: StartPageTokenResponse = response.json().await?;
@@ -360,7 +362,7 @@ impl DriveClient {
         let mut new_start_token = None;
 
         loop {
-            let request = self.http.get(format!("{API_BASE}/changes")).query(&[
+            let request = self.http.get(format!("{}/changes", self.api_base)).query(&[
                 ("pageToken", token.as_str()),
                 ("fields", "nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, parents, modifiedTime, trashed, md5Checksum, size))"),
             ]);
@@ -405,7 +407,7 @@ impl DriveClient {
     pub async fn download_file(&self, file_id: &str) -> Result<bytes::Bytes, SyncError> {
         let request = self
             .http
-            .get(format!("{API_BASE}/files/{file_id}"))
+            .get(format!("{}/files/{file_id}", self.api_base))
             .query(&[("alt", "media")]);
         let response = self.send(request).await?;
         let response = check_status(response).await?;
@@ -508,7 +510,7 @@ async fn check_status(response: reqwest::Response) -> Result<reqwest::Response, 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         collections::HashMap,
@@ -519,16 +521,16 @@ mod tests {
         time::Instant,
     };
 
-    struct Reply {
+    pub(crate) struct Reply {
         status: u16,
         body: &'static str,
-        header_delay: Duration,
+        pub(crate) header_delay: Duration,
         body_delay: Duration,
         completed: Option<mpsc::Sender<()>>,
     }
 
     impl Reply {
-        fn json(body: &'static str) -> Self {
+        pub(crate) fn json(body: &'static str) -> Self {
             Self {
                 status: 200,
                 body,
@@ -539,21 +541,21 @@ mod tests {
         }
     }
 
-    struct Server {
+    pub(crate) struct Server {
         base: String,
         requests: mpsc::Receiver<String>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
     impl Server {
-        fn start(replies: Vec<Reply>) -> Self {
+        pub(crate) fn start(replies: Vec<Reply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let (sender, requests) = mpsc::channel();
             let worker = thread::spawn(move || {
                 for reply in replies {
-                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let deadline = Instant::now() + Duration::from_secs(10);
                     let mut stream = loop {
                         match listener.accept() {
                             Ok((stream, _)) => break stream,
@@ -615,7 +617,11 @@ mod tests {
             }
         }
 
-        fn client(&self, request_timeout: Duration, folder_timeout: Duration) -> DriveClient {
+        pub(crate) fn client(
+            &self,
+            request_timeout: Duration,
+            folder_timeout: Duration,
+        ) -> DriveClient {
             DriveClient {
                 http: http_client(Duration::from_secs(1), request_timeout),
                 oauth_http: auth::refresh_http_client().unwrap(),

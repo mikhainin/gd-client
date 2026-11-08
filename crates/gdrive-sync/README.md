@@ -17,8 +17,17 @@ The sync engine, used by the `gdrived` daemon.
   are reconciled as obsolete, including failed uploads followed by a rename;
   pending remote deletions and unrelated errors remain outstanding. Status
   mutations touch only the affected activity flag/error entry, without cloning
-  the outstanding-error map. Fatal initial failures remain visible after the
-  task exits. Stop/abort clears activity, and run generations reject updates
+  the outstanding-error map. Initial sync retries connection failures and
+  timeouts (including OAuth refresh transport failures) after the configured
+  polling interval, with a five-second minimum in production. Each attempt
+  checks Drive access by retrying the recursive pull and cursor initialization;
+  no separate internet probe is used. Already-recorded downloads are skipped.
+  Waiting workers remain running but are not marked active; their error clears
+  after initialization succeeds. Authentication, API, malformed-response and
+  local failures remain fatal during initialization and visible after the
+  task exits. Established workers already retry remote polls after failures,
+  retaining the last successful change cursor. Stop/abort cancels pending
+  retries and clears activity, and run generations reject updates
   from superseded tasks. Status is in memory, not persisted. Finished tasks
   are excluded from `running_folders`.
   Remote-deletion failures and local metadata failures other than a vanished
