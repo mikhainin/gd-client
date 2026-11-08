@@ -22,4 +22,5 @@ uuid = { workspace = true }
 notify = { workspace = true }
 rusqlite = { workspace = true }
 bytes = { workspace = true }
+md5 = { workspace = true }
 nix = { workspace = true }
