@@ -91,6 +91,12 @@ The sync engine, used by the `gdrived` daemon.
   Link contents are read-only: local edits/copies return visible errors and
   never upload the pointer over the native document. Edit documents in the
   browser; these links do not cache document contents or provide offline editing.
+  Link filenames and tracked MIME metadata identify pointer candidates; malformed
+  moved links cannot fall back to ordinary uploads. Ordinary text containing an
+  ID marker is not a link. Moves reject tracked destinations before contacting
+  Drive, persist successful remote metadata before installation, and revalidate
+  destination bytes after staging so concurrent edits/deletions are not overwritten.
+  Browser-only document edits do not change link checksums or create conflict links.
 - `auth` — Google OAuth2 flow (via the `oauth2` crate) and cached token
   storage. Reads `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` from the
   environment at runtime (letting anyone bring their own OAuth client),

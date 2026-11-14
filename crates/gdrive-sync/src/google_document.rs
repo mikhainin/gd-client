@@ -19,6 +19,16 @@ pub(crate) fn local_name(file: &DriveFile) -> String {
     }
 }
 
+pub(crate) fn is_link_name(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            [".gdoc.desktop", ".gsheet.desktop", ".gslides.desktop"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+        })
+}
+
 pub(crate) fn content(file: &DriveFile) -> Result<Option<Vec<u8>>, SyncError> {
     let Some((_, application)) = kind(&file.mime_type) else {
         return Ok(None);

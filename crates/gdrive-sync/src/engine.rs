@@ -390,7 +390,7 @@ async fn sync_local_changes(
         let Some(remote) = drive.get_file(id).await? else {
             continue;
         };
-        if !remote.trashed && remote_content_changed(&existing, &remote) {
+        if !remote.trashed && remote_content_changed(&existing, &remote)? {
             status.active();
             let content = drive.download_file(id).await?;
             save_conflict(folder, state_db, &key, &content, "remote").await?;
@@ -410,12 +410,15 @@ async fn sync_local_changes(
     .await
 }
 
-fn remote_content_changed(existing: &FileStateEntry, remote: &DriveFile) -> bool {
+fn remote_content_changed(
+    existing: &FileStateEntry,
+    remote: &DriveFile,
+) -> Result<bool, SyncError> {
     if google_document::kind(&remote.mime_type).is_some() {
-        return existing.drive_modified_time != remote.modified_time;
+        return Ok(existing.md5_checksum != remote_checksum(remote)?);
     }
-    existing.md5_checksum != remote.md5_checksum
-        || (remote.md5_checksum.is_none() && existing.drive_modified_time != remote.modified_time)
+    Ok(existing.md5_checksum != remote.md5_checksum
+        || (remote.md5_checksum.is_none() && existing.drive_modified_time != remote.modified_time))
 }
 
 fn conflict_path(key: &str, side: &str, identity: &str) -> Result<PathBuf, SyncError> {
@@ -481,11 +484,27 @@ async fn preserve_local_path(
 }
 
 async fn atomic_download(path: &Path, content: &[u8]) -> Result<(), SyncError> {
+    atomic_download_checked(path, content, None)
+        .await
+        .map(|_| ())
+}
+
+async fn atomic_download_checked(
+    path: &Path,
+    content: &[u8],
+    expected: Option<&[u8]>,
+) -> Result<bool, SyncError> {
     use tokio::io::AsyncWriteExt;
     let parent = path
         .parent()
         .ok_or_else(|| SyncError::Api("download has no parent".into()))?;
-    tokio::fs::create_dir_all(parent).await?;
+    if expected.is_some() {
+        if !tokio::fs::try_exists(parent).await? {
+            return Ok(false);
+        }
+    } else {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let temporary = parent.join(format!(".gdrive-download-{}", Uuid::new_v4()));
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
@@ -502,8 +521,19 @@ async fn atomic_download(path: &Path, content: &[u8]) -> Result<(), SyncError> {
         file.write_all(content).await?;
         file.sync_all().await?;
         drop(file);
+        if let Some(expected) = expected {
+            let unchanged = match tokio::fs::read(path).await {
+                Ok(current) => current == expected,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if !unchanged {
+                tokio::fs::remove_file(&temporary).await?;
+                return Ok(false);
+            }
+        }
         tokio::fs::rename(&temporary, path).await?;
-        Ok::<(), SyncError>(())
+        Ok::<bool, SyncError>(true)
     }
     .await;
     if result.is_err() {
@@ -645,7 +675,7 @@ async fn initial_pull(
                     let mut destination = PathBuf::new();
                     for item in chain {
                         validate_remote_name(&item.name)?;
-                        destination.push(&item.name);
+                        destination.push(google_document::local_name(&item));
                     }
                     let destination = path_key(&destination)?;
                     if destination == rel_path {
@@ -704,7 +734,7 @@ async fn initial_pull(
         } else {
             if let Some(existing) = state_db.find_by_drive_id(folder.id, &child.id)? {
                 if local_file_changed(&local_path, &existing).await? {
-                    if remote_content_changed(&existing, &child) && existing.md5_checksum.is_some()
+                    if remote_content_changed(&existing, &child)? && existing.md5_checksum.is_some()
                     {
                         let content = download_content(drive, &child).await?;
                         save_conflict(folder, state_db, &rel_path, &content, "remote").await?;
@@ -1016,24 +1046,34 @@ async fn handle_local_change(
     };
     if let Some(content) = &content {
         let checksum = format!("{:x}", md5::compute(content));
-        if existing
-            .as_ref()
-            .and_then(|entry| entry.md5_checksum.as_deref())
-            == Some(checksum.as_str())
-        {
-            return Ok(completed_pending);
-        }
-        if existing
+        let native = existing
             .as_ref()
             .and_then(|entry| entry.remote_mime_type.as_deref())
             .and_then(google_document::kind)
-            .is_some()
+            .is_some();
+        let linked_source = match google_document::linked_id(content) {
+            Some(id) => state_db.find_by_drive_id(folder.id, id)?,
+            None => None,
+        };
+        let matches_native_source = linked_source.as_ref().is_some_and(|source| {
+            source
+                .remote_mime_type
+                .as_deref()
+                .and_then(google_document::kind)
+                .is_some()
+                && source.md5_checksum.as_deref() == Some(&checksum)
+                && source.local_rel_path != rel_path_str
+        });
+        if !native
+            && (matches_native_source
+                || (google_document::is_link_name(rel_path) && existing.is_none()))
         {
-            return Err(SyncError::Api(
-                "Google document browser links are read-only; edit the document in your browser, or restore the link contents".into(),
-            ));
-        }
-        if let Some(id) = google_document::linked_id(content) {
+            let id = google_document::linked_id(content).ok_or_else(|| {
+                SyncError::Api(
+                    "malformed Google document browser link; the source document was not changed"
+                        .into(),
+                )
+            })?;
             return move_document_link(
                 folder,
                 drive,
@@ -1044,6 +1084,18 @@ async fn handle_local_change(
                 content,
             )
             .await;
+        }
+        if existing
+            .as_ref()
+            .and_then(|entry| entry.md5_checksum.as_deref())
+            == Some(checksum.as_str())
+        {
+            return Ok(completed_pending);
+        }
+        if native {
+            return Err(SyncError::Api(
+                "Google document browser links are read-only; edit the document in your browser, or restore the link contents".into(),
+            ));
         }
     }
     let name = rel_path
@@ -1099,6 +1151,13 @@ async fn move_document_link(
     id: &str,
     content: &[u8],
 ) -> Result<bool, SyncError> {
+    let key = path_key(destination)?;
+    if state_db.find_by_local_path(folder.id, &key)?.is_some() {
+        return Err(SyncError::Api(
+            "Google document move targets another tracked item; neither remote item was changed"
+                .into(),
+        ));
+    }
     let existing = state_db.find_by_drive_id(folder.id, id)?
         .ok_or_else(|| SyncError::Api("untracked Google document browser link; bind its remote folder instead of uploading the link".into()))?;
     let mime = existing
@@ -1135,15 +1194,25 @@ async fn move_document_link(
             "Drive returned an unexpected moved document".into(),
         ));
     }
-    let key = path_key(destination)?;
-    atomic_download(
-        &folder.local_path.join(destination),
-        &google_document::content(&moved)?
-            .ok_or_else(|| SyncError::Api("moved document has no browser link".into()))?,
-    )
-    .await?;
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, &key)?;
     record_state(folder.id, state_db, &key, &moved, false)?;
+    let path = folder.local_path.join(destination);
+    let installed = atomic_download_checked(
+        &path,
+        &google_document::content(&moved)?
+            .ok_or_else(|| SyncError::Api("moved document has no browser link".into()))?,
+        Some(content),
+    )
+    .await?;
+    if !installed {
+        state_db.queue_local_change(folder.id, &key)?;
+        if tokio::fs::try_exists(&path).await? {
+            return Err(SyncError::Api("local browser link changed during the remote move; local edits were preserved, restore the link contents to resume".into()));
+        }
+    } else {
+        let (uid, gid) = resolve_owner(&folder.owner_user, &folder.owner_group);
+        apply_ownership(&path, uid, gid)?;
+    }
     Ok(true)
 }
 
@@ -1170,7 +1239,7 @@ async fn finish_upload(
         if let Some(existing) = state_db.find_by_local_path(folder.id, rel_path)? {
             if !existing.is_folder {
                 if let Some(remote) = drive.get_file(previous).await? {
-                    if !remote.trashed && remote_content_changed(&existing, &remote) {
+                    if !remote.trashed && remote_content_changed(&existing, &remote)? {
                         let content = drive.download_file(previous).await?;
                         save_conflict(folder, state_db, rel_path, &content, "remote").await?;
                         record_state(folder.id, state_db, rel_path, &remote, false)?;
@@ -1443,6 +1512,281 @@ mod tests {
 
     const UPLOADED_NEW: &str = r#"{"id":"new-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}"#;
     const REMOTE_OLD: &str = r#"{"id":"old-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"149603e6c03516362a8da23f624db945"}"#;
+
+    #[tokio::test]
+    async fn malformed_moved_native_links_cannot_be_uploaded_before_source_deletion() {
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        let remote: DriveFile = serde_json::from_str(
+            r#"{"id":"doc-id","name":"Notes","mimeType":"application/vnd.google-apps.document"}"#,
+        )
+        .unwrap();
+        let source = google_document::local_name(&remote);
+        let destination = "Renamed.gdoc.desktop";
+        record_state(folder.id, &engine.state_db, &source, &remote, false).unwrap();
+        tokio::fs::write(
+            folder.local_path.join(destination),
+            b"[Desktop Entry]\nType=Link\nURL=https://example.com/\n",
+        )
+        .await
+        .unwrap();
+        engine
+            .state_db
+            .queue_local_change(folder.id, &source)
+            .unwrap();
+        engine
+            .state_db
+            .queue_local_change(folder.id, destination)
+            .unwrap();
+        let status = engine.status.start(folder.id, 1);
+        retry_fixture(&folder, &engine, &status).await;
+        assert!(server.requests.try_iter().next().is_none());
+        assert!(engine
+            .state_db
+            .find_by_drive_id(folder.id, "doc-id")
+            .unwrap()
+            .is_some());
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .contains(&source));
+        assert!(engine.sync_status().folders[0]
+            .errors
+            .iter()
+            .any(|message| message.contains("malformed")));
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_text_containing_a_link_marker_is_uploaded_normally() {
+        let content = b"ordinary text\nX-GDrive-Id=not-a-native-link\n";
+        let uploaded: &'static str = Box::leak(format!(
+            r#"{{"id":"ordinary-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"{:x}"}}"#, md5::compute(content),
+        ).into_boxed_str());
+        let server = Server::start(vec![
+            Reply::json(r#"{"ids":["ordinary-id"]}"#),
+            Reply::json(uploaded),
+            Reply::json(uploaded),
+        ]);
+        let (root, folder, engine) = local_fixture(&server, content).await;
+        engine
+            .state_db
+            .remove_file_state(folder.id, "file.txt")
+            .unwrap();
+        let status = engine.status.start(folder.id, 1);
+        retry_fixture(&folder, &engine, &status).await;
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .is_empty());
+        assert!(engine.sync_status().folders[0].errors.is_empty());
+        assert!(server
+            .requests
+            .try_iter()
+            .any(|request| request.starts_with("POST ")
+                && request.contains("X-GDrive-Id=not-a-native-link")));
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_moves_reject_tracked_destinations_before_contacting_drive() {
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        let remote: DriveFile = serde_json::from_str(
+            r#"{"id":"doc-id","name":"Notes","mimeType":"application/vnd.google-apps.document"}"#,
+        )
+        .unwrap();
+        let source = google_document::local_name(&remote);
+        let destination = "Target.gdoc.desktop";
+        record_state(folder.id, &engine.state_db, &source, &remote, false).unwrap();
+        let target: DriveFile = serde_json::from_str(r#"{"id":"target-id","name":"Target.gdoc.desktop","mimeType":"text/plain","md5Checksum":"ordinary"}"#).unwrap();
+        record_state(folder.id, &engine.state_db, destination, &target, false).unwrap();
+        tokio::fs::write(
+            folder.local_path.join(destination),
+            google_document::content(&remote).unwrap().unwrap(),
+        )
+        .await
+        .unwrap();
+        engine
+            .state_db
+            .queue_local_change(folder.id, &source)
+            .unwrap();
+        engine
+            .state_db
+            .queue_local_change(folder.id, destination)
+            .unwrap();
+        let status = engine.status.start(folder.id, 1);
+        retry_fixture(&folder, &engine, &status).await;
+        assert!(server.requests.try_iter().next().is_none());
+        assert_eq!(
+            engine
+                .state_db
+                .find_by_local_path(folder.id, destination)
+                .unwrap()
+                .unwrap()
+                .drive_file_id
+                .as_deref(),
+            Some("target-id")
+        );
+        assert_eq!(
+            engine
+                .state_db
+                .find_by_drive_id(folder.id, "doc-id")
+                .unwrap()
+                .unwrap()
+                .local_rel_path,
+            source
+        );
+        assert!(engine.sync_status().folders[0]
+            .errors
+            .iter()
+            .any(|message| message.contains("another tracked")));
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_moves_preserve_intervening_edits_and_deletions_and_record_remote_success() {
+        for deleted in [false, true] {
+            const DOC: &str = r#"{"id":"doc-id","name":"Notes","mimeType":"application/vnd.google-apps.document","parents":["root"]}"#;
+            let mut moved = Reply::json(
+                r#"{"id":"doc-id","name":"Renamed","mimeType":"application/vnd.google-apps.document","parents":["root"]}"#,
+            );
+            moved.header_delay = Duration::from_millis(150);
+            let server = Server::start(vec![Reply::json(DOC), moved]);
+            let (root, folder, engine) = local_fixture(&server, b"old").await;
+            let remote: DriveFile = serde_json::from_str(DOC).unwrap();
+            record_state(
+                folder.id,
+                &engine.state_db,
+                &google_document::local_name(&remote),
+                &remote,
+                false,
+            )
+            .unwrap();
+            let key = "Renamed.gdoc.desktop";
+            let path = folder.local_path.join(key);
+            tokio::fs::write(&path, google_document::content(&remote).unwrap().unwrap())
+                .await
+                .unwrap();
+            engine.state_db.queue_local_change(folder.id, key).unwrap();
+            let status = engine.status.start(folder.id, 1);
+            let change = LocalChange {
+                path: path.clone(),
+                kind: crate::local_watcher::LocalChangeKind::Modified,
+            };
+            let (result, ()) = tokio::join!(
+                handle_local_change(
+                    &folder,
+                    &engine.drive,
+                    &engine.state_db,
+                    "root",
+                    &change,
+                    nix::unistd::Uid::current(),
+                    nix::unistd::Gid::current(),
+                    &status
+                ),
+                async {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !server
+                            .requests
+                            .try_iter()
+                            .any(|request| request.starts_with("PATCH "))
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    if deleted {
+                        tokio::fs::remove_file(&path).await.unwrap();
+                    } else {
+                        tokio::fs::write(&path, b"edited during move")
+                            .await
+                            .unwrap();
+                    }
+                }
+            );
+            if deleted {
+                assert!(result.unwrap());
+                assert!(!path.exists());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(tokio::fs::read(&path).await.unwrap(), b"edited during move");
+            }
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_drive_id(folder.id, "doc-id")
+                    .unwrap()
+                    .unwrap()
+                    .local_rel_path,
+                key
+            );
+            assert!(engine
+                .state_db
+                .pending_local_paths(folder.id)
+                .unwrap()
+                .contains(&key.to_string()));
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_browser_edits_do_not_create_conflict_pointers_after_local_moves_or_deletions() {
+        for moved in [false, true] {
+            let server = Server::start(vec![Reply::json(
+                r#"{"files":[{"id":"doc-id","name":"Notes","mimeType":"application/vnd.google-apps.document","modifiedTime":"updated-in-browser"}]}"#,
+            )]);
+            let (root, folder, engine) = local_fixture(&server, b"old").await;
+            engine
+                .state_db
+                .complete_local_change(folder.id, "file.txt")
+                .unwrap();
+            let remote: DriveFile = serde_json::from_str(r#"{"id":"doc-id","name":"Notes","mimeType":"application/vnd.google-apps.document","modifiedTime":"before"}"#).unwrap();
+            let key = google_document::local_name(&remote);
+            record_state(folder.id, &engine.state_db, &key, &remote, false).unwrap();
+            if moved {
+                tokio::fs::write(
+                    folder.local_path.join("Renamed.gdoc.desktop"),
+                    google_document::content(&remote).unwrap().unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            initial_pull(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root",
+                "",
+                (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                &mut 0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                engine.state_db.pending_local_paths(folder.id).unwrap(),
+                vec![key]
+            );
+            assert_eq!(server.requests.try_iter().count(), 1);
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn native_documents_are_browser_links_and_follow_remote_renames_without_media_downloads()
