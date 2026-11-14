@@ -57,7 +57,7 @@ impl LocalWatcher {
                         let Ok(relative) = path.strip_prefix(&watched_root) else {
                             continue;
                         };
-                        if relative.as_os_str().is_empty() {
+                        if relative.as_os_str().is_empty() || is_download_staging(relative) {
                             continue;
                         }
                         let result = path_key(relative)
@@ -83,6 +83,15 @@ impl LocalWatcher {
 
 pub(crate) fn path_key(path: &Path) -> Result<String, SyncError> {
     Ok(std::str::from_utf8(path.as_os_str().as_bytes())?.to_owned())
+}
+
+pub(crate) fn is_download_staging(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".gdrive-download-"))
+    })
 }
 
 fn classify(kind: &EventKind) -> Option<LocalChangeKind> {
