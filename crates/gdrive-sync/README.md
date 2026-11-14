@@ -11,6 +11,8 @@ The sync engine, used by the `gdrived` daemon.
   the sync root; directory moves relocate descendant mappings together.
   Failed polls retain their cursor for replay after reconnect or restart.
   Same-name replacements retire old local mappings before downloading new IDs.
+  Startup checks live metadata before rejecting old mappings; moved-out items
+  release their paths before same-path creations are replayed.
   Unsafe remote names and duplicate tracked local-path mappings are explicit
   errors rather than silent overwrites. Untracked occupied destinations are
   preserved as local conflict copies. Emits `SyncEvent`s

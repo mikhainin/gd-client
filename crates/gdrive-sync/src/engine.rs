@@ -596,21 +596,51 @@ async fn initial_pull(
         let local_path = folder.local_path.join(&rel_path);
         if let Some(at_path) = state_db.find_by_local_path(folder.id, &rel_path)? {
             if at_path.drive_file_id.as_deref() != Some(&child.id) {
-                let old = match &at_path.drive_file_id {
+                let live = match &at_path.drive_file_id {
                     Some(id) => drive.get_file(id).await?,
                     None => None,
                 };
-                if old.as_ref().is_some_and(|file| !file.trashed) {
-                    return Err(SyncError::Api(
-                        "multiple Drive items map to the same local path".into(),
-                    ));
+                let live_path = match live.as_ref().filter(|file| !file.trashed) {
+                    Some(file) => remote_path(folder, drive, file).await?,
+                    None => None,
+                };
+                if let Some(chain) = live_path {
+                    let mut destination = PathBuf::new();
+                    for item in chain {
+                        validate_remote_name(&item.name)?;
+                        destination.push(&item.name);
+                    }
+                    let destination = path_key(&destination)?;
+                    if destination == rel_path {
+                        return Err(SyncError::Api(
+                            "multiple Drive items map to the same local path".into(),
+                        ));
+                    }
+                    if !relocate_remote_entry(
+                        folder,
+                        state_db,
+                        live.as_ref().unwrap(),
+                        &destination,
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
+                } else {
+                    if local_file_changed(&local_path, &at_path).await?
+                        || (at_path.is_folder
+                            && queue_dirty_descendants(folder, state_db, &local_path).await?)
+                    {
+                        if tokio::fs::try_exists(&local_path).await? {
+                            preserve_local_path(folder, state_db, &rel_path).await?;
+                        }
+                    } else if at_path.is_folder {
+                        tokio::fs::remove_dir_all(&local_path).await?;
+                    } else {
+                        tokio::fs::remove_file(&local_path).await?;
+                    }
+                    state_db.remove_file_state(folder.id, &rel_path)?;
                 }
-                if local_file_changed(&local_path, &at_path).await?
-                    && tokio::fs::try_exists(&local_path).await?
-                {
-                    preserve_local_path(folder, state_db, &rel_path).await?;
-                }
-                state_db.remove_file_state(folder.id, &rel_path)?;
             }
         }
         if !relocate_remote_entry(folder, state_db, &child, &rel_path).await? {
@@ -1065,114 +1095,110 @@ async fn poll_remote_changes(
         return Ok(());
     };
 
-    let (mut changes, new_token) = drive.list_changes(&page_token).await?;
-    // Retire old IDs before applying same-name replacements in this batch.
-    changes.sort_by_key(|change| {
-        !(change.removed || change.file.as_ref().is_none_or(|file| file.trashed))
+    let (changes, new_token) = drive.list_changes(&page_token).await?;
+    let mut classified = Vec::new();
+    for change in changes {
+        let resolved = match change
+            .file
+            .as_ref()
+            .filter(|file| !change.removed && !file.trashed && !file.parents.is_empty())
+        {
+            Some(file) => Some(remote_path(folder, drive, file).await?),
+            None => None,
+        };
+        classified.push((change, resolved));
+    }
+    // Moves out of the root release paths just like deletions do.
+    classified.sort_by_key(|(change, resolved)| {
+        !(change.removed
+            || change.file.as_ref().is_none_or(|file| file.trashed)
+            || matches!(resolved, Some(None)))
     });
 
     let mut deferred = false;
-    for change in changes {
+    for (change, resolved) in classified {
         let mut existing = state_db.find_by_drive_id(folder.id, &change.file_id)?;
-        let mut outside = false;
+        let outside = matches!(&resolved, Some(None));
         if let Some(remote) = change
             .file
             .as_ref()
             .filter(|file| !file.trashed && !change.removed)
         {
-            if !remote.parents.is_empty() {
-                match remote_path(folder, drive, remote).await? {
-                    Some(chain) => {
-                        let mut rel_path = PathBuf::new();
-                        let mut blocked = false;
-                        for item in &chain {
-                            validate_remote_name(&item.name)?;
-                            rel_path.push(&item.name);
-                            let key = path_key(&rel_path)?;
-                            if state_db.has_pending_local_change(folder.id, &key)?
-                                || !relocate_remote_entry(folder, state_db, item, &key).await?
-                            {
-                                deferred = true;
-                                blocked = true;
-                                break;
-                            }
-                            if let Some(at_path) = state_db.find_by_local_path(folder.id, &key)? {
-                                if at_path.drive_file_id.as_deref() != Some(&item.id) {
-                                    return Err(SyncError::Api(
-                                        "multiple Drive items map to the same local path".into(),
-                                    ));
-                                }
-                            }
-                            if item.mime_type == FOLDER_MIME_TYPE {
-                                let path = folder.local_path.join(&rel_path);
-                                if tokio::fs::try_exists(&path).await?
-                                    && !tokio::fs::metadata(&path).await?.is_dir()
-                                {
-                                    preserve_local_path(folder, state_db, &key).await?;
-                                }
-                                tokio::fs::create_dir_all(folder.local_path.join(&rel_path))
-                                    .await?;
-                                apply_ownership(
-                                    &folder.local_path.join(&rel_path),
-                                    owner_uid,
-                                    owner_gid,
-                                )?;
-                                record_state(folder.id, state_db, &key, item, true)?;
-                            }
-                        }
-                        if blocked {
-                            continue;
-                        }
-                        if chain.is_empty() {
-                            continue;
-                        }
-                        existing = state_db.find_by_drive_id(folder.id, &change.file_id)?;
-                        if remote.mime_type == FOLDER_MIME_TYPE {
-                            status.active();
-                            let mut synced = 0;
-                            initial_pull(
-                                folder,
-                                drive,
-                                state_db,
-                                &remote.id,
-                                &path_key(&rel_path)?,
-                                (owner_uid, owner_gid),
-                                &mut synced,
-                            )
-                            .await?;
-                            continue;
-                        }
-                        if existing.is_none() {
-                            status.active();
-                            let content = drive.download_file(&remote.id).await?;
-                            let path = folder.local_path.join(&rel_path);
-                            if state_db
-                                .has_pending_local_change(folder.id, &path_key(&rel_path)?)?
-                            {
-                                deferred = true;
-                                continue;
-                            }
-                            if tokio::fs::try_exists(&path).await? {
-                                preserve_local_path(folder, state_db, &path_key(&rel_path)?)
-                                    .await?;
-                            }
-                            atomic_download(&path, &content).await?;
-                            apply_ownership(&path, owner_uid, owner_gid)?;
-                            record_state(
-                                folder.id,
-                                state_db,
-                                &path_key(&rel_path)?,
-                                remote,
-                                false,
-                            )?;
-                            let _ = events.send(SyncEvent::RemoteChangeApplied {
-                                folder_id: folder.id,
-                                path,
-                            });
-                            continue;
+            if let Some(Some(chain)) = resolved {
+                let mut rel_path = PathBuf::new();
+                let mut blocked = false;
+                for item in &chain {
+                    validate_remote_name(&item.name)?;
+                    rel_path.push(&item.name);
+                    let key = path_key(&rel_path)?;
+                    if state_db.has_pending_local_change(folder.id, &key)?
+                        || !relocate_remote_entry(folder, state_db, item, &key).await?
+                    {
+                        deferred = true;
+                        blocked = true;
+                        break;
+                    }
+                    if let Some(at_path) = state_db.find_by_local_path(folder.id, &key)? {
+                        if at_path.drive_file_id.as_deref() != Some(&item.id) {
+                            return Err(SyncError::Api(
+                                "multiple Drive items map to the same local path".into(),
+                            ));
                         }
                     }
-                    None => outside = true,
+                    if item.mime_type == FOLDER_MIME_TYPE {
+                        let path = folder.local_path.join(&rel_path);
+                        if state_db.find_by_drive_id(folder.id, &item.id)?.is_none()
+                            && tokio::fs::try_exists(&path).await?
+                            && !tokio::fs::metadata(&path).await?.is_dir()
+                        {
+                            preserve_local_path(folder, state_db, &key).await?;
+                        }
+                        tokio::fs::create_dir_all(folder.local_path.join(&rel_path)).await?;
+                        apply_ownership(&folder.local_path.join(&rel_path), owner_uid, owner_gid)?;
+                        record_state(folder.id, state_db, &key, item, true)?;
+                    }
+                }
+                if blocked {
+                    continue;
+                }
+                if chain.is_empty() {
+                    continue;
+                }
+                existing = state_db.find_by_drive_id(folder.id, &change.file_id)?;
+                if remote.mime_type == FOLDER_MIME_TYPE {
+                    status.active();
+                    let mut synced = 0;
+                    initial_pull(
+                        folder,
+                        drive,
+                        state_db,
+                        &remote.id,
+                        &path_key(&rel_path)?,
+                        (owner_uid, owner_gid),
+                        &mut synced,
+                    )
+                    .await?;
+                    continue;
+                }
+                if existing.is_none() {
+                    status.active();
+                    let content = drive.download_file(&remote.id).await?;
+                    let path = folder.local_path.join(&rel_path);
+                    if state_db.has_pending_local_change(folder.id, &path_key(&rel_path)?)? {
+                        deferred = true;
+                        continue;
+                    }
+                    if tokio::fs::try_exists(&path).await? {
+                        preserve_local_path(folder, state_db, &path_key(&rel_path)?).await?;
+                    }
+                    atomic_download(&path, &content).await?;
+                    apply_ownership(&path, owner_uid, owner_gid)?;
+                    record_state(folder.id, state_db, &path_key(&rel_path)?, remote, false)?;
+                    let _ = events.send(SyncEvent::RemoteChangeApplied {
+                        folder_id: folder.id,
+                        path,
+                    });
+                    continue;
                 }
             }
         }
@@ -1449,6 +1475,142 @@ mod tests {
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn startup_reconciles_retired_ids_but_rejects_live_duplicate_names() {
+        for duplicate in [false, true] {
+            let mut replies = vec![Reply::json(
+                r#"{"files":[{"id":"new-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}]}"#,
+            )];
+            if duplicate {
+                replies.push(Reply::json(r#"{"id":"old-id","name":"file.txt","mimeType":"text/plain","parents":["root-id"]}"#));
+            } else {
+                replies.push(Reply::error(404));
+                replies.push(Reply::json("new"));
+            }
+            let server = Server::start(replies);
+            let (root, mut folder, mut engine) = local_fixture(&server, b"old").await;
+            folder.drive_folder_id = Some("root-id".into());
+            engine
+                .state_db
+                .complete_local_change(folder.id, "file.txt")
+                .unwrap();
+            engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+            let mut synced = 0;
+            let result = initial_pull(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root-id",
+                "",
+                (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                &mut synced,
+            )
+            .await;
+            if duplicate {
+                assert!(
+                    matches!(result, Err(SyncError::Api(message)) if message.contains("multiple Drive"))
+                );
+                assert_eq!(
+                    tokio::fs::read(folder.local_path.join("file.txt"))
+                        .await
+                        .unwrap(),
+                    b"old"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(synced, 1);
+                assert_eq!(
+                    tokio::fs::read(folder.local_path.join("file.txt"))
+                        .await
+                        .unwrap(),
+                    b"new"
+                );
+            }
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn moved_out_mapping_releases_its_path_before_an_earlier_creation() {
+        let server = Server::start(vec![
+            Reply::json(
+                r#"{"changes":[{"fileId":"new-id","removed":false,"file":{"id":"new-id","name":"file.txt","mimeType":"text/plain","parents":["root-id"],"md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}},{"fileId":"old-id","removed":false,"file":{"id":"old-id","name":"file.txt","mimeType":"text/plain","parents":["outside"]}}],"newStartPageToken":"next"}"#,
+            ),
+            Reply::json(
+                r#"{"id":"outside","name":"outside","mimeType":"application/vnd.google-apps.folder"}"#,
+            ),
+            Reply::json("new"),
+        ]);
+        let (root, mut folder, engine) = local_fixture(&server, b"old").await;
+        folder.drive_folder_id = Some("root-id".into());
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        engine.state_db.set_page_token(folder.id, "start").unwrap();
+        poll_fixture(&folder, &engine).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("file.txt"))
+                .await
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref(),
+            Some("next")
+        );
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recursive_discovery_does_not_overwrite_untracked_children() {
+        let server = Server::start(vec![
+            Reply::json(
+                r#"{"changes":[{"fileId":"dir","removed":false,"file":{"id":"dir","name":"dir","mimeType":"application/vnd.google-apps.folder","parents":["root-id"]}}],"newStartPageToken":"next"}"#,
+            ),
+            Reply::json(
+                r#"{"files":[{"id":"remote-child","name":"child.txt","mimeType":"text/plain","md5Checksum":"remote"}]}"#,
+            ),
+            Reply::json("remote"),
+        ]);
+        let (root, mut folder, engine) = local_fixture(&server, b"old").await;
+        folder.drive_folder_id = Some("root-id".into());
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        engine.state_db.set_page_token(folder.id, "start").unwrap();
+        tokio::fs::create_dir(folder.local_path.join("dir"))
+            .await
+            .unwrap();
+        tokio::fs::write(folder.local_path.join("dir/child.txt"), b"local")
+            .await
+            .unwrap();
+        assert!(poll_fixture(&folder, &engine).await.is_err());
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("dir/child.txt"))
+                .await
+                .unwrap(),
+            b"local"
+        );
+        assert_eq!(
+            engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref(),
+            Some("start")
+        );
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
     async fn poll_fixture(folder: &SyncFolder, engine: &SyncEngine) -> Result<(), SyncError> {
         let status = engine.status.start(folder.id, 100);
         poll_remote_changes(
@@ -1555,10 +1717,10 @@ mod tests {
             Reply::json(
                 r#"{"changes":[{"fileId":"dir","removed":false,"file":{"id":"dir","name":"renamed","mimeType":"application/vnd.google-apps.folder","parents":["root-id"]}},{"fileId":"outside","removed":false,"file":{"id":"outside","name":"secret.txt","mimeType":"text/plain","parents":["unrelated"]}}],"newStartPageToken":"next"}"#,
             ),
-            Reply::json(r#"{"files":[]}"#),
             Reply::json(
                 r#"{"id":"unrelated","name":"unrelated","mimeType":"application/vnd.google-apps.folder"}"#,
             ),
+            Reply::json(r#"{"files":[]}"#),
         ]);
         let (root, mut folder, engine) = local_fixture(&server, b"old").await;
         folder.drive_folder_id = Some("root-id".into());
