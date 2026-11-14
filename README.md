@@ -12,7 +12,8 @@ The daemon handles syncing; the UI manages folders, sign-in, and status.
 Initial binding preserves occupied local paths as conflict copies. Local deletions move Drive items to Trash;
 local edits upload replacements before trashing the previous copies.
 Concurrent remote content is preserved in local conflict copies; new remote
-items and moves/renames are reconciled. Google document export, resumable
+items and moves/renames are reconciled. Native Google Docs/Sheets/Slides appear
+as browser-link files, not offline document copies. Google document export, resumable
 uploads, and transactional multi-client arbitration remain unsupported; see
 [sync limitations](crates/gdrive-sync/README.md#current-limitations).
 

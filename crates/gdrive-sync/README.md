@@ -74,6 +74,19 @@ The sync engine, used by the `gdrived` daemon.
   Local deletions also use Trash.
   MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
   suppress uploads of unchanged files and daemon-generated download events.
+- `google_document` — native Google Docs, Sheets and Slides are represented as
+  `.gdoc.desktop`, `.gsheet.desktop` and `.gslides.desktop` browser links.
+  These Linux desktop links contain only `Type=Link`, a display name and the
+  document's HTTPS URL/ID, never executable commands. Names are escaped and
+  IDs validated. Their generated content checksum and original MIME type are
+  persisted, so unchanged links never echo as binary uploads. Discovery,
+  remote renames and deletion use the same reconciliation as other files.
+  Moving/renaming an unchanged link updates native document metadata and keeps
+  its ID (unlike ordinary content replacements); retain its link extension.
+  Deleting a tracked link moves the native document to Drive Trash.
+  Link contents are read-only: local edits/copies return visible errors and
+  never upload the pointer over the native document. Edit documents in the
+  browser; these links do not cache document contents or provide offline editing.
 - `auth` — Google OAuth2 flow (via the `oauth2` crate) and cached token
   storage. Reads `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` from the
   environment at runtime (letting anyone bring their own OAuth client),
@@ -155,7 +168,8 @@ The sync engine, used by the `gdrived` daemon.
 Conflict handling preserves both content versions rather than choosing a winner
 by modified time. The locally edited version keeps its ordinary name when it
 replaces a tracked remote file; the remote version becomes a conflict copy.
-Google Docs/Sheets/Slides export is not implemented. Remote names that cannot
+Google Docs/Sheets/Slides use browser links, not Office/PDF exports. Other native
+Google file types and Drive shortcuts are not implemented. Remote names that cannot
 be represented safely on Linux and duplicate Drive names within one directory
 are reported as errors. Local moves/renames create new Drive IDs.
 

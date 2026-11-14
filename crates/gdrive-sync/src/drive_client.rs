@@ -63,6 +63,7 @@ pub struct DriveClient {
     api_base: String,
     upload_base: String,
     folder_list_timeout: Duration,
+    metadata_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +134,7 @@ impl DriveClient {
             api_base: API_BASE.to_owned(),
             upload_base: UPLOAD_BASE.to_owned(),
             folder_list_timeout: FOLDER_LIST_TIMEOUT,
+            metadata_timeout: METADATA_TIMEOUT,
         }
     }
 
@@ -510,6 +512,31 @@ impl DriveClient {
         response_json(check_status(response).await?).await.map(Some)
     }
 
+    /// Moves/renames a native document without replacing its cloud content.
+    pub async fn move_document(
+        &self,
+        file: &DriveFile,
+        name: &str,
+        parent: &str,
+    ) -> Result<DriveFile, SyncError> {
+        let mut request = self
+            .http
+            .patch(format!("{}/files/{}", self.api_base, file.id))
+            .timeout(self.metadata_timeout)
+            .query(&[(
+                "fields",
+                "id,name,mimeType,parents,modifiedTime,md5Checksum,size,trashed",
+            )])
+            .json(&serde_json::json!({ "name": name }));
+        if !file.parents.iter().any(|id| id == parent) {
+            request = request.query(&[("addParents", parent)]);
+            if !file.parents.is_empty() {
+                request = request.query(&[("removeParents", file.parents.join(","))]);
+            }
+        }
+        response_json(check_status(self.send(request).await?).await?).await
+    }
+
     /// Moves a file/folder to Trash; retrying an already-trashed item is safe.
     pub async fn trash_file(&self, file_id: &str) -> Result<(), SyncError> {
         let request = self
@@ -713,6 +740,7 @@ pub(crate) mod tests {
                 api_base: self.base.clone(),
                 upload_base: self.base.clone(),
                 folder_list_timeout: folder_timeout,
+                metadata_timeout: request_timeout.min(METADATA_TIMEOUT),
             }
         }
 
@@ -725,6 +753,28 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             self.worker.take().unwrap().join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn moving_native_document_has_a_bounded_deadline_and_preserves_timeout_classification() {
+        let mut reply = Reply::json("{}");
+        reply.header_delay = Duration::from_millis(150);
+        let server = Server::start(vec![reply]);
+        let client = server.client(Duration::from_millis(35), Duration::from_secs(2));
+        let file: DriveFile = serde_json::from_str(
+            r#"{"id":"doc-id","name":"Notes","mimeType":"application/vnd.google-apps.document","parents":["old-parent"]}"#,
+        ).unwrap();
+        let error = client
+            .move_document(&file, "Renamed", "new-parent")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncError::Http(error) if error.is_timeout()));
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(request.contains("addParents=new-parent"));
+        assert!(request.contains("removeParents=old-parent"));
     }
 
     fn params(request: &str) -> HashMap<String, String> {
