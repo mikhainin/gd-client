@@ -140,6 +140,21 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn relocate_file_state(
+        &self,
+        folder_id: Uuid,
+        old: &str,
+        new: &str,
+    ) -> Result<(), SyncError> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE file_state SET local_rel_path = ?3 || substr(local_rel_path, length(?2) + 1)
+             WHERE sync_folder_id = ?1 AND
+             (local_rel_path = ?2 OR substr(local_rel_path, 1, length(?2) + 1) = ?2 || '/')",
+            params![folder_id.to_string(), old, new],
+        )?;
+        Ok(())
+    }
+
     pub fn find_by_drive_id(
         &self,
         sync_folder_id: Uuid,

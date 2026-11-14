@@ -5,7 +5,13 @@ The sync engine, used by the `gdrived` daemon.
 - `engine` — `SyncEngine`: starts/stops a background task per `SyncFolder`
   (`start_folder`/`stop_folder`/`start_all`/`running_folders`), each of which
   does an initial recursive pull from Drive, then watches local changes and
-  polls Drive's Changes API for remote changes. Emits `SyncEvent`s
+  polls Drive's Changes API for remote changes, including newly created items.
+  Live parent metadata resolves subtree membership, including moves into/out of
+  the sync root; directory moves relocate descendant mappings together.
+  Failed polls retain their cursor for replay after reconnect or restart.
+  Same-name replacements retire old local mappings before downloading new IDs.
+  Unsafe remote names, duplicate local-path mappings and occupied move targets
+  are explicit errors rather than silent overwrites. Emits `SyncEvent`s
   (`FolderStarted`, `InitialSyncComplete`, `LocalChangeUploaded`,
   `RemoteChangeApplied`, `Error`) consumed by `gdrived` for logging.
   `sync_status` supplies authoritative runtime snapshots and `subscribe_status`
@@ -133,10 +139,9 @@ There is no conflict-copy or reliable modified-time conflict arbitration.
 The initial pull can overwrite existing local files and does not upload
 local-only files; local watching starts only after it completes. Existing
 tracked local edits and queued retries are preserved during reconciliation. Remote
-polling skips untracked Drive items until the worker's next initial pull,
-so disable/re-enable the folder to discover newly created remote items.
-Moves/renames are not reliably reconciled. Google Docs/Sheets/Slides export
-is not implemented.
+polling discovers new remote items and follows remote moves/renames.
+Local moves/renames are not reliably reconciled. Google Docs/Sheets/Slides
+export is not implemented.
 
 Local deletion of a tracked item moves it to Drive Trash. Local edits create
 replacement files with new IDs before trashing the previous copies: Drive
