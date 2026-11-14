@@ -4,14 +4,16 @@ The sync engine, used by the `gdrived` daemon.
 
 - `engine` — `SyncEngine`: starts/stops a background task per `SyncFolder`
   (`start_folder`/`stop_folder`/`start_all`/`running_folders`), each of which
-  does an initial recursive pull from Drive, then watches local changes and
+  watches local changes before the first network request, performs an initial
+  recursive merge from Drive, then reconciles local changes and
   polls Drive's Changes API for remote changes, including newly created items.
   Live parent metadata resolves subtree membership, including moves into/out of
   the sync root; directory moves relocate descendant mappings together.
   Failed polls retain their cursor for replay after reconnect or restart.
   Same-name replacements retire old local mappings before downloading new IDs.
-  Unsafe remote names, duplicate local-path mappings and occupied move targets
-  are explicit errors rather than silent overwrites. Emits `SyncEvent`s
+  Unsafe remote names and duplicate tracked local-path mappings are explicit
+  errors rather than silent overwrites. Untracked occupied destinations are
+  preserved as local conflict copies. Emits `SyncEvent`s
   (`FolderStarted`, `InitialSyncComplete`, `LocalChangeUploaded`,
   `RemoteChangeApplied`, `Error`) consumed by `gdrived` for logging.
   `sync_status` supplies authoritative runtime snapshots and `subscribe_status`
@@ -44,15 +46,26 @@ The sync engine, used by the `gdrived` daemon.
   requiring another filesystem event. Retries reconcile the latest disk state
   rather than replaying a stale create/delete event. Failures remain visible
   until that path succeeds; stopping a worker cancels attempts but preserves
-  its queue for the next start. Pending paths are protected from startup pulls
-  and remote polling; tracked local edits found before a remote write are
+  its queue for the next start. Startup and periodic disk scans also discover
+  local-only files, missing tracked paths, and entire locally moved directories.
+  Existing local content is preserved during the initial merge. Tracked local
+  edits found before a remote write are
   queued instead of overwritten. Missing legacy checksum baselines are treated
   conservatively as local work, not evidence that a file is unchanged.
-  Remote directory removal first checks descendant disk state and queues edited
-  or untracked children. Deferred changes retain the previous change cursor
+  Remote directory removal first checks descendant disk state and preserves
+  dirty subtrees as local conflict directories, queued recursively for upload.
+  Deferred changes retain the previous change cursor
   until the blocking local work resolves, so reverting a failed local edit does
   not lose an intervening remote update.
   Local edits create a new Drive file before moving the previous file to Trash.
+  Before retirement, live previous-file metadata is compared with the stored
+  baseline. Concurrent remote content is downloaded to a deterministic
+  `.remote-conflict-<digest>` local copy before Trash; failures leave the
+  previous copy live and retryable. Conflict copies are themselves queued for
+  upload. During initial binding, occupied local paths become
+  `.local-conflict-<uuid>` siblings before remote content is installed.
+  Local creates/updates run before deletions; a failed write postpones deletion
+  of rename sources. Local moves use create-and-trash rather than preserving IDs.
   Drive-generated IDs and staged upload metadata are persisted before retirement:
   a retry can recover a create whose response was lost, or finish a failed trash
   operation without uploading another copy. Retirement checks live replacement
@@ -124,6 +137,8 @@ The sync engine, used by the `gdrived` daemon.
   The text-backed path store accepts UTF-8 names; unsupported byte sequences
   are explicit watcher errors, never lossy aliases to another file. Watcher
   errors and persistence failures remain visible until stop/restart.
+  Downloads are staged and atomically renamed; `.gdrive-download-` filename
+  prefixes are reserved internal staging paths and excluded from watching/scans.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API
   page tokens and per-file sync state (Drive id, checksum, etc.), keyed by
   `sync_folder_id`. `Connection` is wrapped in a `Mutex` since it isn't
@@ -135,13 +150,16 @@ The sync engine, used by the `gdrived` daemon.
 
 ## Current limitations
 
-There is no conflict-copy or reliable modified-time conflict arbitration.
-The initial pull can overwrite existing local files and does not upload
-local-only files; local watching starts only after it completes. Existing
-tracked local edits and queued retries are preserved during reconciliation. Remote
-polling discovers new remote items and follows remote moves/renames.
-Local moves/renames are not reliably reconciled. Google Docs/Sheets/Slides
-export is not implemented.
+Conflict handling preserves both content versions rather than choosing a winner
+by modified time. The locally edited version keeps its ordinary name when it
+replaces a tracked remote file; the remote version becomes a conflict copy.
+Google Docs/Sheets/Slides export is not implemented. Remote names that cannot
+be represented safely on Linux and duplicate Drive names within one directory
+are reported as errors. Local moves/renames create new Drive IDs.
+
+Uploads are not resumable and remote writes are not conditional transactions:
+another writer can still race the final metadata check and Trash request.
+Use separate backups; this is not a guarantee of transactional multi-client sync.
 
 Local deletion of a tracked item moves it to Drive Trash. Local edits create
 replacement files with new IDs before trashing the previous copies: Drive

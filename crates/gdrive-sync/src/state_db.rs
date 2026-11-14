@@ -191,6 +191,20 @@ impl StateDb {
         }
     }
 
+    pub fn file_states(&self, folder_id: Uuid) -> Result<Vec<FileStateEntry>, SyncError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum
+             FROM file_state WHERE sync_folder_id = ?1 ORDER BY local_rel_path",
+        )?;
+        let mut rows = stmt.query([folder_id.to_string()])?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next()? {
+            entries.push(row_to_entry(row)?);
+        }
+        Ok(entries)
+    }
+
     pub fn queue_local_change(&self, folder_id: Uuid, rel_path: &str) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO pending_local_changes (sync_folder_id, local_rel_path) VALUES (?1, ?2)
