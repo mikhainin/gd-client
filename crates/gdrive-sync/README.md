@@ -73,7 +73,7 @@ The sync engine, used by the `gdrived` daemon.
   operation without uploading another copy. Retirement verifies live replacement
   metadata; initial reconciliation recognizes staged IDs before collision checks.
   Conflict filenames are bounded to 255 bytes without splitting UTF-8 characters.
-  metadata is never trusted solely from the stored response. If that copy is gone or
+  Replacement metadata is never trusted solely from the stored response. If that copy is gone or
   trashed, the previous copy is preserved and a fresh upload is queued.
   Local deletions also use Trash.
   MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
