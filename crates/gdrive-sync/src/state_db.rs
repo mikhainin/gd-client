@@ -79,6 +79,17 @@ impl StateDb {
                 [],
             )?;
         }
+        let has_mime: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('file_state') WHERE name = 'remote_mime_type')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_mime {
+            transaction.execute(
+                "ALTER TABLE file_state ADD COLUMN remote_mime_type TEXT",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -106,14 +117,15 @@ impl StateDb {
     pub fn upsert_file_state(&self, entry: &FileStateEntry) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO file_state
-                (sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum, remote_mime_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(sync_folder_id, local_rel_path) DO UPDATE SET
                 drive_file_id = excluded.drive_file_id,
                 is_folder = excluded.is_folder,
                 local_mtime_secs = excluded.local_mtime_secs,
                 drive_modified_time = excluded.drive_modified_time,
-                md5_checksum = excluded.md5_checksum",
+                md5_checksum = excluded.md5_checksum,
+                remote_mime_type = excluded.remote_mime_type",
             params![
                 entry.sync_folder_id.to_string(),
                 entry.local_rel_path,
@@ -122,6 +134,7 @@ impl StateDb {
                 entry.local_mtime_secs,
                 entry.drive_modified_time,
                 entry.md5_checksum,
+                entry.remote_mime_type,
             ],
         )?;
         Ok(())
@@ -162,7 +175,7 @@ impl StateDb {
     ) -> Result<Option<FileStateEntry>, SyncError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum
+            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum, remote_mime_type
              FROM file_state WHERE sync_folder_id = ?1 AND drive_file_id = ?2",
         )?;
         let mut rows = stmt.query(params![sync_folder_id.to_string(), drive_file_id])?;
@@ -180,7 +193,7 @@ impl StateDb {
     ) -> Result<Option<FileStateEntry>, SyncError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum
+            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum, remote_mime_type
              FROM file_state WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
         )?;
         let mut rows = stmt.query(params![sync_folder_id.to_string(), local_rel_path])?;
@@ -194,7 +207,7 @@ impl StateDb {
     pub fn file_states(&self, folder_id: Uuid) -> Result<Vec<FileStateEntry>, SyncError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum
+            "SELECT sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum, remote_mime_type
              FROM file_state WHERE sync_folder_id = ?1 ORDER BY local_rel_path",
         )?;
         let mut rows = stmt.query([folder_id.to_string()])?;
@@ -335,6 +348,7 @@ pub struct FileStateEntry {
     pub local_mtime_secs: Option<i64>,
     pub drive_modified_time: Option<String>,
     pub md5_checksum: Option<String>,
+    pub remote_mime_type: Option<String>,
 }
 
 fn row_to_entry(row: &rusqlite::Row) -> Result<FileStateEntry, SyncError> {
@@ -348,6 +362,7 @@ fn row_to_entry(row: &rusqlite::Row) -> Result<FileStateEntry, SyncError> {
         local_mtime_secs: row.get(4)?,
         drive_modified_time: row.get(5)?,
         md5_checksum: row.get(6)?,
+        remote_mime_type: row.get(7)?,
     })
 }
 
@@ -456,6 +471,7 @@ mod tests {
             local_mtime_secs: Some(1_700_000_000),
             drive_modified_time: Some("2024-01-01T00:00:00Z".into()),
             md5_checksum: Some("deadbeef".into()),
+            remote_mime_type: None,
         };
         db.upsert_file_state(&entry).unwrap();
         let found = db.find_by_drive_id(folder_id, "abc123").unwrap().unwrap();
