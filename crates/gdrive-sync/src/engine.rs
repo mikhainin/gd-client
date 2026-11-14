@@ -271,14 +271,10 @@ async fn run_folder(
     loop {
         tokio::select! {
             Some(change) = local_rx.recv() => {
-                let result = match change {
-                    Ok(_) => sync_local_changes(&folder, &drive, &state_db, &root_folder_id, (owner_uid, owner_gid), &events, status).await,
-                    Err(error) => {
-                        status.finish("local watcher", Err(error.to_string()));
-                        let _ = events.send(SyncEvent::Error { folder_id: Some(folder.id), message: error.to_string() });
-                        continue;
-                    },
-                };
+                if !coalesce_local_notifications(change, &mut local_rx, folder.id, &events, status) {
+                    continue;
+                }
+                let result = sync_local_changes(&folder, &drive, &state_db, &root_folder_id, (owner_uid, owner_gid), &events, status).await;
                 if let Err(err) = result {
                     status.finish("local retry queue", Err(err.to_string()));
                     let _ = events.send(SyncEvent::Error { folder_id: Some(folder.id), message: err.to_string() });
@@ -297,6 +293,36 @@ async fn run_folder(
             }
         }
     }
+}
+
+fn coalesce_local_notifications(
+    first: Result<LocalChange, SyncError>,
+    receiver: &mut mpsc::UnboundedReceiver<Result<LocalChange, SyncError>>,
+    folder_id: Uuid,
+    events: &broadcast::Sender<SyncEvent>,
+    status: &FolderRun,
+) -> bool {
+    let mut next = Some(first);
+    let mut changed = false;
+    let mut remaining = receiver.len();
+    while let Some(notification) = next {
+        match notification {
+            Ok(_) => changed = true,
+            Err(error) => {
+                status.finish("local watcher", Err(error.to_string()));
+                let _ = events.send(SyncEvent::Error {
+                    folder_id: Some(folder_id),
+                    message: error.to_string(),
+                });
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
+        next = receiver.try_recv().ok();
+    }
+    changed
 }
 
 async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
@@ -383,6 +409,20 @@ fn remote_content_changed(existing: &FileStateEntry, remote: &DriveFile) -> bool
         || (remote.md5_checksum.is_none() && existing.drive_modified_time != remote.modified_time)
 }
 
+fn conflict_path(key: &str, side: &str, identity: &str) -> Result<PathBuf, SyncError> {
+    let path = Path::new(key);
+    let name = path
+        .file_name()
+        .ok_or_else(|| SyncError::Api("conflict has no filename".into()))?;
+    let name = path_key(Path::new(name))?;
+    let suffix = format!(".{side}-conflict-{identity}");
+    let mut length = name.len().min(255 - suffix.len());
+    while !name.is_char_boundary(length) {
+        length -= 1;
+    }
+    Ok(path.with_file_name(format!("{}{suffix}", &name[..length])))
+}
+
 async fn save_conflict(
     folder: &SyncFolder,
     state_db: &StateDb,
@@ -390,29 +430,15 @@ async fn save_conflict(
     content: &[u8],
     side: &str,
 ) -> Result<String, SyncError> {
-    let path = Path::new(key);
-    let name = path
-        .file_name()
-        .ok_or_else(|| SyncError::Api("conflict has no filename".into()))?;
     let digest = format!("{:x}", md5::compute(content));
-    let mut conflict = path.with_file_name(format!(
-        "{}.{}-conflict-{}",
-        path_key(Path::new(name))?,
-        side,
-        digest
-    ));
+    let mut conflict = conflict_path(key, side, &digest)?;
     if tokio::fs::try_exists(folder.local_path.join(&conflict)).await? {
         if tokio::fs::read(folder.local_path.join(&conflict)).await? == content {
             let key = path_key(&conflict)?;
             state_db.queue_local_change(folder.id, &key)?;
             return Ok(key);
         }
-        conflict = path.with_file_name(format!(
-            "{}.{}-conflict-{}",
-            path_key(Path::new(name))?,
-            side,
-            Uuid::new_v4()
-        ));
+        conflict = conflict_path(key, side, &Uuid::new_v4().to_string())?;
     }
     let key = path_key(&conflict)?;
     atomic_download(&folder.local_path.join(&conflict), content).await?;
@@ -428,14 +454,7 @@ async fn preserve_local_path(
     key: &str,
 ) -> Result<String, SyncError> {
     let path = Path::new(key);
-    let name = path
-        .file_name()
-        .ok_or_else(|| SyncError::Api("conflict has no filename".into()))?;
-    let conflict = path.with_file_name(format!(
-        "{}.local-conflict-{}",
-        path_key(Path::new(name))?,
-        Uuid::new_v4()
-    ));
+    let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
     tokio::fs::rename(
         folder.local_path.join(path),
@@ -463,8 +482,14 @@ async fn atomic_download(path: &Path, content: &[u8]) -> Result<(), SyncError> {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&temporary)
             .await?;
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) => file.set_permissions(metadata.permissions()).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         file.write_all(content).await?;
         file.sync_all().await?;
         drop(file);
@@ -594,6 +619,9 @@ async fn initial_pull(
             format!("{local_rel_prefix}/{}", child.name)
         };
         let local_path = folder.local_path.join(&rel_path);
+        if state_db.pending_upload(folder.id, &rel_path)?.is_some() {
+            continue;
+        }
         if let Some(at_path) = state_db.find_by_local_path(folder.id, &rel_path)? {
             if at_path.drive_file_id.as_deref() != Some(&child.id) {
                 let live = match &at_path.drive_file_id {
@@ -646,21 +674,16 @@ async fn initial_pull(
         if !relocate_remote_entry(folder, state_db, &child, &rel_path).await? {
             continue;
         }
-        if state_db.pending_upload(folder.id, &rel_path)?.is_some() {
-            continue;
-        }
-
         if child.mime_type == FOLDER_MIME_TYPE {
-            if tokio::fs::try_exists(&local_path).await?
-                && !tokio::fs::metadata(&local_path).await?.is_dir()
-            {
-                preserve_local_path(folder, state_db, &rel_path).await?;
-            }
             if let Some(existing) = state_db.find_by_drive_id(folder.id, &child.id)? {
                 if local_file_changed(&local_path, &existing).await? {
                     state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
                     continue;
                 }
+            } else if tokio::fs::try_exists(&local_path).await?
+                && !tokio::fs::metadata(&local_path).await?.is_dir()
+            {
+                preserve_local_path(folder, state_db, &rel_path).await?;
             }
             tokio::fs::create_dir_all(&local_path).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
@@ -727,7 +750,6 @@ async fn relocate_remote_entry(
     }
     let old = folder.local_path.join(&existing.local_rel_path);
     if state_db.has_pending_local_change(folder.id, &existing.local_rel_path)?
-        || state_db.has_pending_local_change(folder.id, rel_path)?
         || local_file_changed(&old, &existing).await?
         || (existing.is_folder && queue_dirty_descendants(folder, state_db, &old).await?)
     {
@@ -741,7 +763,18 @@ async fn relocate_remote_entry(
                 "remote move targets another tracked Drive item".into(),
             ));
         }
+        for key in state_db.pending_local_paths(folder.id)? {
+            if (Path::new(&key).starts_with(rel_path) || Path::new(rel_path).starts_with(&key))
+                && state_db.pending_upload(folder.id, &key)?.is_some()
+            {
+                return Ok(false);
+            }
+        }
         preserve_local_path(folder, state_db, rel_path).await?;
+        state_db.complete_local_change(folder.id, rel_path)?;
+    }
+    if state_db.has_pending_local_change(folder.id, rel_path)? {
+        return Ok(false);
     }
     if let Some(parent) = new.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -840,10 +873,10 @@ async fn queue_dirty_descendants(
         };
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if is_download_staging(&path) {
+            let relative = path.strip_prefix(&folder.local_path)?;
+            if is_download_staging(relative) {
                 continue;
             }
-            let relative = path.strip_prefix(&folder.local_path)?;
             let key = path_key(relative)?;
             let existing = state_db.find_by_local_path(folder.id, &key)?;
             let changed = match existing {
@@ -1131,8 +1164,8 @@ async fn poll_remote_changes(
                     validate_remote_name(&item.name)?;
                     rel_path.push(&item.name);
                     let key = path_key(&rel_path)?;
-                    if state_db.has_pending_local_change(folder.id, &key)?
-                        || !relocate_remote_entry(folder, state_db, item, &key).await?
+                    if !relocate_remote_entry(folder, state_db, item, &key).await?
+                        || state_db.has_pending_local_change(folder.id, &key)?
                     {
                         deferred = true;
                         blocked = true;
@@ -1295,6 +1328,258 @@ mod tests {
 
     const UPLOADED_NEW: &str = r#"{"id":"new-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}"#;
     const REMOTE_OLD: &str = r#"{"id":"old-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"149603e6c03516362a8da23f624db945"}"#;
+
+    #[tokio::test]
+    async fn staged_downloads_preserve_restricted_and_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        let path = folder.local_path.join("file.txt");
+        for mode in [0o600, 0o750] {
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .await
+                .unwrap();
+            atomic_download(&path, b"remote").await.unwrap();
+            assert_eq!(
+                tokio::fs::metadata(&path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                mode
+            );
+        }
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_pending_retirement_before_treating_staged_ids_as_duplicates() {
+        let server = Server::start(vec![
+            Reply::json(
+                r#"{"files":[{"id":"old-id","name":"file.txt","mimeType":"text/plain"},{"id":"new-id","name":"file.txt","mimeType":"text/plain"}]}"#,
+            ),
+            Reply::json(UPLOADED_NEW),
+            Reply::json(REMOTE_OLD),
+            Reply::json("{}"),
+            Reply::json(r#"{"changes":[],"newStartPageToken":"next"}"#),
+        ]);
+        let (root, folder, mut engine) = local_fixture(&server, b"new").await;
+        engine.state_db.set_page_token(folder.id, "start").unwrap();
+        engine
+            .state_db
+            .set_pending_upload(
+                folder.id,
+                "file.txt",
+                Some(&PendingUpload {
+                    file_id: "new-id".into(),
+                    previous_drive_id: Some("old-id".into()),
+                    is_folder: false,
+                    uploaded: Some(serde_json::from_str(UPLOADED_NEW).unwrap()),
+                }),
+            )
+            .unwrap();
+        engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+        engine.start_folder(folder.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine
+                .state_db
+                .get_page_token(folder.id)
+                .unwrap()
+                .as_deref()
+                != Some("next")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        engine.stop_folder(folder.id);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            engine
+                .state_db
+                .find_by_local_path(folder.id, "file.txt")
+                .unwrap()
+                .unwrap()
+                .drive_file_id
+                .as_deref(),
+            Some("new-id")
+        );
+        assert!(server
+            .requests
+            .try_iter()
+            .all(|request| !request.starts_with("POST ")));
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tracked_directory_replaced_with_a_file_stays_queued_at_its_original_path() {
+        let server = Server::start(vec![Reply::json(
+            r#"{"files":[{"id":"old-id","name":"file.txt","mimeType":"application/vnd.google-apps.folder"}]}"#,
+        )]);
+        let (root, folder, engine) = local_fixture(&server, b"replacement").await;
+        let mut existing = engine
+            .state_db
+            .find_by_local_path(folder.id, "file.txt")
+            .unwrap()
+            .unwrap();
+        existing.is_folder = true;
+        existing.md5_checksum = None;
+        engine.state_db.upsert_file_state(&existing).unwrap();
+        initial_pull(
+            &folder,
+            &engine.drive,
+            &engine.state_db,
+            "root",
+            "",
+            (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+            &mut 0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("file.txt"))
+                .await
+                .unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            engine.state_db.pending_local_paths(folder.id).unwrap(),
+            vec!["file.txt"]
+        );
+        assert_eq!(server.requests.try_iter().count(), 1);
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_rename_preserves_a_queued_untracked_destination_before_moving() {
+        let server = Server::start(vec![Reply::json(
+            r#"{"files":[{"id":"old-id","name":"b.txt","mimeType":"text/plain","md5Checksum":"149603e6c03516362a8da23f624db945"}]}"#,
+        )]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        tokio::fs::write(folder.local_path.join("b.txt"), b"untracked local")
+            .await
+            .unwrap();
+        scan_local_changes(&folder, &engine.state_db).await.unwrap();
+        initial_pull(
+            &folder,
+            &engine.drive,
+            &engine.state_db,
+            "root",
+            "",
+            (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+            &mut 0,
+        )
+        .await
+        .unwrap();
+        assert!(!folder.local_path.join("file.txt").exists());
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join("b.txt"))
+                .await
+                .unwrap(),
+            b"old"
+        );
+        let pending = engine.state_db.pending_local_paths(folder.id).unwrap();
+        let conflict = pending
+            .iter()
+            .find(|key| key.starts_with("b.txt.local-conflict-"))
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join(conflict))
+                .await
+                .unwrap(),
+            b"untracked local"
+        );
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_utf8_conflicts_and_reserved_ancestor_names_do_not_block_local_scans() {
+        let server = Server::start(vec![]);
+        let (root, mut folder, engine) = local_fixture(&server, b"old").await;
+        let parent = root.join(".gdrive-download-parent");
+        tokio::fs::create_dir(&parent).await.unwrap();
+        let destination = parent.join("files");
+        tokio::fs::rename(&folder.local_path, &destination)
+            .await
+            .unwrap();
+        folder.local_path = destination;
+        let key = "\u{e9}".repeat(120);
+        tokio::fs::write(folder.local_path.join(&key), b"local")
+            .await
+            .unwrap();
+        scan_local_changes(&folder, &engine.state_db).await.unwrap();
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .contains(&key));
+        let first = save_conflict(&folder, &engine.state_db, &key, b"remote", "remote")
+            .await
+            .unwrap();
+        assert!(first.len() <= 255);
+        tokio::fs::write(folder.local_path.join(&first), b"user edited conflict")
+            .await
+            .unwrap();
+        let second = save_conflict(&folder, &engine.state_db, &key, b"remote", "remote")
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        assert!(second.len() <= 255);
+        let local = preserve_local_path(&folder, &engine.state_db, &key)
+            .await
+            .unwrap();
+        assert!(local.len() <= 255);
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join(local))
+                .await
+                .unwrap(),
+            b"local"
+        );
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coalescing_notifications_retains_watcher_errors() {
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        let status = engine.status.start(folder.id, 1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let change = || {
+            Ok(LocalChange {
+                path: folder.local_path.join("file.txt"),
+                kind: crate::local_watcher::LocalChangeKind::Modified,
+            })
+        };
+        tx.send(change()).unwrap();
+        tx.send(Err(SyncError::Api("watcher persistence failed".into())))
+            .unwrap();
+        tx.send(change()).unwrap();
+        assert!(coalesce_local_notifications(
+            change(),
+            &mut rx,
+            folder.id,
+            &engine.events,
+            &status
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(engine.sync_status().folders[0]
+            .errors
+            .iter()
+            .any(|message| message.contains("watcher persistence failed")));
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[tokio::test]
     async fn concurrent_remote_edit_is_saved_before_trash_and_is_not_duplicated_on_retry() {
@@ -1569,7 +1854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_discovery_does_not_overwrite_untracked_children() {
+    async fn recursive_discovery_preserves_untracked_children_as_conflict_copies() {
         let server = Server::start(vec![
             Reply::json(
                 r#"{"changes":[{"fileId":"dir","removed":false,"file":{"id":"dir","name":"dir","mimeType":"application/vnd.google-apps.folder","parents":["root-id"]}}],"newStartPageToken":"next"}"#,
@@ -1592,9 +1877,20 @@ mod tests {
         tokio::fs::write(folder.local_path.join("dir/child.txt"), b"local")
             .await
             .unwrap();
-        assert!(poll_fixture(&folder, &engine).await.is_err());
+        poll_fixture(&folder, &engine).await.unwrap();
         assert_eq!(
             tokio::fs::read(folder.local_path.join("dir/child.txt"))
+                .await
+                .unwrap(),
+            b"remote"
+        );
+        let pending = engine.state_db.pending_local_paths(folder.id).unwrap();
+        let conflict = pending
+            .iter()
+            .find(|key| key.starts_with("dir/child.txt.local-conflict-"))
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(folder.local_path.join(conflict))
                 .await
                 .unwrap(),
             b"local"
@@ -1605,7 +1901,7 @@ mod tests {
                 .get_page_token(folder.id)
                 .unwrap()
                 .as_deref(),
-            Some("start")
+            Some("next")
         );
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();

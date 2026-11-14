@@ -70,8 +70,10 @@ The sync engine, used by the `gdrived` daemon.
   of rename sources. Local moves use create-and-trash rather than preserving IDs.
   Drive-generated IDs and staged upload metadata are persisted before retirement:
   a retry can recover a create whose response was lost, or finish a failed trash
-  operation without uploading another copy. Retirement checks live replacement
-  metadata rather than trusting the stored response. If that copy is gone or
+  operation without uploading another copy. Retirement verifies live replacement
+  metadata; initial reconciliation recognizes staged IDs before collision checks.
+  Conflict filenames are bounded to 255 bytes without splitting UTF-8 characters.
+  metadata is never trusted solely from the stored response. If that copy is gone or
   trashed, the previous copy is preserved and a fresh upload is queued.
   Local deletions also use Trash.
   MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
@@ -141,6 +143,9 @@ The sync engine, used by the `gdrived` daemon.
   errors and persistence failures remain visible until stop/restart.
   Downloads are staged and atomically renamed; `.gdrive-download-` filename
   prefixes are reserved internal staging paths and excluded from watching/scans.
+  Filtering is relative to the sync root. Staging preserves destination permission
+  bits, including executable bits; new downloads are private by default. Queued
+  watcher wakeups are coalesced before scanning, without dropping watcher errors.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API
   page tokens and per-file sync state (Drive id, checksum, etc.), keyed by
   `sync_folder_id`. SQLite is bundled through rusqlite 0.42, including the
