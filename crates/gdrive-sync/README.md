@@ -120,7 +120,9 @@ The sync engine, used by the `gdrived` daemon.
   errors and persistence failures remain visible until stop/restart.
 - `state_db` — SQLite-backed (`rusqlite`) local state: per-folder Changes API
   page tokens and per-file sync state (Drive id, checksum, etc.), keyed by
-  `sync_folder_id`. `Connection` is wrapped in a `Mutex` since it isn't
+  `sync_folder_id`. SQLite is bundled through rusqlite 0.42, including the
+  WAL page-size validation fix required by RUSTSEC-2026-0459; no system SQLite
+  upgrade is needed. `Connection` is wrapped in a `Mutex` since it isn't
   `Sync` but needs to be shared across `tokio::spawn`ed per-folder tasks.
   Pending local paths and replacement upload stages survive worker/daemon
   restarts. Removing a directory's mapping also removes descendant mappings.
