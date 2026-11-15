@@ -537,6 +537,17 @@ impl DriveClient {
         response_json(check_status(self.send(request).await?).await?).await
     }
 
+    /// Changes only the name; concurrent content edits remain on the same live ID.
+    pub async fn rename_file(&self, file_id: &str, name: &str) -> Result<(), SyncError> {
+        let request = self
+            .http
+            .patch(format!("{}/files/{file_id}", self.api_base))
+            .timeout(self.metadata_timeout)
+            .json(&serde_json::json!({ "name": name }));
+        check_status(self.send(request).await?).await?;
+        Ok(())
+    }
+
     /// Moves a file/folder to Trash; retrying an already-trashed item is safe.
     pub async fn trash_file(&self, file_id: &str) -> Result<(), SyncError> {
         let request = self
@@ -611,7 +622,7 @@ pub(crate) mod tests {
 
     pub(crate) struct Reply {
         status: u16,
-        body: &'static str,
+        body: String,
         pub(crate) header_delay: Duration,
         body_delay: Duration,
         completed: Option<mpsc::Sender<()>>,
@@ -619,10 +630,10 @@ pub(crate) mod tests {
     }
 
     impl Reply {
-        pub(crate) fn json(body: &'static str) -> Self {
+        pub(crate) fn json(body: impl Into<String>) -> Self {
             Self {
                 status: 200,
-                body,
+                body: body.into(),
                 header_delay: Duration::ZERO,
                 body_delay: Duration::ZERO,
                 completed: None,
@@ -653,12 +664,21 @@ pub(crate) mod tests {
 
     impl Server {
         pub(crate) fn start(replies: Vec<Reply>) -> Self {
+            let count = replies.len();
+            let mut replies = replies.into_iter();
+            Self::start_with_handler(count, move |_| replies.next().unwrap())
+        }
+
+        pub(crate) fn start_with_handler(
+            request_count: usize,
+            mut reply_for: impl FnMut(&str) -> Reply + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let (sender, requests) = mpsc::channel();
             let worker = thread::spawn(move || {
-                for reply in replies {
+                for _ in 0..request_count {
                     let deadline = Instant::now() + Duration::from_secs(10);
                     let mut stream = loop {
                         match listener.accept() {
@@ -697,7 +717,9 @@ pub(crate) mod tests {
                         return;
                     }
                     request.extend(body);
-                    sender.send(String::from_utf8(request).unwrap()).unwrap();
+                    let request = String::from_utf8(request).unwrap();
+                    let reply = reply_for(&request);
+                    sender.send(request).unwrap();
                     thread::sleep(reply.header_delay);
                     let headers = format!(
                         "HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -977,6 +999,30 @@ pub(crate) mod tests {
                 "stale-token"
             );
         }
+    }
+
+    #[test]
+    fn history_renames_are_metadata_only_and_timeout_without_trashing() {
+        let mut delayed = Reply::json("{}");
+        delayed.header_delay = Duration::from_millis(150);
+        let server = Server::start(vec![delayed]);
+        let client = server.client(Duration::from_millis(35), Duration::from_secs(2));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(client.rename_file("old-id", "file.txt.remote-history-old"))
+            .unwrap_err();
+        assert!(matches!(error, SyncError::Http(error) if error.is_timeout()));
+        let request = server
+            .requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(request.starts_with("PATCH /files/old-id "));
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "name": "file.txt.remote-history-old" })
+        );
     }
 
     #[test]
