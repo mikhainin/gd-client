@@ -68,23 +68,42 @@ The sync engine, used by the `gdrived` daemon.
   Deferred changes retain the previous change cursor
   until the blocking local work resolves, so reverting a failed local edit does
   not lose an intervening remote update.
-  Local edits create a new Drive file before moving the previous file to Trash.
+  Local edits create a new Drive file and retain the previous live file under
+  a deterministic `<name>.remote-history-<id-digest>` sibling name. The digest
+  identifies the replacement Drive ID, not the previous contents, so retries use
+  the same history name even if another client edits it. Each later replacement
+  has a new identity; a no-op history name receives a distinct suffix.
+  This metadata-only v3 rename
+  leaves concurrent content edits on that same live ID; replacement uploads
+  never send Trash requests for previous versions. A previous version already
+  renamed by another client is left at its current name.
   Before retirement, live previous-file metadata is compared with the stored
   baseline. Concurrent remote content is downloaded to a deterministic
-  `.remote-conflict-<digest>` local copy before Trash; failures leave the
+  `.remote-conflict-<digest>` local copy before retention; failures leave the
   previous copy live and retryable. Conflict copies are themselves queued for
   upload. During initial binding, occupied local paths become
   `.local-conflict-<uuid>` siblings before remote content is installed.
   Local creates/updates run before deletions; a failed write postpones deletion
   of rename sources. Local moves use create-and-trash rather than preserving IDs.
   Drive-generated IDs and staged upload metadata are persisted before retirement:
-  a retry can recover a create whose response was lost, or finish a failed trash
+  a retry can recover a create whose response was lost, or finish a failed history rename
   operation without uploading another copy. Retirement verifies live replacement
   metadata; initial reconciliation recognizes staged IDs before collision checks.
   Conflict filenames are bounded to 255 bytes without splitting UTF-8 characters.
   Replacement metadata is never trusted solely from the stored response. If that copy is gone or
   trashed, the previous copy is preserved and a fresh upload is queued.
   Local deletions also use Trash.
+  Retained versions are ordinary remote files/folders: they remain discoverable
+  under their history names and sync locally, including later edits to them.
+  They keep their original IDs and sharing. The replacement alone is bound to
+  the original local path. Replacing a directory releases its old descendant
+  mappings and staged descendant uploads atomically, while preserving queued
+  local notifications, so retries cannot resurrect or trash the retained subtree.
+  Scanning and deletion preflight defer children beneath a directory replaced
+  by a file until that parent replacement reconciles.
+  History names use the same UTF-8-safe 255-byte bound as conflict names,
+  reserving space for native documents' synthesized browser-link suffixes.
+  There is no automatic history cleanup; history uses remote and local storage.
   MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
   suppress uploads of unchanged files and daemon-generated download events.
 - `google_document` — native Google Docs, Sheets and Slides are represented as
@@ -127,7 +146,7 @@ The sync engine, used by the `gdrived` daemon.
   issues a refresh token even after an earlier authorization. Missing offline
   access is reported as an error instead of saving a non-renewable session.
 - `drive_client` — thin async wrapper around the Google Drive v3 REST API
-  (list children, download/upload/create/trash, generated IDs, metadata recovery,
+  (list children, download/upload/create/rename/trash, generated IDs, metadata recovery,
   list changes). Requests have
   a 10-second connection timeout and a 30-minute total HTTP timeout covering
   response headers and bodies, allowing large sync transfers. Folder browsing
@@ -195,12 +214,18 @@ Google file types and Drive shortcuts are not implemented. Remote names that can
 be represented safely on Linux and duplicate Drive names within one directory
 are reported as errors. Local moves/renames create new Drive IDs.
 
-Uploads are not resumable and remote writes are not conditional transactions:
-another writer can still race the final metadata check and Trash request.
-Use separate backups; this is not a guarantee of transactional multi-client sync.
+Uploads are not resumable and remote metadata writes are not conditional
+transactions. Replacement retention avoids the check-then-Trash content race
+without relying on unsupported v3 conditional-write headers or the v2 API.
+Concurrent renames can still cause naming conflicts, which are reported rather
+than resolved by choosing an arbitrary ID. Explicit local deletions still trash
+their tracked remote items and are not transactional multi-client arbitration.
+Use separate backups.
 
 Local deletion of a tracked item moves it to Drive Trash. Local edits create
-replacement files with new IDs before trashing the previous copies: Drive
-links and per-file sharing do not automatically carry over, and both copies
-can briefly remain live if retirement fails. Remote deletions still remove
+replacement files with new IDs and retain the previous versions as live history:
+Drive links and per-file sharing do not automatically carry over to replacements.
+Both items can temporarily share the original name if history renaming fails;
+the persisted upload stage resumes that rename without another upload.
+Retained versions are not garbage-collected automatically. Remote deletions still remove
 local items. Drive Trash is not an independent backup; retain separate backups.

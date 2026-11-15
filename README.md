@@ -10,7 +10,8 @@ The daemon handles syncing; the UI manages folders, sign-in, and status.
 
 **Experimental: use disposable folders and keep independent backups.**
 Initial binding preserves occupied local paths as conflict copies. Local deletions move Drive items to Trash;
-local edits upload replacements before trashing the previous copies.
+local edits upload replacements and retain previous copies under distinct
+`.remote-history-<id-digest>` sibling names instead of trashing them.
 Concurrent remote content is preserved in local conflict copies; new remote
 items and moves/renames are reconciled. Native Google Docs/Sheets/Slides appear
 as browser-link files, not offline document copies. Google document export, resumable

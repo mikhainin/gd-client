@@ -153,6 +153,24 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn release_replaced_state(&self, folder_id: Uuid, path: &str) -> Result<(), SyncError> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "UPDATE pending_local_changes SET upload_json = NULL, revision = revision + 1
+             WHERE sync_folder_id = ?1 AND upload_json IS NOT NULL
+             AND substr(local_rel_path, 1, length(?2) + 1) = ?2 || '/'",
+            params![folder_id.to_string(), path],
+        )?;
+        transaction.execute(
+            "DELETE FROM file_state WHERE sync_folder_id = ?1 AND
+             (local_rel_path = ?2 OR substr(local_rel_path, 1, length(?2) + 1) = ?2 || '/')",
+            params![folder_id.to_string(), path],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn relocate_file_state(
         &self,
         folder_id: Uuid,
