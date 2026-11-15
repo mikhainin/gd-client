@@ -24,8 +24,9 @@ Older configurations without a path remain loadable, and absent paths are
 omitted when saving. Stored paths do not track remote moves or renames.
 
 `AppConfig::load`/`save` use the standard config location; `load_from`/`save_to`
-accept explicit paths. Saving creates parent directories and overwrites the
-file as pretty TOML. Loading a missing file returns `AppConfig::default()`;
+accept explicit paths. Saving creates parent directories and non-atomically
+overwrites the file as pretty TOML; a failed write may leave it truncated or
+partially written. Loading a missing file returns `AppConfig::default()`;
 malformed or unreadable files return errors rather than being reset.
 These helpers perform deserialization, not semantic validation of paths,
 ownership, folder overlap, or polling values.

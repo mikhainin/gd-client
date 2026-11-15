@@ -55,8 +55,11 @@ or restart after manual TOML edits. SIGINT and SIGTERM terminate the process.
 The bus name and interface are `org.gclient.GDrive1`; the object path is
 `/org/gclient/GDrive1`. The shared
 [`dbus_api.rs`](../gdrive-common/src/dbus_api.rs) defines method signatures and
-row layouts. Folder mutations persist configuration before changing runtime
-state; persistence failures leave both unchanged. Removing a sync folder,
+row layouts. Folder mutations save the candidate configuration before updating
+in-memory configuration or workers; save failures preserve those in-memory
+states, but not necessarily the on-disk file. See
+[configuration persistence](../gdrive-common/README.md#configuration).
+Removing a sync folder,
 disabling it, or signing out stops workers without deleting local or remote
 files. Sign-out retains folder configuration and the sync-state database.
 
