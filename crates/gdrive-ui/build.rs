@@ -18,6 +18,8 @@ fn main() {
     )
     .files(["src/cxxqt_object.rs"])
     .file("src/app_icon.rs")
+    .file("src/application.rs")
+    .qt_module("Widgets")
     .qrc_resources([
         "icons/org.gclient.gdrive-ui.svg",
         "icons/syncing.svg",

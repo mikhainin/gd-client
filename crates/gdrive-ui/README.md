@@ -32,6 +32,9 @@ the Debian/Ubuntu package list).
 SVG icons require the Qt SVG runtime plugin (`libqt6svg6` on Debian/Ubuntu),
 including when running directly from Cargo. The Debian package declares this
 dependency explicitly.
+The application also links Qt Widgets and starts a `QApplication`, not just a
+`QGuiApplication`: `Qt.labs.platform` can fall back to widget-backed tray menus
+when the desktop does not supply a native menu implementation.
 
 ## Running
 
@@ -163,6 +166,8 @@ Tray tests cover state precedence, transitions, unavailable status, and decoding
 every selected SVG. The standalone `verify-icons` Qt probe renders all embedded
 variants at
 16/22/24/32/48/128 pixels and checks application/new-window icon propagation.
+It uses the production application factory and constructs and triggers a
+widget-backed tray menu, covering startup on desktops that need that fallback.
 Set `GDRIVE_ICON_PREVIEWS` to an existing absolute artifact directory to save
 light/dark-background PNG previews during that probe. Qt runs on its process's
 main thread, not on a Rust unit-test worker; it does not load the UI or contact
