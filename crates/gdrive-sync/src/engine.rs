@@ -329,7 +329,10 @@ fn coalesce_local_notifications(
 async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
     queue_dirty_descendants(folder, state_db, &folder.local_path).await?;
     for existing in state_db.file_states(folder.id)? {
-        if !tokio::fs::try_exists(folder.local_path.join(&existing.local_rel_path)).await? {
+        if local_metadata(&folder.local_path.join(&existing.local_rel_path))
+            .await?
+            .is_none()
+        {
             state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
         }
     }
@@ -349,7 +352,9 @@ async fn sync_local_changes(
     let mut untracked = false;
     for key in state_db.pending_local_paths(folder.id)? {
         if state_db.find_by_local_path(folder.id, &key)?.is_none()
-            && tokio::fs::try_exists(folder.local_path.join(&key)).await?
+            && local_metadata(&folder.local_path.join(&key))
+                .await?
+                .is_some()
         {
             untracked = true;
             break;
@@ -379,9 +384,24 @@ async fn sync_local_changes(
                 .as_deref()
                 .and_then(google_document::kind)
                 .is_some()
-            || tokio::fs::try_exists(folder.local_path.join(&key)).await?
+            || local_metadata(&folder.local_path.join(&key))
+                .await?
+                .is_some()
             || !local_file_changed(&folder.local_path.join(&key), &existing).await?
         {
+            continue;
+        }
+        let mut blocked_by_file = false;
+        for parent in Path::new(&key).ancestors().skip(1) {
+            if local_metadata(&folder.local_path.join(parent))
+                .await?
+                .is_some_and(|metadata| !metadata.is_dir())
+            {
+                blocked_by_file = true;
+                break;
+            }
+        }
+        if blocked_by_file {
             continue;
         }
         let Some(id) = &existing.drive_file_id else {
@@ -422,23 +442,25 @@ fn remote_content_changed(
 }
 
 fn conflict_path(key: &str, side: &str, identity: &str) -> Result<PathBuf, SyncError> {
-    suffixed_path(key, &format!(".{side}-conflict-{identity}"))
+    suffixed_path(key, &format!(".{side}-conflict-{identity}"), 255)
 }
 
-fn retained_path(key: &str, drive_id: &str) -> Result<PathBuf, SyncError> {
-    suffixed_path(
-        key,
-        &format!(".remote-history-{:x}", md5::compute(drive_id)),
-    )
+fn retained_path(key: &str, replacement_id: &str, max_bytes: usize) -> Result<PathBuf, SyncError> {
+    let suffix = format!(".remote-history-{:x}", md5::compute(replacement_id));
+    let retained = suffixed_path(key, &suffix, max_bytes)?;
+    if retained == Path::new(key) {
+        return suffixed_path(key, &format!("{suffix}.1"), max_bytes);
+    }
+    Ok(retained)
 }
 
-fn suffixed_path(key: &str, suffix: &str) -> Result<PathBuf, SyncError> {
+fn suffixed_path(key: &str, suffix: &str, max_bytes: usize) -> Result<PathBuf, SyncError> {
     let path = Path::new(key);
     let name = path
         .file_name()
         .ok_or_else(|| SyncError::Api("conflict has no filename".into()))?;
     let name = path_key(Path::new(name))?;
-    let mut length = name.len().min(255 - suffix.len());
+    let mut length = name.len().min(max_bytes - suffix.len());
     while !name.is_char_boundary(length) {
         length -= 1;
     }
@@ -1281,8 +1303,15 @@ async fn finish_upload(
                 let name = path
                     .file_name()
                     .ok_or_else(|| SyncError::Api("replacement has no filename".into()))?;
-                if remote.name == path_key(Path::new(name))? {
-                    let retained = retained_path(rel_path, previous)?;
+                let local_name = google_document::local_name(&remote);
+                if local_name == path_key(Path::new(name))? {
+                    let link_suffix_bytes = local_name.len() - remote.name.len();
+                    let remote_path = path.with_file_name(&remote.name);
+                    let retained = retained_path(
+                        &path_key(&remote_path)?,
+                        &upload.file_id,
+                        255 - link_suffix_bytes,
+                    )?;
                     let name = retained
                         .file_name()
                         .ok_or_else(|| SyncError::Api("retained version has no filename".into()))?;
@@ -1297,7 +1326,7 @@ async fn finish_upload(
             .and_then(|entry| entry.drive_file_id.as_deref())
             == Some(previous.as_str())
         {
-            state_db.remove_file_state(folder.id, rel_path)?;
+            state_db.release_replaced_state(folder.id, rel_path)?;
         }
     }
     record_state(folder.id, state_db, rel_path, &uploaded, upload.is_folder)?;
@@ -2268,6 +2297,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn editing_maximum_length_history_names_retains_to_a_distinct_name() {
+        for event_id in ["old-id", "new-id"] {
+            let key = path_key(&retained_path(&"x".repeat(207), event_id, 255).unwrap()).unwrap();
+            assert_eq!(key.len(), 255);
+            let mut previous: DriveFile = serde_json::from_str(REMOTE_OLD).unwrap();
+            previous.name = key.clone();
+            let mut uploaded: DriveFile = serde_json::from_str(UPLOADED_NEW).unwrap();
+            uploaded.name = key.clone();
+            let server = Server::start(vec![
+                Reply::json(serde_json::to_string(&uploaded).unwrap()),
+                Reply::json(serde_json::to_string(&previous).unwrap()),
+                Reply::json("{}"),
+            ]);
+            let (root, folder, engine) = local_fixture(&server, b"new").await;
+            tokio::fs::rename(
+                folder.local_path.join("file.txt"),
+                folder.local_path.join(&key),
+            )
+            .await
+            .unwrap();
+            engine
+                .state_db
+                .relocate_file_state(folder.id, "file.txt", &key)
+                .unwrap();
+            let upload = PendingUpload {
+                file_id: uploaded.id.clone(),
+                previous_drive_id: Some(previous.id),
+                is_folder: false,
+                uploaded: Some(uploaded),
+            };
+            finish_upload(&folder, &engine.drive, &engine.state_db, &key, &upload)
+                .await
+                .unwrap();
+            let requests: Vec<_> = server.requests.try_iter().collect();
+            assert_eq!(requests.len(), 3);
+            let patch: serde_json::Value =
+                serde_json::from_str(requests[2].split_once("\r\n\r\n").unwrap().1).unwrap();
+            let name = patch["name"].as_str().unwrap();
+            assert_ne!(name, key);
+            assert!(name.len() <= 255);
+            assert_eq!(patch.as_object().unwrap().len(), 1);
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_local_path(folder.id, &key)
+                    .unwrap()
+                    .unwrap()
+                    .drive_file_id
+                    .as_deref(),
+                Some("new-id")
+            );
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_native_links_with_directories_retains_safe_distinct_browser_link_names() {
+        for name in ["Notes".to_string(), "é".repeat(120)] {
+            let mut previous: DriveFile = serde_json::from_str(REMOTE_OLD).unwrap();
+            previous.name = name;
+            previous.mime_type = "application/vnd.google-apps.document".into();
+            previous.md5_checksum = None;
+            let key = google_document::local_name(&previous);
+            let mut uploaded: DriveFile = serde_json::from_str(UPLOADED_NEW).unwrap();
+            uploaded.name = key.clone();
+            uploaded.mime_type = FOLDER_MIME_TYPE.into();
+            uploaded.md5_checksum = None;
+            let suffix_bytes = key.len() - previous.name.len();
+            let mut history = previous.clone();
+            history.name =
+                path_key(&retained_path(&previous.name, &uploaded.id, 255 - suffix_bytes).unwrap())
+                    .unwrap();
+            let local_history = google_document::local_name(&history);
+            let server = Server::start(vec![
+                Reply::json(serde_json::to_string(&uploaded).unwrap()),
+                Reply::json(serde_json::to_string(&previous).unwrap()),
+                Reply::json("{}"),
+                Reply::json(serde_json::json!({ "files": [uploaded, history] }).to_string()),
+                Reply::json(r#"{"files":[]}"#),
+            ]);
+            let (root, folder, engine) = local_fixture(&server, b"new").await;
+            tokio::fs::remove_file(folder.local_path.join("file.txt"))
+                .await
+                .unwrap();
+            tokio::fs::create_dir(folder.local_path.join(&key))
+                .await
+                .unwrap();
+            engine
+                .state_db
+                .remove_file_state(folder.id, "file.txt")
+                .unwrap();
+            engine
+                .state_db
+                .complete_local_change(folder.id, "file.txt")
+                .unwrap();
+            record_state(folder.id, &engine.state_db, &key, &previous, false).unwrap();
+            let upload = PendingUpload {
+                file_id: uploaded.id.clone(),
+                previous_drive_id: Some(previous.id),
+                is_folder: true,
+                uploaded: Some(uploaded),
+            };
+            finish_upload(&folder, &engine.drive, &engine.state_db, &key, &upload)
+                .await
+                .unwrap();
+            initial_pull(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root",
+                "",
+                (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                &mut 0,
+            )
+            .await
+            .unwrap();
+            assert!(folder.local_path.join(&key).is_dir());
+            assert!(folder.local_path.join(&local_history).is_file());
+            assert_ne!(local_history, key);
+            assert!(local_history.len() <= 255);
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_local_path(folder.id, &key)
+                    .unwrap()
+                    .unwrap()
+                    .drive_file_id
+                    .as_deref(),
+                Some("new-id")
+            );
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_local_path(folder.id, &local_history)
+                    .unwrap()
+                    .unwrap()
+                    .drive_file_id
+                    .as_deref(),
+                Some("old-id")
+            );
+            let requests: Vec<_> = server.requests.try_iter().collect();
+            assert_eq!(requests.len(), 5);
+            assert!(requests
+                .iter()
+                .all(|request| !request.contains(r#""trashed":true"#)));
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn remote_edit_after_final_metadata_is_retained_without_trashing_either_version() {
         #[derive(Default)]
         struct Previous {
@@ -2353,7 +2534,7 @@ mod tests {
 
     #[tokio::test]
     async fn retained_versions_restart_with_distinct_paths_and_follow_later_remote_edits() {
-        let history = path_key(&retained_path("file.txt", "old-id").unwrap()).unwrap();
+        let history = path_key(&retained_path("file.txt", "new-id", 255).unwrap()).unwrap();
         let old: DriveFile = serde_json::from_str(REMOTE_OLD).unwrap();
         let active: DriveFile = serde_json::from_str(UPLOADED_NEW).unwrap();
         let mut archived = old.clone();
@@ -2465,7 +2646,7 @@ mod tests {
     #[tokio::test]
     async fn retry_after_retention_or_another_clients_rename_does_not_rename_again() {
         for name in [
-            path_key(&retained_path("file.txt", "old-id").unwrap()).unwrap(),
+            path_key(&retained_path("file.txt", "new-id", 255).unwrap()).unwrap(),
             "renamed-by-another-client.txt".into(),
         ] {
             let mut remote: DriveFile = serde_json::from_str(REMOTE_OLD).unwrap();
@@ -2536,6 +2717,21 @@ mod tests {
             .state_db
             .queue_local_change(folder.id, &child.local_rel_path)
             .unwrap();
+        let mut uploaded_child: DriveFile = serde_json::from_str(UPLOADED_NEW).unwrap();
+        uploaded_child.id = "uploaded-child".into();
+        engine
+            .state_db
+            .set_pending_upload(
+                folder.id,
+                &child.local_rel_path,
+                Some(&PendingUpload {
+                    file_id: uploaded_child.id.clone(),
+                    previous_drive_id: Some("child-id".into()),
+                    is_folder: false,
+                    uploaded: Some(uploaded_child),
+                }),
+            )
+            .unwrap();
         engine
             .state_db
             .set_pending_upload(
@@ -2550,7 +2746,17 @@ mod tests {
             )
             .unwrap();
         let status = engine.status.start(folder.id, 1);
-        retry_fixture(&folder, &engine, &status).await;
+        sync_local_changes(
+            &folder,
+            &engine.drive,
+            &engine.state_db,
+            "root",
+            (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+            &engine.events,
+            &status,
+        )
+        .await
+        .unwrap();
         assert!(engine
             .state_db
             .pending_local_paths(folder.id)

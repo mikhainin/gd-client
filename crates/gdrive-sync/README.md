@@ -61,8 +61,10 @@ The sync engine, used by the `gdrived` daemon.
   not lose an intervening remote update.
   Local edits create a new Drive file and retain the previous live file under
   a deterministic `<name>.remote-history-<id-digest>` sibling name. The digest
-  identifies the previous Drive ID, not its contents, so retries use the same
-  history name even if another client edits it. This metadata-only v3 rename
+  identifies the replacement Drive ID, not the previous contents, so retries use
+  the same history name even if another client edits it. Each later replacement
+  has a new identity; a no-op history name receives a distinct suffix.
+  This metadata-only v3 rename
   leaves concurrent content edits on that same live ID; replacement uploads
   never send Trash requests for previous versions. A previous version already
   renamed by another client is left at its current name.
@@ -86,8 +88,12 @@ The sync engine, used by the `gdrived` daemon.
   under their history names and sync locally, including later edits to them.
   They keep their original IDs and sharing. The replacement alone is bound to
   the original local path. Replacing a directory releases its old descendant
-  mappings so queued local removals cannot trash the retained subtree.
-  History names use the same UTF-8-safe 255-byte bound as conflict names.
+  mappings and staged descendant uploads atomically, while preserving queued
+  local notifications, so retries cannot resurrect or trash the retained subtree.
+  Scanning and deletion preflight defer children beneath a directory replaced
+  by a file until that parent replacement reconciles.
+  History names use the same UTF-8-safe 255-byte bound as conflict names,
+  reserving space for native documents' synthesized browser-link suffixes.
   There is no automatic history cleanup; history uses remote and local storage.
   MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
   suppress uploads of unchanged files and daemon-generated download events.
