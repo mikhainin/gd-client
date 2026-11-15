@@ -1,5 +1,14 @@
 # gdrive-sync
 
+The nondefault `test-support` feature provides a disposable full-application
+smoke endpoint override; see the [UI testing instructions](../gdrive-ui/README.md#hidden-full-application-smoke).
+Only `http://<numeric loopback IP>:<explicit port>` origins are accepted through
+`GDRIVE_TEST_DRIVE_ORIGIN`. In that mode the default HTTP timeout is five seconds
+(existing explicit per-request metadata deadlines still apply), redirects and
+proxies are disabled, and OAuth refresh is disabled. Normal builds
+do not read this variable or expose endpoint redirection. Never enable this
+feature in packaged binaries.
+
 The sync engine, used by the `gdrived` daemon.
 
 - `engine` — `SyncEngine`: starts/stops a background task per `SyncFolder`

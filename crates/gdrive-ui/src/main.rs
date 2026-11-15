@@ -7,12 +7,21 @@ mod app_icon;
 mod application;
 pub mod cxxqt_object;
 mod dbus_client;
+#[cfg(feature = "test-support")]
+mod smoke;
 
 use cxx_qt::casting::Upcast;
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQmlEngine, QQuickStyle, QString, QUrl};
 use std::pin::Pin;
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--test-smoke")
+        && (!cfg!(feature = "test-support")
+            || std::env::var("GDRIVE_UI_TEST_BUS").as_deref() != Ok("1"))
+    {
+        eprintln!("--test-smoke requires test-support and an isolated test bus");
+        std::process::exit(2);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -31,10 +40,12 @@ fn main() {
     app_icon::configure();
     let mut engine = QQmlApplicationEngine::new();
 
-    if let Some(engine) = engine.as_mut() {
-        engine.load(&QUrl::from(
+    if let Some(mut engine) = engine.as_mut() {
+        engine.as_mut().load(&QUrl::from(
             "qrc:/qt/qml/org/gclient/gdrive_ui/qml/main.qml",
         ));
+        #[cfg(feature = "test-support")]
+        smoke::observe(engine.as_mut());
     }
 
     if let Some(engine) = engine.as_mut() {

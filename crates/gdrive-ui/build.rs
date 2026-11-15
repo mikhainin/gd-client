@@ -6,7 +6,9 @@
 use cxx_qt_build::{CxxQtBuilder, QmlModule};
 
 fn main() {
-    CxxQtBuilder::new_qml_module(
+    #[cfg(feature = "test-support")]
+    println!("cargo::rerun-if-changed=src/smoke.h");
+    let builder = CxxQtBuilder::new_qml_module(
         QmlModule::new("org.gclient.gdrive_ui")
             .qml_file("qml/main.qml")
             .qml_file("qml/TrayPresentation.qml")
@@ -25,6 +27,8 @@ fn main() {
         "icons/syncing.svg",
         "icons/error.svg",
         "icons/disconnected.svg",
-    ])
-    .build();
+    ]);
+    #[cfg(feature = "test-support")]
+    let builder = builder.file("src/smoke.rs").qt_module("Quick");
+    builder.build();
 }

@@ -8,6 +8,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Only for disposable localhost integration-test binaries; never package these.
+test-support = []
+
 [dependencies]
 gdrive-common = { workspace = true }
 tokio = { workspace = true }

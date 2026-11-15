@@ -1,5 +1,11 @@
 # gdrived
 
+For a disposable hidden integration run with this real daemon, the actual UI,
+and a stateful localhost fake Drive, see
+[Hidden full-application smoke](../gdrive-ui/README.md#hidden-full-application-smoke).
+Its nondefault `test-support` feature must not be used for packaged builds;
+normal binaries reject the runner's `--test-smoke` startup flag.
+
 Background daemon binary.
 
 On startup it:

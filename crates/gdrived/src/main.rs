@@ -17,6 +17,14 @@ use gdrive_sync::SyncEngine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--test-smoke") {
+        anyhow::ensure!(
+            cfg!(feature = "test-support")
+                && std::env::var("GDRIVE_UI_TEST_BUS").as_deref() == Ok("1")
+                && std::env::var("GDRIVE_TEST_DRIVE_ORIGIN").is_ok(),
+            "--test-smoke requires test-support, an isolated bus and a loopback fake Drive"
+        );
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();

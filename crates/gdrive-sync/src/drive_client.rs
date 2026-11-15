@@ -124,7 +124,7 @@ pub struct Change {
 
 impl DriveClient {
     pub fn new(access_token: impl Into<String>) -> Self {
-        Self {
+        let client = Self {
             http: http_client(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
             oauth_http: auth::refresh_http_client().expect("failed to construct OAuth HTTP client"),
             tokens: RwLock::new(TokenState::new(access_token.into())),
@@ -135,7 +135,32 @@ impl DriveClient {
             upload_base: UPLOAD_BASE.to_owned(),
             folder_list_timeout: FOLDER_LIST_TIMEOUT,
             metadata_timeout: METADATA_TIMEOUT,
+        };
+        #[cfg(feature = "test-support")]
+        let client = client.with_smoke_origin();
+        client
+    }
+
+    #[cfg(feature = "test-support")]
+    fn with_smoke_origin(mut self) -> Self {
+        if let Ok(origin) = std::env::var("GDRIVE_TEST_DRIVE_ORIGIN") {
+            let origin = smoke_origin(&origin).expect("invalid smoke Drive origin");
+            // Do not follow redirects, use ambient proxies, or refresh against
+            // Google when the disposable integration-test endpoint is active.
+            self.http = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("smoke HTTP client");
+            self.oauth_http = self.http.clone();
+            self.oauth_config = None;
+            self.token_endpoint = format!("{origin}/token");
+            self.api_base = format!("{origin}/drive/v3");
+            self.upload_base = format!("{origin}/upload/drive/v3");
         }
+        self
     }
 
     /// Replaces a bare access token and discards refresh metadata. An empty
@@ -561,6 +586,56 @@ impl DriveClient {
         }
         check_status(response).await?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn smoke_origin(value: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let url = reqwest::Url::parse(value).context("expected an HTTP loopback origin")?;
+    let loopback = url
+        .host_str()
+        .and_then(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|ip| ip.is_loopback());
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("expected http://<loopback IP>:<port> without credentials or path");
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
+#[cfg(all(test, feature = "test-support"))]
+#[test]
+fn smoke_endpoint_rejects_non_loopback_and_non_origins() {
+    assert_eq!(
+        smoke_origin("http://127.0.0.1:12345/").unwrap(),
+        "http://127.0.0.1:12345"
+    );
+    assert!(smoke_origin("http://[::1]:12345").is_ok());
+    for invalid in [
+        "https://127.0.0.1:12345",
+        "http://localhost:12345",
+        "http://192.0.2.1:12345",
+        "http://0.0.0.0:12345",
+        "http://127.0.0.1.example.invalid:12345",
+        "http://127.0.0.1",
+        "http://user@127.0.0.1:12345",
+        "http://127.0.0.1:12345/drive",
+        "http://127.0.0.1:12345?redirect=example.com",
+        "http://127.0.0.1:12345#fragment",
+    ] {
+        assert!(smoke_origin(invalid).is_err(), "accepted {invalid}");
     }
 }
 

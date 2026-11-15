@@ -8,6 +8,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+test-support = ["gdrive-sync/test-support"]
+
 [[bin]]
 name = "gdrived"
 path = "src/main.rs"
