@@ -4,6 +4,7 @@
 //! `dbus_client`/`cxxqt_object::SyncManager`) and renders `qml/main.qml`.
 
 mod app_icon;
+mod application;
 pub mod cxxqt_object;
 mod dbus_client;
 
@@ -25,7 +26,7 @@ fn main() {
     // Must happen before any QML importing Qt Quick Controls is loaded.
     QQuickStyle::set_fallback_style(&QString::from("Fusion"));
 
-    let mut app = QGuiApplication::new();
+    let mut app = application::new();
     QGuiApplication::set_desktop_file_name(&QString::from("org.gclient.gdrive-ui"));
     app_icon::configure();
     let mut engine = QQmlApplicationEngine::new();
