@@ -100,6 +100,8 @@ coordinates, clipboard injection, or an X11-only fallback.
 Read the tree first. Names and roles are exact and case-sensitive; names may
 differ by Qt version, localization, or application branch. Repeat `--name` for
 explicit observed variants. `find` reports actions and EditableText support.
+Put helper-wide options (`--pid`, `--timeout`, and traversal/IPC limits) before
+the command; `smoke` has its own options after `smoke`.
 
 ```sh
 ./.github/skills/gdrive-ui-testing/gdrive-ui-testing --pid 12345 find --name 'Add folder'
@@ -115,10 +117,14 @@ The bounded smoke supports the common Add name variants:
 ./.github/skills/gdrive-ui-testing/gdrive-ui-testing smoke --pid 12345 --timeout 60
 ```
 
-This bundled scenario refuses existing dialogs, opens Add, waits for Cancel,
-cancels, and verifies the dialog disappeared. It never submits settings and
-does not depend on the Drive API, a live account, or app-specific test fixtures.
-It can still be blocked by a missing or broken application accessibility action.
+This bundled scenario refuses any already-showing `Cancel`, opens Add, waits
+for `Cancel`, presses it, and verifies no `Cancel` remains showing and Add is
+findable again. These are control-based checks, not dialog-role assertions;
+start with no open dialogs. Use repeated `--add-name 'Observed name'` options
+after `smoke` for custom Add variants. It never submits settings or needs the
+Drive API, a live account, or app-specific fixtures. Broken accessibility actions
+can still block it. `Cancel` is hardcoded in English; use individual commands
+with observed names for other locales.
 
 Where the actual tree exposes the following names, Drive navigation uses:
 
@@ -151,14 +157,16 @@ Quick/Fusion buttons can advertise Press without emitting `clicked`. A provider
 may need explicit `Accessible.onPressAction` handling that respects `enabled`.
 Report a missing transition as a provider blocker; do not modify the production
 app just to force a smoke test through. The bundled QML fixture demonstrates the
-handling separately. Named dialog containers help expose/disambiguate controls.
+handling separately; this branch's `AccessibleButton.qml` also supplies it for
+production buttons. Named dialog containers help expose/disambiguate controls.
 
 Qt can advertise duplicate Press names. The helper accepts equivalent duplicates,
 but distinct Press/Click candidates require explicit `invoke`; node ambiguity
 is never ignored.
 
-Text fields may have a `text` role but no EditableText interface. Where `find`
-reports `"editable": true`, unsaved field editing can use:
+Text fields may have a `text` role but no EditableText interface. In the Add
+dialog, first reveal the ID field with `Advanced: enter Drive folder ID`.
+Where `find` reports `"editable": true`, unsaved field editing can use:
 
 ```sh
 ./.github/skills/gdrive-ui-testing/gdrive-ui-testing --pid 12345 edit --name 'Drive folder id' --role text --text 'unsaved test value'
@@ -185,17 +193,22 @@ and the executable's fixed dispatch. The Qt fixture uses the Qt 6 runner
 offscreen with software rendering; it checks semantic Press, disabled buttons,
 and native text entry without relying on any application QML module or fixture.
 
-These are **skill/toolkit tests, not regression coverage for the application's
-Drive browser**. Run any application tests separately using that branch's
-documented commands. Do not claim a fixed app, successful Drive listing, or live
-AT-SPI interaction from an offscreen pass alone.
+These are **skill/toolkit tests, not application regression coverage**. The
+separate [full-application smoke](../../../crates/gdrive-ui/README.md#hidden-full-application-smoke)
+uses production UI/daemon code with a fake Drive server, not this QML fixture.
+Do not claim a fixed app, successful live Drive listing, or live AT-SPI interaction
+from an offscreen pass alone.
 
 ## Budgets, screenshots, and cleanup
 
 The helper sets bounded AT-SPI startup/call timeouts (1500ms by default).
 `--timeout` bounds the complete disposable worker, including GI discovery.
+Its default is 15 seconds; traversal defaults are 1000 nodes and depth 40.
 `wait` also has `--wait-seconds` and `--poll-seconds`; leave time for IPC inside
-the overall budget. Polls clear AT-SPI caches before reading names, states and
+the overall budget (`--wait-seconds` must be less than `--timeout`). It waits
+for one matching showing node, not an enabled control or a completed action.
+The `--include-hidden` option on `find`/`wait` permits hidden inspection only.
+Polls clear AT-SPI caches before reading names, states and
 children rather than assuming a sleeping client dispatches GLib change events.
 `--max-nodes`/`--max-depth` fail instead of returning incomplete ambiguous trees.
 Actions require SHOWING, ENABLED and SENSITIVE; hidden inspection is not action
@@ -203,7 +216,10 @@ authorization. Guards clear the selected node's cache and reread these states
 after traversal and again immediately before action/edit dispatch, including
 after interface/action discovery. Results report the refreshed states.
 The provider can still change state after a guard, so verify postconditions.
-Errors are JSON with exit 2; the hard worker deadline exits 124.
+Worker/runtime errors are JSON with exit 2; argument and dispatcher errors are
+plain text. The helper's hard worker deadline exits 124; `smoke` reports its
+deadline failures with exit 2. Validation commands require their own finite
+execution-tool budgets.
 
 If taking a screenshot immediately after launch, use the documented active-window
 capture without raising/focusing through window-manager tools:

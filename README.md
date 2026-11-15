@@ -4,16 +4,20 @@ A small Google Drive sync suite for Linux, split into a background daemon
 and a Qt6/QML front-end, built as a Rust workspace.
 
 Choose local directories to pair with Google Drive folders or "My Drive".
-The daemon handles syncing; the UI manages folders, sign-in, and status.
+The daemon syncs both ways using the Drive v3 API; the UI manages folders,
+sign-in, and status.
 
 ## Current limitations
 
-**Experimental: use disposable folders and keep independent backups.**
-Initial binding preserves occupied local paths as conflict copies. Local deletions move Drive items to Trash;
+**Experimental sync, not a backup: use disposable folders and keep independent backups.**
+Initial binding preserves conflicting local content as conflict copies.
+Local deletions move Drive items to Trash;
 local edits upload replacements and retain previous copies under distinct
 `.remote-history-<id-digest>` sibling names instead of trashing them.
-Concurrent remote content is preserved in local conflict copies; new remote
-items and moves/renames are reconciled. Native Google Docs/Sheets/Slides appear
+Retained versions sync locally and consume storage; there is no automatic cleanup.
+Detected concurrent remote edits are preserved in local conflict copies; new remote
+items and moves/renames are reconciled. Remote deletions remove unchanged local
+copies. Native Google Docs/Sheets/Slides appear
 as browser-link files, not offline document copies. Google document export, resumable
 uploads, and transactional multi-client arbitration remain unsupported; see
 [sync limitations](crates/gdrive-sync/README.md#current-limitations).
@@ -47,8 +51,9 @@ and `GDRIVE_CLIENT_SECRET` for the daemon. Packaged installs use
 Cloud requirements, runtime overrides, and build-time defaults.
 
 Launch **g-client Google Drive Sync** from the application menu or run
-`gdrive-ui`; packaged installs activate the daemon on demand. From source,
-run these in separate terminals in your desktop session:
+`gdrive-ui`; packaged installs activate the daemon on demand through its
+systemd user service. From source, run these in separate terminals in your
+desktop session (with a session D-Bus):
 
 ```sh
 cargo run -p gdrived
@@ -56,7 +61,7 @@ cargo run -p gdrive-ui
 ```
 
 Click **Sign in**, complete browser consent, then add a local path and
-select a Drive folder (or leave its id empty for "My Drive"). New folders
+browse for a Drive folder (the default is "My Drive"). New folders
 are enabled immediately. Startup alone does not initiate sign-in.
 Closing the window hides it to the tray; **Quit** exits only the UI.
 

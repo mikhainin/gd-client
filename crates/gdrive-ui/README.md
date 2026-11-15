@@ -3,24 +3,21 @@
 Qt6/QML desktop control panel for `gdrived`, built with
 [cxx-qt](https://github.com/KDAB/cxx-qt) (no CMake required).
 
-- `cxxqt_object.rs` — the `SyncManager` `QObject` exposed to QML: lists,
-  adds, removes, and enables/disables sync folders by calling `gdrived`'s
-  D-Bus interface (`gdrive_common::dbus_api::GDrive1`), exposing a JSON
-  `foldersJson` property for the QML `ListView` model, plus a `darkMode`
-  property. All daemon requests and the startup color-scheme lookup run
-  away from the GUI thread and deliver results through cxx-qt's Qt queue.
+- `cxxqt_object.rs` — QML's `SyncManager` `QObject`: folder JSON, authentication,
+  tray status, preferences, and action results. Daemon/portal requests run off
+  the GUI thread and return through cxx-qt's Qt queue.
 - `dbus_client.rs` — bounded asynchronous requests using the shared
   `GDrive1Proxy`, executed on a two-thread Tokio runtime. Request generations
   and abort handles reject obsolete completions and cancel abandoned work.
-- `qml/main.qml` — the UI itself: a folder list with add/remove/enable
-  controls, deliberately avoiding `QtQuick.Layouts` (not always packaged
-  alongside base QtQuick Controls) in favour of plain `Row`/`Column`.
-- `qml/DriveFolderDialog.qml` — asynchronous Drive folder browser, also
-  exercised directly by the Qt Quick tests.
+- `qml/main.qml` — window, tray, authentication, and folder controls; uses
+  `Row`/`Column` rather than requiring `QtQuick.Layouts`.
+- `qml/DriveFolderDialog.qml` — asynchronous Drive folder browser.
 - `qml/DriveFolderSelection.qml` and `qml/DriveFolderPath.qml` — pending
   ID/path selection and the shared readable path display.
 - `qml/TrayPresentation.qml` — tray icon and tooltip selection from explicit
   connection, authentication, and engine-status properties.
+- `application.rs`/`application.h` — the Rust/C++ `QApplication` factory;
+  `app_icon.rs`/`app_icon.h` set the embedded application icon.
 - `build.rs` — builds the QML module (`org.gclient.gdrive_ui`) via
   `cxx-qt-build`.
 
@@ -42,33 +39,60 @@ when the desktop does not supply a native menu implementation.
 cargo run -p gdrive-ui
 ```
 
-Requires `gdrived` to be running for the "Connected to gdrived" status and
-folder list to populate; the UI itself holds no sync state.
+From source, run `gdrived` separately in the same desktop session; packaged
+installs activate it over D-Bus. See the [daemon README](../gdrived/README.md)
+for OAuth setup, activation, configuration locations, and diagnostics, and the
+[workspace build instructions](../../README.md#building) for packaging commands.
+The daemon owns persisted configuration and synchronization; the UI keeps
+only presentation and pending-request state.
+
+**Sign in…** asks the daemon to start browser consent; startup never starts
+sign-in itself. The five-second control deadline covers starting that flow,
+not completing consent. Authentication means a cached token exists, not that
+Google has just validated it. Asynchronous sign-in failures are currently
+reported in daemon logs, not delivered as a UI error. **Sign out** forgets the
+token and stops workers without removing configured folders.
+
+**Add folder…** accepts a display name, Drive selection, local path, and optional
+owner user/group, and always submits the new folder as enabled. Local Browse
+prefers `kdialog`, otherwise an in-app directory browser supports navigation
+and creating a subfolder. Local paths can also be typed directly. Accepting
+Add clears the name, Drive selection, and local path immediately, even if the
+daemon later rejects the request; owner fields remain. Canceling Add preserves
+its pending fields. There is no edit operation for existing entries.
+**Remove** stops/removes the configuration without deleting its local or remote
+files and has no confirmation dialog.
+
+Folder-row labels use worker lifetime: **syncing** means a worker is running
+(possibly idle or waiting to retry), **starting…** means enabled with no
+running worker, and **paused** means disabled. Use the tray for actual activity
+and engine errors. Closing the window hides it; the tray toggles Show/Hide and
+**Quit** exits only the UI, leaving the daemon running.
 
 ## Drive folder paths
 
 The Add dialog displays `My Drive/Parent/Selected folder` after browsing, with
 `My Drive` for root. The opaque ID stays separate and is used for syncing.
 **Advanced: enter Drive folder ID** exposes manual entry; changing that ID
-invalidates the previously selected path. Canceling the browser preserves the
-pending selection, and adding a folder resets it to root.
+invalidates the previously selected path. Each Browse opens at My Drive;
+canceling it preserves the pending selection.
 
 Configured folders show the saved remote path alongside their display name
 and local destination. Long paths are elided, with full text available through
 accessibility and a window-width-bounded, wrapped hover tooltip (including
 long unbroken folder names). Legacy and manually entered non-root folders without
 a saved path show **Drive path unavailable; reselect folder**, not the ID.
-Select through Browse when adding a folder to save its path; this change does
-not introduce editing of existing entries or automatic path lookups.
+Select through Browse when adding a folder to save its path; existing entries
+have no path-reselection control or automatic path lookup.
 Paths are selection-time snapshots, so remote moves/renames do not update them.
 
-The added path argument in `AddSyncFolder` and field in `ListSyncFolders`
-change their D-Bus signatures. Upgrade the UI and daemon together and restart
-the daemon; mixed versions are unsupported and surface D-Bus errors.
+`AddSyncFolder` and `ListSyncFolders` transport both ID and path. Upgrade the UI
+and daemon together and restart the daemon: older versions without the path
+argument/field have incompatible D-Bus signatures.
 
 ## Application identity and tray status
 
-The original violet folder icon combines a path-drawn lowercase **g** with
+The violet folder icon combines a path-drawn lowercase **g** with
 sync arrows, independently of Google's branding. SVGs under `icons/` are embedded
 in the binary, so window and tray icons do not depend on an installed theme.
 The static identity is installed as
@@ -83,8 +107,8 @@ or actual upload/download/change application, not an idle watcher, empty remote
 poll, folder browser, or UI operation. Error and disconnected variants have
 distinct shapes, not just different colors. Tooltips distinguish startup,
 disconnection, sign-out, and unavailable status, and describe the state and
-outstanding errors. Existing Show/Hide, Quit, and hide-on-close actions are
-unchanged.
+outstanding errors. See the [sync engine README](../gdrive-sync/README.md) for
+activity, retry, and error-clearing semantics.
 
 The UI uses `SyncStatus` snapshots plus `SyncStatusChanged` invalidations,
 subscribing before its initial snapshot. Status runs on a separate cancellable
@@ -99,9 +123,9 @@ status message; the tray's sync errors come from the engine.
 ## Responsiveness and errors
 
 Drive browsing has a **30-second overall deadline**, including session-bus
-connection, service activation, and the method reply. The daemon bounds its
-listing to 27 seconds and its underlying paginated Drive request to 25
-seconds. A loading indicator appears immediately; Cancel remains usable.
+connection, service activation, and the method reply. The
+[daemon's shorter browse bounds](../gdrived/README.md) leave headroom for
+delivery. A loading indicator appears immediately; Cancel remains usable.
 Failures appear in the dialog with Retry, not as an empty folder listing.
 Changing folders or closing the dialog aborts the pending UI request and
 invalidates any completion already queued to Qt.
@@ -110,7 +134,7 @@ Other daemon requests and the portal preference lookup have a **5-second
 overall deadline**. Polls are coalesced while a refresh is pending, and
 mutation controls are disabled during a mutation. Starting a mutation
 invalidates an older refresh; its completion triggers a fresh snapshot.
-Action errors remain visible across successful polling refreshes until the
+Mutation errors remain visible across successful polling refreshes until the
 next action, rather than being immediately replaced by the folder count.
 Folder switches remain bound to the backend state while a change is pending
 or fails, including changes requested through accessibility. A successful folder
@@ -122,10 +146,11 @@ invalidate older snapshots. Each `SyncManager` owns one cancellable subscription
 daemon ownership changes replace it, and transport failures retry after three
 seconds. Subscription setup calls have five-second deadlines. A snapshot is
 requested after subscribing so initial state and restarts do not rely on receiving
-a signal; periodic polling remains a fallback for older daemons and sync status.
+a signal; periodic polling remains a fallback for authentication.
 Browsing and mutations still execute independently, not through a serial queue.
-The native `kdialog` local-folder picker is a separate, unchanged synchronous
-path; these guarantees apply to D-Bus requests.
+These guarantees apply to D-Bus requests, not local filesystem operations
+or the synchronous `kdialog --version` probe and local-folder picker, which
+can block the GUI thread and have no explicit timeout.
 
 ## UI testing
 
@@ -139,9 +164,9 @@ cargo build -p gdrived -p gdrive-ui --features gdrived/test-support,gdrive-ui/te
 ./scripts/smoke-full-app.py --artifacts target/full-app-smoke
 ```
 
-This launches the **real daemon and actual UI main/QML** on a disposable private
-D-Bus with no activatable services, using Qt's offscreen/software platform.
-It verifies rendered connection, authentication, and folder labels, the real
+This optional runner launches the **real daemon and actual UI main/QML** on a
+disposable private D-Bus with no activatable services, using Qt offscreen/software.
+It inspects visible QML connection, authentication, and folder text, the real
 Qt.labs.platform widget-backed menu, and explicitly constructs/triggers a
 `QMenu` in the same process to catch accidental `QGuiApplication` regressions.
 The stateful loopback Drive checks the synthetic bearer token and exercises
@@ -150,18 +175,17 @@ shown through the UI's sync-error state, remote download retry, and idle recover
 It accepts both legacy replacement Trash and retained-history rename requests;
 this is an integration smoke, not a replacement-retention policy assertion.
 
-The runner starts children with a clean environment, synthetic nonrefreshable
-tokens, and unique config/data/cache/runtime/local roots below the artifact
-directory, never the current account or sync folders. Only feature-enabled
-binaries accept `--test-smoke`; normal binaries refuse it before doing any work.
-The `test-support` Drive override accepts only an explicit numeric HTTP loopback
-origin/port, disables redirects/proxies and OAuth refresh, and is absent from
+Children use a clean environment, synthetic nonrefreshable tokens, and unique
+config/data/cache/runtime/local roots below the artifact directory, never the
+current account or sync folders. `--test-smoke` requires `test-support` and
+`GDRIVE_UI_TEST_BUS=1`; normal binaries reject it before startup.
+The `test-support` [Drive override](../gdrive-sync/README.md) is absent from
 normal builds. **Do not package feature-enabled binaries.** Build ordinary
 binaries again without these features before packaging.
 
 Readiness uses bus ownership, atomic snapshots of visible production QML text
 and backend properties, sync-completion events, and exact file/fake-server
-content, not fixed startup sleeps. The default overall deadline is 60 seconds
+content, not fixed startup sleeps. The shared stage-wait deadline is 60 seconds
 (`--deadline` allows 5–120); HTTP/IPC/subprocess calls and owned-child cleanup
 have separate finite bounds. Unexpected requests and early child exits fail
 with logs, UI snapshots, request traces, and a stage-specific `result.json`
@@ -169,16 +193,16 @@ under the printed run directory. Successful runs remove disposable state but
 retain evidence; failed runs retain state for diagnosis. Only owned child
 handles are terminated, in reverse order. `--bin-dir` selects a separately
 staged build; otherwise `$CARGO_TARGET_DIR/debug` or `target/debug` is used.
-This is **offscreen native integration**, not live-window/AT-SPI validation.
+This is **offscreen native integration**, not live-window/AT-SPI validation
+or a pixel/screenshot comparison. It does not exercise interactive OAuth,
+Add/Browse controls, a real tray host, or real Google Drive.
 
 ### Component and live-window tests
 
-The repository skill
-[`gdrive-ui-testing`](../../.github/skills/gdrive-ui-testing/SKILL.md)
-provides semantic real-window interaction through AT-SPI accessibility,
-without X11 input automation. Enable Qt accessibility when launching an
-owned test instance with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`. Never change
-real sync folders as part of a smoke test.
+The [`gdrive-ui-testing` skill](../../.github/skills/gdrive-ui-testing/SKILL.md)
+documents owned-window AT-SPI interaction, prerequisites, safety constraints,
+and its separate toolkit fixture tests. Those fixtures do not load application
+QML or prove live accessibility works. Application component tests are below.
 
 The Qt Quick tests require `qml6-module-qttest` on Debian/Ubuntu. If it is
 missing, ask the user to run `sudo apt install qml6-module-qttest`; agents
@@ -188,44 +212,42 @@ must not install it themselves.
 cargo test -p gdrive-ui
 cargo run -p gdrive-ui --example verify-icons
 dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrive-ui -- --ignored --test-threads=1
-QT_QPA_PLATFORM=offscreen QT_QUICK_CONTROLS_STYLE=Fusion \
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Fusion \
   /usr/lib/qt6/bin/qmltestrunner -input crates/gdrive-ui/tests/qml
 ```
 
-Run these from the workspace root. The ignored Rust test deliberately uses
-a private D-Bus session to test a stalled daemon, authentication signals, daemon
-ownership changes, subscription cleanup, and portal color-scheme variants
-(including invalid types) without touching the user's daemon or desktop portal.
-The Qt tests use a controllable backend double for loading, errors,
-retry, cancellation, late replies, breadcrumbs, and root/nested selection;
-they also measure GUI heartbeat/cancel responsiveness while work is pending.
-The production path/selection controls are tested for readable nested/root
-paths, legacy/manual unknown paths, native manual input invalidation,
-reselection/reset, cancellation, and literal folder names. Private-bus tests
-verify ID/path transport; daemon/configuration tests cover persistence and
-loading old configuration without a path.
-Switch tests cover native and accessible input, failed updates, and subsequent
-backend changes without losing the checked-state binding.
-Tray tests cover state precedence, transitions, unavailable status, and decoding
-every selected SVG. The standalone `verify-icons` Qt probe renders all embedded
-variants at
-16/22/24/32/48/128 pixels and checks application/new-window icon propagation.
-It uses the production application factory and constructs and triggers a
-widget-backed tray menu, covering startup on desktops that need that fallback.
-Set `GDRIVE_ICON_PREVIEWS` to an existing absolute artifact directory to save
-light/dark-background PNG previews during that probe. Qt runs on its process's
-main thread, not on a Rust unit-test worker; it does not load the UI or contact
-the daemon. Missing SVG support fails
-the rendering tests explicitly. Private-bus tests also cover status signals,
-lost-signal polling recovery, stale revisions, daemon replacement, and timeout
-recovery; run ignored UI tests serially because they own the same service name.
+Run these from the workspace root:
+
+- Ordinary Rust tests cover cancellation/generations, a stalled connection
+  deadline, and status aggregation. Ignored tests use private daemon/portal
+  doubles for authentication/status signals, ownership changes, subscription
+  cleanup, ID/path transport, partial authentication failures, color-scheme
+  values/types, polling, stale revisions, and timeout recovery. Run them
+  serially because they own the same service name.
+- Qt Quick tests load production components with a backend double: loading,
+  retry/errors, cancellation/late replies, heartbeat responsiveness, navigation,
+  ID/path selection and manual editing, readable/literal/long paths, accessible
+  button actions, switch bindings after failed changes, and tray precedence/SVGs.
+  The double implements request cancellation; these tests alone do not verify
+  the Rust bridge or a real D-Bus deadline.
+- `verify-icons` uses the production `QApplication` factory, constructs/triggers
+  a widget-backed menu, renders embedded icons at 16/22/24/32/48/128 pixels, and
+  checks application/new-window icon propagation. It forces offscreen Qt on the
+  process main thread without loading the UI or contacting the daemon. Missing
+  SVG support fails explicitly. Set `GDRIVE_ICON_PREVIEWS` to an existing absolute
+  directory for light/dark-background PNG previews.
 
 `tests/live_browse.py` drives the actual debug binary using the skill,
 against `tests/mock_daemon.py` on a private D-Bus session. It tests the
 production 30-second deadline, cancellation, errors/retry, nested selection,
 late replies, and authentication signals while polling is stalled, without
 submitting a sync folder or authenticating a real account. It uses the skill's
-dedicated executable. With the desktop accessibility bus address available, run:
+dedicated executable. Unlike the skill's normal existing-session launch,
+the session bus is private, but the accessibility bus
+is the desktop's. It requires system Python GI/Gio, `dbus-run-session`, `busctl`,
+the skill's AT-SPI prerequisites, and a built `target/debug/gdrive-ui`
+(it does not honor `CARGO_TARGET_DIR`). Set `AT_SPI_BUS_ADDRESS` to the actual
+desktop accessibility bus address before running:
 
 ```sh
 dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 \
@@ -237,25 +259,19 @@ to avoid activating real desktop services on its private bus. Cancellation
 measurements wait for the scoped Drive-dialog Cancel control to disappear,
 not for a control behind the modal dialog to remain visible.
 
-`AccessibleButton.qml` explicitly connects accessible Press to the enabled
-button's click action, including dialog footer buttons. This is necessary
-on Qt 6.4, which can advertise Press without activating a Quick button.
-Named accessible containers disambiguate nested dialog actions. Qt 6.4 may
-not expose EditableText for Quick text fields; the skill reports this
-limitation explicitly instead of pretending that text entry succeeded.
+`AccessibleButton.qml` connects accessible Press to enabled buttons' click
+actions, including dialog footers; named containers disambiguate nested
+actions. The skill describes Qt 6.4 Press/EditableText limitations.
 
 ## Dark mode
 
-The UI follows the desktop's dark/light preference. At startup, `main.rs`
-sets the Qt Quick Controls fallback style to "Fusion" (which draws every
-control from the QML `palette` property, unlike the default "Basic" style),
-and the asynchronous startup request queries the freedesktop desktop
-portal's `org.freedesktop.appearance` `color-scheme` setting over D-Bus
-(supported by `xdg-desktop-portal-kde`/`-gnome`/`-gtk` on effectively every
-modern desktop, so this doesn't depend on a Qt6-specific platform theme
-plugin being installed). `qml/main.qml` applies an approximate Breeze Dark
-`Palette` to the window when `SyncManager.darkMode` is true. The preference
-is only read once at startup (not live-updated if changed while running).
-The window starts with the default palette and updates when the bounded
-portal request completes; an unavailable portal logs a warning and leaves
-the light fallback in place.
+`main.rs` sets the Qt Quick Controls fallback style to **Fusion**, which
+supports the QML palette; an explicit style override is still honored.
+An asynchronous startup request reads the desktop portal's
+`org.freedesktop.appearance` `color-scheme` setting. Unsigned value `1` enables
+`SyncManager.darkMode` and the approximate Breeze Dark palette in `main.qml`;
+other unsigned values leave the default palette, and invalid types fail the
+read. No Qt-specific platform theme plugin is required, but the installed
+portal backend must provide the setting. The window uses its default palette
+until the request completes; failures log a warning and keep that default.
+This is a one-time read, not a live preference subscription.

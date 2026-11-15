@@ -5,15 +5,26 @@ and a stateful localhost fake Drive, see
 [Hidden full-application smoke](../gdrive-ui/README.md#hidden-full-application-smoke).
 Its nondefault `test-support` feature must not be used for packaged builds;
 normal binaries reject the runner's `--test-smoke` startup flag.
+Feature builds require `GDRIVE_UI_TEST_BUS=1` and
+`GDRIVE_TEST_DRIVE_ORIGIN` for that flag. The Drive-origin override itself is
+feature-gated, not flag-gated; use the linked runner's isolated state and bus,
+not a real account. See [gdrive-sync](../gdrive-sync/README.md) for the override's
+loopback validation and network restrictions.
 
-Background daemon binary.
+Background daemon binary. See [gdrive-sync](../gdrive-sync/README.md) for
+sync, conflict, deletion and recovery behavior.
+
+## Startup and local state
 
 On startup it:
 
-1. Loads the persisted configuration (`~/.config/gdrive-client/config.toml`).
+1. Loads the persisted configuration (`$XDG_CONFIG_HOME/gdrive-client/config.toml`,
+   normally `~/.config/gdrive-client/config.toml`). A missing file means an
+   empty configuration; unreadable or malformed configuration aborts startup.
 2. Loads a cached OAuth2 access token, without starting an interactive flow.
    If none is available, it still starts the D-Bus service so `gdrive-ui`
-   can request sign-in.
+   can request sign-in. An unreadable or malformed token cache is logged and
+   treated as signed out.
 3. Starts the `gdrive_sync::SyncEngine` for every enabled sync folder when
    a cached token is available.
 4. Serves the `org.gclient.GDrive1` interface (defined in
@@ -26,6 +37,29 @@ On startup it:
    interaction; `SignOut` deletes the cached token and stops all running
    folders. Successful sign-in and sign-out emit `AuthenticationChanged(b)`.
 
+The daemon also opens `sync-state.sqlite3` under
+`$XDG_DATA_HOME/gdrive-client` (normally `~/.local/share/gdrive-client`);
+failure to open it aborts startup. The same directory holds `oauth-token.json`.
+New token-cache writes use mode `0600` and atomic replacement. Treat this
+directory as private account state.
+
+Run a source build with `cargo run -p gdrived`, using the same user/session bus
+as the UI. Stop an existing packaged daemon first to avoid competing for the
+bus name. There are no normal configuration-path or OAuth CLI options:
+configuration locations follow XDG, and OAuth uses the environment/defaults
+below. Configuration is loaded once; use D-Bus folder mutations while running,
+or restart after manual TOML edits. SIGINT and SIGTERM terminate the process.
+
+## D-Bus control and status
+
+The bus name and interface are `org.gclient.GDrive1`; the object path is
+`/org/gclient/GDrive1`. The shared
+[`dbus_api.rs`](../gdrive-common/src/dbus_api.rs) defines method signatures and
+row layouts. Folder mutations persist configuration before changing runtime
+state; persistence failures leave both unchanged. Removing a sync folder,
+disabling it, or signing out stops workers without deleting local or remote
+files. Sign-out retains folder configuration and the sync-state database.
+
 `AddSyncFolder` persists the display-only `drive_folder_path` argument alongside
 the Drive ID, and `ListSyncFolders` returns both. Empty or `root` IDs are
 normalized to My Drive; a non-root ID with an empty path keeps its path unknown.
@@ -36,7 +70,8 @@ field follows the Drive ID and changes the D-Bus wire signatures: upgrade
 `gdrive-ui` and `gdrived` together and restart the daemon.
 
 `SyncStatus` returns the engine's authoritative in-memory per-folder activity
-and outstanding failures, with a monotonic revision. `SyncStatusChanged(t)`
+and outstanding failures, with a revision monotonic within one daemon lifetime.
+Discard cached revisions when the bus owner changes. `SyncStatusChanged(t)`
 notifies clients to re-read it. Subscribers are established before workers
 start; snapshots remain available even if no UI was connected during a change.
 Coalesced notifications do not lose the current state, and emission failures
@@ -46,6 +81,11 @@ The separate sync-event logging loop tolerates lag instead of terminating.
 Idle background workers and empty polling are not active file sync. Errors
 survive unrelated successes and clear only when affected work recovers or
 the folder is explicitly stopped/restarted.
+
+`IsAuthenticated` checks for a parseable cached token, not whether Google still
+accepts it; it does not validate or refresh credentials. Cache read/parse
+failures return a D-Bus error. Adding or enabling folders can start workers
+even while signed out; this does not authenticate them.
 
 The OAuth flow has a ten-minute overall deadline, and a duplicate `SignIn`
 request is rejected while one is pending. Its tokens are saved only when the
@@ -59,6 +99,10 @@ that deadline, sign-out reports a timeout and new sign-ins remain rejected
 until the aborted task has actually finished. Signals are emitted in state-change order, with a two-second
 emission deadline; delivery failures are logged and clients can recover by
 querying `IsAuthenticated`.
+
+`SignIn` returning successfully only confirms that the background attempt was
+started. Later browser, token-exchange or persistence failures are logged;
+there is no sign-in-failure signal. See the daemon journal for diagnosis.
 
 Cached OAuth expiry and refresh tokens are retained at startup and after sign-in.
 All Drive calls renew expired credentials automatically, persist renewed tokens,
@@ -84,6 +128,8 @@ Application diagnostics report cache expiry/configuration availability, listing
 page/status/count, and refresh progress without tokens, OAuth response bodies,
 or folder names. Avoid global HTTP trace logging, which can expose credentials.
 
+## Tests
+
 Authentication and configuration regressions use temporary state and tokens:
 
 ```sh
@@ -94,12 +140,6 @@ dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrived -- --ignored
 The private-bus case verifies Drive ID/path transport, status snapshots/signals, fatal sync failures,
 explicit stop, sign-out signals and cancellation without a real
 Google account or the user's daemon.
-
-Run it with:
-
-```sh
-cargo run -p gdrived
-```
 
 ## OAuth client configuration
 
@@ -119,9 +159,13 @@ already be in the compiled binary. This uses installed-application OAuth
 with PKCE: the embedded client secret is not confidential. Embedded
 credentials remove per-user client setup, not browser sign-in and consent.
 
+The daemon does not load an environment file itself; source runs use the
+process environment, and packaged activation uses the systemd file below.
 Starting the daemon does not open a browser: click **Sign in** in the UI
 or call `SignIn` over D-Bus. The daemon opens the browser via `xdg-open` and
 receives the redirect on `127.0.0.1:8734`.
+That port must be available. Browser launch requires `xdg-open`; the consent
+URL is also logged, with a manual-open instruction if spawning it fails.
 
 ## Packaged (systemd/D-Bus-activated) daemon
 
@@ -129,6 +173,10 @@ When installed from the `.deb`, `gdrived` is started via D-Bus activation
 ([`org.gclient.GDrive1.service`](../../packaging/org.gclient.GDrive1.service),
 which has `SystemdService=gdrived.service`) or the
 [systemd user unit](../../packaging/gdrived.service) directly.
+The package installs these activation files; it does not enable the user unit
+for login. D-Bus activation is normally sufficient. To start at login instead,
+run `systemctl --user enable --now gdrived.service`. This is a per-user service,
+not a system-wide/root daemon.
 Activation normally does not inherit the invoking shell's exported
 environment variables. If the binary has no embedded OAuth client, or to
 override it, put both credentials in `~/.config/gdrived/env`. The unit
@@ -145,6 +193,13 @@ GDRIVE_CLIENT_SECRET=your-client-secret
 EOF
 chmod 600 ~/.config/gdrived/env
 systemctl --user restart gdrived.service
+```
+
+Check startup and asynchronous sign-in failures with:
+
+```sh
+systemctl --user status gdrived.service
+journalctl --user -u gdrived.service -b
 ```
 
 Query it directly without the UI, e.g.:

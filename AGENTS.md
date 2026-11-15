@@ -4,7 +4,7 @@ Guidance for AI agents (and human contributors) working in this repository.
 
 ## Project
 
-This is a Rust project.
+This is a Rust workspace. See the [README](README.md) for building and running it, and each crate's README for component behavior and tests.
 
 ## Documentation
 
@@ -16,7 +16,7 @@ This is a Rust project.
 ## Dependency management
 
 - When adding a new crate dependency, ALWAYS check the latest available version first via the crates.io REST API, e.g.:
-  `curl -s https://crates.io/api/v1/crates/<crate_name> | jq '.crate.max_stable_version'`
+  `curl --fail --silent --show-error --connect-timeout 10 --max-time 30 https://crates.io/api/v1/crates/<crate_name> | jq '.crate.max_stable_version'`
   Do not rely on memory or guesses for version numbers.
 - Never downgrade an existing dependency in `Cargo.toml`.
 - To update an existing dependency, only upgrade it. If a downgrade seems necessary, stop and ask the user what to do before proceeding.
@@ -39,14 +39,14 @@ This is a Rust project.
 
 ## Verifying the Qt/QML UI visually
 
-- Use the repository's `.github/skills/gdrive-ui-testing` skill for semantic Qt UI interaction through AT-SPI and display-independent Qt Quick tests. Launch owned accessibility test instances with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; do not assume X11 is available or change real sync-folder settings during smoke tests.
+- Use the repository's [gdrive-ui-testing skill](.github/skills/gdrive-ui-testing/SKILL.md) through its dedicated executable for semantic Qt UI interaction through AT-SPI and the skill's display-independent Qt Quick tests. These toolkit tests are not application regression tests; see the [UI testing instructions](crates/gdrive-ui/README.md#ui-testing) for application tests and the optional isolated full-application smoke. Launch owned accessibility test instances with `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; do not assume X11 is available or change real sync-folder settings during smoke tests.
 - If any testing tool or package is missing, give the user its exact installation command and wait for them to install it; do not install it yourself.
 - To screenshot the running `gdrive-ui` window, do not try to raise/focus it via `wmctrl`/`xdotool`/KWin scripting - just run `sleep 5 && spectacle -a -b -n -o /path/to/file.png` right after launching it, which captures the active window directly (`-a`), in the background (`-b`), with no capture-start sound (`-n`).
 
 ## License compliance tooling
 
 - `deny.toml` configures `cargo-deny` (`cargo install cargo-deny`) to check dependency licenses (`cargo deny check licenses`), security advisories, banned/duplicate crates, and source registries (`cargo deny check`). The `[licenses.allow]` list must stay in sync with the workspace's own `license = "MIT OR Apache-2.0"` - only add an SPDX id there once you've confirmed it's compatible.
-- `scripts/scancode-scan.sh` runs ScanCode Toolkit (via a `uv`-managed venv in `.venv-scancode/`, gitignored) over our own source (not dependencies) to catch any embedded license text/copyright notices that might indicate copy-pasted code from an incompatibly-licensed project. Requires `uv` (`curl -LsSf https://astral.sh/uv/install.sh | sh`); the script bootstraps everything else itself. Output goes to `.scancode/scancode-report.json` (also gitignored).
-- ScanCode's tested dependencies are pinned in `scripts/scancode-requirements.txt`. Plugincode 32 requires Pluggy 1.6 because Pluggy 1.7 no longer discovers its class-marked hooks. The bootstrap checks the requirements on each run, repairing existing `.venv-scancode` environments as well as creating new ones. It can install/change packages; agents must ask the user to perform needed local installation rather than doing it themselves.
+- `scripts/scancode-scan.sh` runs ScanCode Toolkit (via a `uv`-managed venv in `.venv-scancode/`, gitignored) over `crates/`, `scripts/`, and the root `Cargo.toml`, `AGENTS.md`, and `README.md` (not dependencies) to catch embedded license text/copyright notices. Requires `uv` (user-run installer: `curl -LsSf --connect-timeout 10 --max-time 60 https://astral.sh/uv/install.sh | sh`). Output goes to `.scancode/scancode-report.json` (also gitignored).
+- ScanCode's compatible dependencies are pinned in `scripts/scancode-requirements.txt`. The bootstrap checks the requirements on each run, repairing existing `.venv-scancode` environments as well as creating new ones. It can install/change packages; agents must ask the user to perform needed local installation rather than doing it themselves.
 - `./scripts/test-scancode-bootstrap.py` exercises the bootstrap offline with a fake installer and scanner. `scripts/check-scancode.py` rejects scan errors and unexpected notices; `.github/scancode-policy.json` provides a path-specific baseline for the project's own license mentions and the Debian manifests' license-file/copyright metadata, not blanket source or third-party copyright exemptions.
 - Both checks run in CI via `.github/workflows/license-check.yml` on pushes to `main` and pull requests.
