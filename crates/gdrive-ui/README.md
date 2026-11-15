@@ -129,6 +129,50 @@ path; these guarantees apply to D-Bus requests.
 
 ## UI testing
 
+### Hidden full-application smoke
+
+From the workspace root, with the normal Qt prerequisites and `dbus-daemon`,
+`busctl`, and Python 3 available:
+
+```sh
+cargo build -p gdrived -p gdrive-ui --features gdrived/test-support,gdrive-ui/test-support
+./scripts/smoke-full-app.py --artifacts target/full-app-smoke
+```
+
+This launches the **real daemon and actual UI main/QML** on a disposable private
+D-Bus with no activatable services, using Qt's offscreen/software platform.
+It verifies rendered connection, authentication, and folder labels, the real
+Qt.labs.platform widget-backed menu, and explicitly constructs/triggers a
+`QMenu` in the same process to catch accidental `QGuiApplication` regressions.
+The stateful loopback Drive checks the synthetic bearer token and exercises
+initial download, a watched local modification/upload, an injected HTTP 503
+shown through the UI's sync-error state, remote download retry, and idle recovery.
+It accepts both legacy replacement Trash and retained-history rename requests;
+this is an integration smoke, not a replacement-retention policy assertion.
+
+The runner starts children with a clean environment, synthetic nonrefreshable
+tokens, and unique config/data/cache/runtime/local roots below the artifact
+directory, never the current account or sync folders. Only feature-enabled
+binaries accept `--test-smoke`; normal binaries refuse it before doing any work.
+The `test-support` Drive override accepts only an explicit numeric HTTP loopback
+origin/port, disables redirects/proxies and OAuth refresh, and is absent from
+normal builds. **Do not package feature-enabled binaries.** Build ordinary
+binaries again without these features before packaging.
+
+Readiness uses bus ownership, atomic snapshots of visible production QML text
+and backend properties, sync-completion events, and exact file/fake-server
+content, not fixed startup sleeps. The default overall deadline is 60 seconds
+(`--deadline` allows 5–120); HTTP/IPC/subprocess calls and owned-child cleanup
+have separate finite bounds. Unexpected requests and early child exits fail
+with logs, UI snapshots, request traces, and a stage-specific `result.json`
+under the printed run directory. Successful runs remove disposable state but
+retain evidence; failed runs retain state for diagnosis. Only owned child
+handles are terminated, in reverse order. `--bin-dir` selects a separately
+staged build; otherwise `$CARGO_TARGET_DIR/debug` or `target/debug` is used.
+This is **offscreen native integration**, not live-window/AT-SPI validation.
+
+### Component and live-window tests
+
 The repository skill
 [`gdrive-ui-testing`](../../.github/skills/gdrive-ui-testing/SKILL.md)
 provides semantic real-window interaction through AT-SPI accessibility,

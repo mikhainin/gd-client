@@ -8,6 +8,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+test-support = []
+
 [package.metadata.deb]
 maintainer = "g-client contributors"
 copyright = "2026, g-client contributors"
