@@ -1,5 +1,8 @@
 # gdrive-sync
 
+The experimental sync engine used by the `gdrived` daemon. Use disposable data
+when evaluating it and retain independent backups.
+
 The nondefault `test-support` feature provides a disposable full-application
 smoke endpoint override; see the [UI testing instructions](../gdrive-ui/README.md#hidden-full-application-smoke).
 Only `http://<numeric loopback IP>:<explicit port>` origins are accepted through
@@ -9,13 +12,13 @@ proxies are disabled, and OAuth refresh is disabled. Normal builds
 do not read this variable or expose endpoint redirection. Never enable this
 feature in packaged binaries.
 
-The sync engine, used by the `gdrived` daemon.
-
 - `engine` — `SyncEngine`: starts/stops a background task per `SyncFolder`
   (`start_folder`/`stop_folder`/`start_all`/`running_folders`), each of which
   watches local changes before the first network request, performs an initial
   recursive merge from Drive, then reconciles local changes and
   polls Drive's Changes API for remote changes, including newly created items.
+  Transfers are sequential within each folder; enabled folders have separate
+  workers. A missing Drive folder ID selects "My Drive" (`root`).
   Live parent metadata resolves subtree membership, including moves into/out of
   the sync root; directory moves relocate descendant mappings together.
   Failed polls retain their cursor for replay after reconnect or restart.
@@ -35,12 +38,11 @@ The sync engine, used by the `gdrived` daemon.
   stop/restart clears them. Vanished local paths with no tracked remote item
   are reconciled as obsolete, including failed uploads followed by a rename;
   pending remote deletions and unrelated errors remain outstanding. Status
-  mutations touch only the affected activity flag/error entry, without cloning
-  the outstanding-error map. Initial sync retries connection failures and
+  updates are generation-scoped. Initial sync retries connection failures and
   timeouts (including OAuth refresh transport failures) after the configured
-  polling interval, with a five-second minimum in production. Each attempt
-  persists the change cursor before the first recursive pull and retains it
-  across retries, so deletions during a partial pull or retry wait are replayed
+  polling interval, with a five-second minimum. The starting change cursor
+  is persisted before the first recursive pull and retained across retries and
+  restarts, so deletions during a partial pull or retry wait are replayed
   by polling. No separate internet probe is used. Already-recorded downloads
   are skipped, and the completion count includes downloads from failed attempts.
   Waiting workers remain running but are not marked active; their error clears
@@ -48,8 +50,7 @@ The sync engine, used by the `gdrived` daemon.
   local failures remain fatal during initialization and visible after the
   task exits. Established workers already retry remote polls after failures,
   retaining the last successful change cursor. Stop/abort cancels pending
-  retries and clears activity, and run generations reject updates
-  from superseded tasks. Status is in memory, not persisted. Finished tasks
+  retries and clears activity. Status is in memory, not persisted. Finished tasks
   are excluded from `running_folders`.
   Remote-deletion failures and local metadata failures other than a vanished
   path propagate as sync errors rather than being silently ignored.
@@ -79,12 +80,14 @@ The sync engine, used by the `gdrived` daemon.
   renamed by another client is left at its current name.
   Before retirement, live previous-file metadata is compared with the stored
   baseline. Concurrent remote content is downloaded to a deterministic
-  `.remote-conflict-<digest>` local copy before retention; failures leave the
+  `.remote-conflict-<content-digest>` local copy before retention (a UUID is used
+  if that name already holds different bytes); failures leave the
   previous copy live and retryable. Conflict copies are themselves queued for
   upload. During initial binding, occupied local paths become
   `.local-conflict-<uuid>` siblings before remote content is installed.
   Local creates/updates run before deletions; a failed write postpones deletion
-  of rename sources. Local moves use create-and-trash rather than preserving IDs.
+  of rename sources. Ordinary local moves use create-and-trash rather than
+  preserving IDs; native-document links have the exception described below.
   Drive-generated IDs and staged upload metadata are persisted before retirement:
   a retry can recover a create whose response was lost, or finish a failed history rename
   operation without uploading another copy. Retirement verifies live replacement
@@ -92,20 +95,23 @@ The sync engine, used by the `gdrived` daemon.
   Conflict filenames are bounded to 255 bytes without splitting UTF-8 characters.
   Replacement metadata is never trusted solely from the stored response. If that copy is gone or
   trashed, the previous copy is preserved and a fresh upload is queued.
-  Local deletions also use Trash.
   Retained versions are ordinary remote files/folders: they remain discoverable
   under their history names and sync locally, including later edits to them.
-  They keep their original IDs and sharing. The replacement alone is bound to
-  the original local path. Replacing a directory releases its old descendant
-  mappings and staged descendant uploads atomically, while preserving queued
+  They keep their original IDs and sharing; Drive links and per-file sharing
+  do not automatically carry over to the replacement. The replacement alone is
+  bound to the original local path. Replacing a directory atomically releases
+  its old descendant mappings and staged uploads, while preserving queued
   local notifications, so retries cannot resurrect or trash the retained subtree.
   Scanning and deletion preflight defer children beneath a directory replaced
   by a file until that parent replacement reconciles.
   History names use the same UTF-8-safe 255-byte bound as conflict names,
   reserving space for native documents' synthesized browser-link suffixes.
+  Both versions can temporarily share the original name if history renaming
+  fails; the persisted stage resumes that rename without another upload.
   There is no automatic history cleanup; history uses remote and local storage.
-  MD5 checksums (via `md5`, only for Drive content matching, not cryptography)
-  suppress uploads of unchanged files and daemon-generated download events.
+  Explicit local deletions move the tracked remote item to Drive Trash.
+  MD5 content checksums (not a security mechanism) suppress uploads of unchanged
+  files and daemon-generated download events.
 - `google_document` — native Google Docs, Sheets and Slides are represented as
   `.gdoc.desktop`, `.gsheet.desktop` and `.gslides.desktop` browser links.
   These Linux desktop links contain only `Type=Link`, a display name and the
@@ -123,7 +129,7 @@ The sync engine, used by the `gdrived` daemon.
   moved links cannot fall back to ordinary uploads. Ordinary text containing an
   ID marker is not a link. Moves reject tracked destinations before contacting
   Drive, persist successful remote metadata before installation, and revalidate
-  destination bytes after staging so concurrent edits/deletions are not overwritten.
+  destination bytes after staging, preserving detected intervening edits/deletions.
   Browser-only document edits do not change link checksums or create conflict links.
 - `auth` — Google OAuth2 flow (via the `oauth2` crate) and cached token
   storage. Reads `GDRIVE_CLIENT_ID`/`GDRIVE_CLIENT_SECRET` from the
@@ -131,8 +137,14 @@ The sync engine, used by the `gdrived` daemon.
   falling back to whatever was baked in at *build* time via the
   `GDRIVE_BUILD_CLIENT_ID`/`GDRIVE_BUILD_CLIENT_SECRET` build-environment
   variables (read with `option_env!`, never committed to source) - see
-  `OAuthConfig::from_env` in `src/auth.rs`. Note: `oauth2`'s bundled
-  `reqwest` HTTP client is disabled
+  `OAuthConfig::from_env` in `src/auth.rs`. Runtime overrides must supply both
+  values; otherwise the build-time pair is used. Interactive sign-in uses
+  PKCE, the full Drive scope, and a loopback redirect at `127.0.0.1:8734`.
+  The daemon bounds the whole flow to ten minutes; direct callers of
+  `authorize`/`authenticate` must bound the redirect wait themselves.
+  The authorization-code exchange has a 15-second connection timeout and
+  30-second request/body timeout, separate from refresh deadlines below.
+  Note: `oauth2`'s bundled `reqwest` HTTP client is disabled
   (`default-features = false`) to avoid a version conflict with the
   workspace's own `reqwest`; a small adapter (`reqwest_http_client`) wraps
   our `reqwest::Client` instead.
@@ -148,8 +160,8 @@ The sync engine, used by the `gdrived` daemon.
 - `drive_client` — thin async wrapper around the Google Drive v3 REST API
   (list children, download/upload/create/rename/trash, generated IDs, metadata recovery,
   list changes). Requests have
-  a 10-second connection timeout and a 30-minute total HTTP timeout covering
-  response headers and bodies, allowing large sync transfers. Folder browsing
+  a 10-second connection timeout and a 30-minute per-request HTTP timeout covering
+  response headers and bodies. Folder browsing
   instead has a 25-second deadline across all pages: Drive filters out files
   and trashed items server-side, returning only folder ids/names. Pagination
   is preserved; failures/timeouts are errors, not empty or partial results.
@@ -168,14 +180,18 @@ The sync engine, used by the `gdrived` daemon.
   and cache-write failures are explicit errors, never empty listings. Refresh
   failures do not log credentials or response bodies.
   Transport and deadline failures retain their source errors; OAuth connection,
-  response, and body timeouts retain timeout classification through D-Bus.
+  response, and body timeouts during refresh retain timeout classification
+  through D-Bus; this does not describe the interactive code-exchange error path.
   Drive JSON parsing happens only after the complete body is transferred:
   interrupted bodies retain a retryable transport classification, while invalid
-  JSON/schema responses remain fatal. OAuth body transfers are likewise distinct
+  JSON/schema responses are non-transport errors (fatal during initialization).
+  OAuth refresh body transfers are likewise distinct
   from malformed token responses; source errors are preserved without body text.
   Create requests use pre-generated IDs rather than updating existing content
-  in place. ID generation, metadata recovery, folder creation, and Trash updates
-  have explicit 25-second HTTP budgets; uploads retain the transfer budget.
+  in place. ID generation, metadata recovery, folder creation, history renames,
+  native-document moves, and Trash updates have explicit 25-second HTTP budgets;
+  uploads retain the transfer budget. These per-request budgets do not include
+  token refresh or a 401 replay; folder browsing has the overall deadline above.
   Only a confirmed HTTP 404 is treated as an absent recovery target or an
   already-removed Trash target; other failures remain errors.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
@@ -202,30 +218,24 @@ The sync engine, used by the `gdrived` daemon.
   Pending local paths and replacement upload stages survive worker/daemon
   restarts. Removing a directory's mapping also removes descendant mappings.
 - `ownership` — resolves configured owner user/group names to numeric
-  uid/gid and applies them to synced files.
+  uid/gid, falling back to the daemon process's user/group for empty or
+  unresolved names, and applies them to synced files. Ownership failures
+  propagate as sync errors; the daemon needs permission to set the chosen owner.
 
 ## Current limitations
 
-Conflict handling preserves both content versions rather than choosing a winner
-by modified time. The locally edited version keeps its ordinary name when it
-replaces a tracked remote file; the remote version becomes a conflict copy.
-Google Docs/Sheets/Slides use browser links, not Office/PDF exports. Other native
-Google file types and Drive shortcuts are not implemented. Remote names that cannot
-be represented safely on Linux and duplicate Drive names within one directory
-are reported as errors. Local moves/renames create new Drive IDs.
+Conflict handling uses the retention/conflict-copy rules above rather than
+choosing a winner by modified time. Native documents use browser links, not
+Office/PDF exports; other native Google file types and Drive shortcuts are not
+implemented.
 
-Uploads are not resumable and remote metadata writes are not conditional
-transactions. Replacement retention avoids the check-then-Trash content race
-without relying on unsupported v3 conditional-write headers or the v2 API.
+Uploads are not resumable; uploads and downloads buffer whole files in memory.
+Remote metadata writes are not conditional transactions, and filesystem
+checks are not atomic with the subsequent write/removal. Replacement retention
+avoids the check-then-Trash content race without relying on unsupported v3
+conditional-write headers or the v2 API.
 Concurrent renames can still cause naming conflicts, which are reported rather
 than resolved by choosing an arbitrary ID. Explicit local deletions still trash
 their tracked remote items and are not transactional multi-client arbitration.
-Use separate backups.
-
-Local deletion of a tracked item moves it to Drive Trash. Local edits create
-replacement files with new IDs and retain the previous versions as live history:
-Drive links and per-file sharing do not automatically carry over to replacements.
-Both items can temporarily share the original name if history renaming fails;
-the persisted upload stage resumes that rename without another upload.
-Retained versions are not garbage-collected automatically. Remote deletions still remove
-local items. Drive Trash is not an independent backup; retain separate backups.
+Remote deletions remove unchanged local items; detected local edits are preserved
+as conflict copies. Drive Trash and retained history are not independent backups.
