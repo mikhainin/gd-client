@@ -47,8 +47,19 @@ pub enum SyncError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[error("OAuth token refresh transport failed; check the connection and retry")]
+    #[error("OAuth token transport failed; check the connection and retry")]
     OAuthTransport(#[source] crate::auth::ReqwestOAuthError),
+
+    #[error(
+        "OAuth authorization exchange failed; retry sign-in or check the client configuration"
+    )]
+    OAuthExchange(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("invalid OAuth redirect request")]
+    OAuthRedirect(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("invalid OAuth token cache data")]
+    OAuthCache(#[source] serde_json::Error),
 
     #[error("OAuth2 error: {0}")]
     OAuth(String),

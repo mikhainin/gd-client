@@ -140,8 +140,11 @@ feature in packaged binaries.
   `OAuthConfig::from_env` in `src/auth.rs`. Runtime overrides must supply both
   values; otherwise the build-time pair is used. Interactive sign-in uses
   PKCE, the full Drive scope, and a loopback redirect at `127.0.0.1:8734`.
-  The daemon bounds the whole flow to ten minutes; direct callers of
-  `authorize`/`authenticate` must bound the redirect wait themselves.
+  The redirect listener is bound before opening the browser, has an eight-minute
+  consent deadline and five-second request/response I/O deadlines, validates
+  the generated state, and decodes exactly one authorization code. Incomplete
+  and oversized HTTP requests fail explicitly. The daemon additionally bounds
+  the whole flow to ten minutes.
   The authorization-code exchange has a 15-second connection timeout and
   30-second request/body timeout, separate from refresh deadlines below.
   Note: `oauth2`'s bundled `reqwest` HTTP client is disabled
@@ -181,7 +184,8 @@ feature in packaged binaries.
   failures do not log credentials or response bodies.
   Transport and deadline failures retain their source errors; OAuth connection,
   response, and body timeouts during refresh retain timeout classification
-  through D-Bus; this does not describe the interactive code-exchange error path.
+  through D-Bus. Interactive code exchange also retains timeout classifications
+  and underlying sources without including token-response bodies in its message.
   Drive JSON parsing happens only after the complete body is transferred:
   interrupted bodies retain a retryable transport classification, while invalid
   JSON/schema responses are non-transport errors (fatal during initialization).

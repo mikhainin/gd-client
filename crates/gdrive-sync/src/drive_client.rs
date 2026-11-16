@@ -732,7 +732,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) struct Server {
-        base: String,
+        pub(crate) base: String,
         pub(crate) requests: mpsc::Receiver<String>,
         worker: Option<thread::JoinHandle<()>>,
     }

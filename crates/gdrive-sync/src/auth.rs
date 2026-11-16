@@ -9,6 +9,7 @@
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -195,9 +196,9 @@ pub fn load_token(path: &Path) -> Result<Option<StoredToken>, SyncError> {
         return Ok(None);
     }
     let text = std::fs::read_to_string(path)?;
-    Ok(Some(serde_json::from_str(&text).map_err(|e| {
-        SyncError::OAuth(format!("failed to parse cached token: {e}"))
-    })?))
+    Ok(Some(
+        serde_json::from_str(&text).map_err(SyncError::OAuthCache)?,
+    ))
 }
 
 pub fn save_token(path: &Path, token: &StoredToken) -> Result<(), SyncError> {
@@ -206,8 +207,7 @@ pub fn save_token(path: &Path, token: &StoredToken) -> Result<(), SyncError> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let text = serde_json::to_string_pretty(token)
-        .map_err(|e| SyncError::OAuth(format!("failed to serialize token: {e}")))?;
+    let text = serde_json::to_string_pretty(token).map_err(SyncError::OAuthCache)?;
     let temporary = parent.join(format!(".oauth-token-{}.tmp", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -234,7 +234,7 @@ pub fn save_token(path: &Path, token: &StoredToken) -> Result<(), SyncError> {
 /// listens on a local loopback port for the redirect, exchanges the
 /// authorization code for tokens, and persists them to `token_path`.
 ///
-/// This is a placeholder end-to-end implementation: it requires
+/// This requires
 /// [`OAuthConfig::from_env`] to return `Some`, and a real Google Cloud OAuth
 /// client to be configured before it will succeed.
 pub async fn authenticate(
@@ -255,6 +255,15 @@ pub async fn authorize(
 ) -> Result<StoredToken, SyncError> {
     let redirect_port = 8734;
     let redirect_url = format!("http://127.0.0.1:{redirect_port}");
+    let listener = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpListener::bind(("127.0.0.1", redirect_port)),
+    )
+    .await
+    .map_err(|source| SyncError::Timeout {
+        operation: "opening the OAuth redirect listener",
+        source: Box::new(source),
+    })??;
 
     let client = BasicClient::new(ClientId::new(config.client_id.clone()))
         .set_client_secret(ClientSecret::new(config.client_secret.clone()))
@@ -264,7 +273,7 @@ pub async fn authorize(
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (auth_url, _csrf_token) = client
+    let (auth_url, csrf_token) = client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new(DRIVE_SCOPE.to_string()))
         .add_extra_param("access_type", "offline")
@@ -274,7 +283,13 @@ pub async fn authorize(
 
     show_auth_url(auth_url.as_str());
 
-    let code = wait_for_redirect_code(redirect_port).await?;
+    let code = wait_for_redirect_code(
+        listener,
+        csrf_token.secret(),
+        Duration::from_secs(8 * 60),
+        Duration::from_secs(5),
+    )
+    .await?;
 
     let http_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -290,7 +305,7 @@ pub async fn authorize(
         .set_pkce_verifier(pkce_verifier)
         .request_async(&reqwest_http_client(http_client))
         .await
-        .map_err(|e| SyncError::OAuth(e.to_string()))?;
+        .map_err(token_exchange_error)?;
 
     let stored = StoredToken {
         access_token: token_result.access_token().secret().clone(),
@@ -321,41 +336,119 @@ fn now_unix_secs() -> i64 {
 
 /// Blocks (asynchronously) until the OAuth redirect hits our loopback
 /// listener, then returns the `code` query parameter from it.
-async fn wait_for_redirect_code(port: u16) -> Result<String, SyncError> {
+async fn wait_for_redirect_code(
+    listener: tokio::net::TcpListener,
+    state: &str,
+    deadline: Duration,
+    io_timeout: Duration,
+) -> Result<String, SyncError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    let (mut socket, _) = listener.accept().await?;
-
-    let mut buf = [0u8; 4096];
-    let n = socket.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    let code = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|path| path.split_once('?'))
-        .map(|(_, query)| query)
-        .and_then(|query| {
-            query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("code=").map(str::to_string))
-        })
-        .ok_or_else(|| SyncError::OAuth("redirect did not contain an authorization code".into()))?;
-
-    let body = "Authentication complete. You can close this window and return to the app.";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = socket.write_all(response.as_bytes()).await;
-
-    Ok(code)
+    tokio::time::timeout(deadline, async {
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let request = tokio::time::timeout(io_timeout, async {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 512];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let size = socket.read(&mut buf).await?;
+                    if size == 0 || request.len() + size > 8192 {
+                        return Err(SyncError::OAuth("invalid OAuth redirect request".into()));
+                    }
+                    request.extend_from_slice(&buf[..size]);
+                }
+                String::from_utf8(request)
+                    .map_err(|source| SyncError::OAuthRedirect(Box::new(source)))
+            }).await.map_err(|source| SyncError::Timeout {
+                operation: "reading the OAuth redirect", source: Box::new(source),
+            })??;
+            let result = redirect_code(&request, state);
+            let (status, body) = match &result {
+                Ok(Some(_)) => ("200 OK", "Authentication received. Return to the app to finish sign-in."),
+                Ok(None) => ("404 Not Found", "Not an OAuth callback."),
+                Err(_) => ("400 Bad Request", "Authentication failed. Return to the app and retry."),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            tokio::time::timeout(io_timeout, async {
+                socket.write_all(response.as_bytes()).await?;
+                socket.shutdown().await
+            }).await.map_err(|source| SyncError::Timeout {
+                operation: "replying to the OAuth redirect", source: Box::new(source),
+            })??;
+            if let Some(code) = result? { return Ok(code); }
+        }
+    }).await.map_err(|source| SyncError::Timeout {
+        operation: "waiting for OAuth browser consent", source: Box::new(source),
+    })?
 }
 
+fn redirect_code(request: &str, state: &str) -> Result<Option<String>, SyncError> {
+    let mut parts = request
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    if parts.next() != Some("GET") {
+        return Err(SyncError::OAuth(
+            "OAuth redirect must be an HTTP GET".into(),
+        ));
+    }
+    let target = parts
+        .next()
+        .filter(|target| target.starts_with('/') && !target.starts_with("//"))
+        .ok_or_else(|| SyncError::OAuth("invalid OAuth redirect target".into()))?;
+    let url = reqwest::Url::parse(&format!("http://127.0.0.1{target}"))
+        .map_err(|source| SyncError::OAuthRedirect(Box::new(source)))?;
+    if url.path() != "/" {
+        return Ok(None);
+    }
+    let pairs: Vec<_> = url.query_pairs().collect();
+    let states: Vec<_> = pairs.iter().filter(|(key, _)| key == "state").collect();
+    if states.len() != 1 || states[0].1 != state {
+        return Err(SyncError::OAuth(
+            "OAuth redirect state did not match; retry sign-in".into(),
+        ));
+    }
+    if pairs.iter().any(|(key, _)| key == "error") {
+        return Err(SyncError::OAuth(
+            "Google authorization was declined or failed".into(),
+        ));
+    }
+    let codes: Vec<_> = pairs.iter().filter(|(key, _)| key == "code").collect();
+    if codes.len() != 1 || codes[0].1.is_empty() {
+        return Err(SyncError::OAuth(
+            "OAuth redirect did not contain one authorization code".into(),
+        ));
+    }
+    Ok(Some(codes[0].1.to_string()))
+}
+
+fn token_exchange_error(
+    error: oauth2::RequestTokenError<ReqwestOAuthError, oauth2::basic::BasicErrorResponse>,
+) -> SyncError {
+    use oauth2::RequestTokenError;
+    match error {
+        RequestTokenError::Request(ReqwestOAuthError::Reqwest(source))
+        | RequestTokenError::Request(ReqwestOAuthError::Body(source))
+            if source.is_timeout() =>
+        {
+            SyncError::Timeout {
+                operation: "exchanging the OAuth authorization code",
+                source: Box::new(source.without_url()),
+            }
+        }
+        RequestTokenError::Request(ReqwestOAuthError::Reqwest(source)) => {
+            SyncError::OAuthTransport(ReqwestOAuthError::Reqwest(source.without_url()))
+        }
+        RequestTokenError::Request(ReqwestOAuthError::Body(source)) => {
+            SyncError::OAuthTransport(ReqwestOAuthError::Body(source.without_url()))
+        }
+        RequestTokenError::Request(source) => SyncError::OAuthTransport(source),
+        source => SyncError::OAuthExchange(Box::new(source)),
+    }
+}
 /// Convenience wrapper resolving the default cached-token path from
 /// `gdrive-common`.
 pub fn default_token_path() -> Result<PathBuf, SyncError> {
@@ -408,5 +501,141 @@ fn reqwest_http_client(
                 .to_vec();
             Ok(builder.body(body)?)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn redirect_requires_matching_state_and_decodes_exactly_one_code() {
+        assert_eq!(
+            redirect_code("GET /?code=a%2Bb%2Fc&state=nonce HTTP/1.1\r\n\r\n", "nonce")
+                .unwrap()
+                .as_deref(),
+            Some("a+b/c")
+        );
+        for target in [
+            "/?code=secret&state=wrong",
+            "/?code=secret",
+            "/?code=one&code=two&state=nonce",
+            "/?code=secret&state=nonce&state=nonce",
+            "/?error=access_denied&error_description=private&state=nonce",
+        ] {
+            let error =
+                redirect_code(&format!("GET {target} HTTP/1.1\r\n\r\n"), "nonce").unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+            assert!(!error.to_string().contains("private"));
+        }
+        assert!(redirect_code("GET /favicon.ico HTTP/1.1\r\n\r\n", "nonce")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn redirect_accept_and_stalled_request_time_out_with_sources() {
+        for connect in [false, true] {
+            let listener = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::net::TcpListener::bind("127.0.0.1:0"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let _socket = if connect {
+                Some(
+                    tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            let error = wait_for_redirect_code(
+                listener,
+                "nonce",
+                Duration::from_millis(100),
+                Duration::from_millis(30),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, SyncError::Timeout { .. }));
+            assert!(std::error::Error::source(&error).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_redirect_is_read_completely_and_responded_to() {
+        let listener = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpListener::bind("127.0.0.1:0"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let browser = async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut socket = tokio::net::TcpStream::connect(address).await?;
+                socket.write_all(b"GET /?code=a%2B").await?;
+                tokio::task::yield_now().await;
+                socket
+                    .write_all(b"b&state=nonce HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await?;
+                let mut response = Vec::new();
+                socket.read_to_end(&mut response).await?;
+                Ok::<_, std::io::Error>(response)
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let (code, response) = tokio::join!(
+            wait_for_redirect_code(
+                listener,
+                "nonce",
+                Duration::from_secs(2),
+                Duration::from_secs(1)
+            ),
+            browser,
+        );
+        assert_eq!(code.unwrap(), "a+b");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn exchange_failures_keep_timeout_classification_and_sanitized_sources() {
+        use crate::drive_client::tests::{Reply, Server};
+        for timeout in [false, true] {
+            let mut reply = Reply::json("private-auth-response");
+            if timeout {
+                reply.header_delay = Duration::from_millis(150);
+            }
+            let server = Server::start(vec![reply]);
+            let client = BasicClient::new(ClientId::new("fixture".into()))
+                .set_token_uri(TokenUrl::new(format!("{}/token", server.base)).unwrap());
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_millis(50))
+                .timeout(Duration::from_millis(75))
+                .build()
+                .unwrap();
+            let error = client
+                .exchange_code(AuthorizationCode::new("fixture-code".into()))
+                .request_async(&reqwest_http_client(http))
+                .await
+                .map_err(token_exchange_error)
+                .unwrap_err();
+            assert_eq!(matches!(error, SyncError::Timeout { .. }), timeout);
+            assert!(std::error::Error::source(&error).is_some());
+            assert!(!error.to_string().contains("private-auth-response"));
+            assert!(!error.to_string().contains("fixture-code"));
+        }
     }
 }
