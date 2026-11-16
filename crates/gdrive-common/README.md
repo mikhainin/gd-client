@@ -24,17 +24,18 @@ Older configurations without a path remain loadable, and absent paths are
 omitted when saving. Stored paths do not track remote moves or renames.
 
 `AppConfig::load`/`save` use the standard config location; `load_from`/`save_to`
-accept explicit paths. Saving creates parent directories and non-atomically
-overwrites the file as pretty TOML; a failed write may leave it truncated or
-partially written. Loading a missing file returns `AppConfig::default()`;
+accept explicit paths. Saving writes pretty TOML to a private, same-directory
+temporary file, syncs it, atomically replaces the configuration, and syncs the
+parent directory. Failures before replacement leave the previous file intact;
+a directory-sync failure after replacement is reported, but the file is already
+the complete new configuration. Loading a missing file returns `AppConfig::default()`;
 malformed or unreadable files return errors rather than being reset.
 These helpers perform deserialization, not semantic validation of paths,
 ownership, folder overlap, or polling values.
 
 Omitted TOML `sync_folders` defaults to an empty list and omitted
-`poll_interval_secs` defaults to 60. Note that the derived
-`AppConfig::default()` instead sets the interval to **0**, including on first
-load when no file exists; the sync engine clamps polling to at least 5 seconds.
+`poll_interval_secs` defaults to 60, also for `AppConfig::default()` and a missing
+configuration file. The sync engine clamps explicit intervals to at least 5 seconds.
 Other than the optional Drive ID/path, folder fields must be present in TOML.
 
 ## D-Bus contract
