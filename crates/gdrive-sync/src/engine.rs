@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gdrive_common::{local_roots, AppConfig, CommonError, SyncFolder};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -64,41 +64,111 @@ pub struct SyncEngine {
     tasks: Arc<Mutex<HashMap<Uuid, JoinHandle<()>>>>,
     status: StatusTracker,
     generation: Arc<AtomicU64>,
-    roots: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    roots: Arc<RootRegistry>,
+    blocked_roots: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+struct RootEntry {
+    folder_id: Uuid,
+    root: local_roots::ResolvedRoot,
+    retiring: bool,
+}
+
+struct RootRegistry {
+    active: Mutex<HashMap<u64, RootEntry>>,
+    changes: watch::Sender<()>,
+}
+
+impl Default for RootRegistry {
+    fn default() -> Self {
+        Self {
+            active: Mutex::default(),
+            changes: watch::channel(()).0,
+        }
+    }
+}
+
+impl RootRegistry {
+    fn retire(&self, folder_id: Uuid) {
+        for entry in self.active.lock().unwrap().values_mut() {
+            if entry.folder_id == folder_id {
+                entry.retiring = true;
+            }
+        }
+        self.changes.send_replace(());
+    }
 }
 
 struct RootLease {
-    roots: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    roots: Arc<RootRegistry>,
     generation: u64,
 }
 
 impl RootLease {
-    fn acquire(
-        roots: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    async fn acquire(
+        roots: Arc<RootRegistry>,
+        folder_id: Uuid,
         generation: u64,
-        root: &Path,
+        root: &local_roots::ResolvedRoot,
     ) -> Result<Self, SyncError> {
-        {
-            let mut active = roots.lock().unwrap();
-            if let Some(other) = active
-                .values()
-                .find(|other| local_roots::overlap(root, other))
-            {
-                return Err(CommonError::OverlappingRoots {
-                    first: root.to_path_buf(),
-                    second: other.clone(),
+        let acquire = async {
+            let mut changes = roots.changes.subscribe();
+            loop {
+                {
+                    let mut active = roots.active.lock().unwrap();
+                    let conflicts: Vec<_> = active
+                        .values()
+                        .filter(|entry| root.overlaps(&entry.root))
+                        .collect();
+                    if let Some(other) = conflicts.iter().find(|entry| !entry.retiring) {
+                        return Err(CommonError::OverlappingRoots {
+                            first: root.path.clone(),
+                            second: other.root.path.clone(),
+                        }
+                        .into());
+                    }
+                    if conflicts.is_empty() {
+                        active.insert(
+                            generation,
+                            RootEntry {
+                                folder_id,
+                                root: root.clone(),
+                                retiring: false,
+                            },
+                        );
+                        return Ok(Self {
+                            roots: Arc::clone(&roots),
+                            generation,
+                        });
+                    }
                 }
-                .into());
+                changes.changed().await.map_err(std::io::Error::other)?;
             }
-            active.insert(generation, root.to_path_buf());
-        }
-        Ok(Self { roots, generation })
+        };
+        tokio::time::timeout(Duration::from_secs(2), acquire)
+            .await
+            .map_err(|source| SyncError::Timeout {
+                operation: "waiting for a retiring local root",
+                source: Box::new(source),
+            })?
     }
 }
 
 impl Drop for RootLease {
     fn drop(&mut self) {
-        self.roots.lock().unwrap().remove(&self.generation);
+        self.roots.active.lock().unwrap().remove(&self.generation);
+        self.roots.changes.send_replace(());
+    }
+}
+
+fn blocking_fs<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    // Unlike detached tokio::fs work, mutations cannot outlive this worker's lease.
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
     }
 }
 
@@ -114,6 +184,7 @@ impl SyncEngine {
             status: StatusTracker::default(),
             generation: Arc::new(AtomicU64::new(0)),
             roots: Arc::default(),
+            blocked_roots: Arc::default(),
         }
     }
 
@@ -164,11 +235,13 @@ impl SyncEngine {
     /// Starts (or restarts) synchronisation for a single folder, spawning a
     /// background task that runs until [`Self::stop_folder`] is called or the
     /// task fails fatally. Restarting an already-running folder first aborts
-    /// and awaits its previous task. Root leases reject overlapping workers
+    /// its previous task. Root leases reject overlapping workers
     /// and survive stop/abort until the old worker has actually dropped.
     pub fn start_folder(&self, mut folder: SyncFolder) {
         let mut tasks = self.tasks.lock().unwrap();
         let previous = tasks.remove(&folder.id);
+        self.roots.retire(folder.id);
+        self.blocked_roots.lock().unwrap().remove(&folder.id);
         if let Some(previous) = &previous {
             previous.abort();
         }
@@ -184,21 +257,24 @@ impl SyncEngine {
 
         let handle = tokio::spawn(async move {
             let result = async {
-                if let Some(previous) = previous {
-                    match tokio::time::timeout(Duration::from_secs(2), previous).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) if error.is_cancelled() => {}
-                        Ok(Err(error)) => tracing::warn!(%error, "previous folder worker failed"),
-                        Err(source) => {
-                            return Err(SyncError::Timeout {
-                                operation: "waiting for previous folder worker to stop",
-                                source: Box::new(source),
-                            })
+                let root = local_roots::ResolvedRoot::new(&folder.local_path)?;
+                folder.local_path = root.path.clone();
+                let _lease = loop {
+                    match RootLease::acquire(Arc::clone(&roots), folder_id, generation, &root).await
+                    {
+                        Ok(lease) => break lease,
+                        Err(error @ SyncError::Timeout { .. }) => {
+                            run.finish("local roots", Err(error.to_string()));
+                            let _ = events.send(SyncEvent::Error {
+                                folder_id: Some(folder_id),
+                                message: error.to_string(),
+                            });
+                            tokio::time::sleep(poll_interval).await;
                         }
+                        Err(error) => return Err(error),
                     }
-                }
-                folder.local_path = local_roots::resolve(&folder.local_path)?;
-                let _lease = RootLease::acquire(roots, generation, &folder.local_path)?;
+                };
+                run.finish("local roots", Ok(()));
                 run_folder(
                     folder.clone(),
                     state_db,
@@ -226,9 +302,11 @@ impl SyncEngine {
     /// A no-op if the folder was never started or was already stopped.
     pub fn stop_folder(&self, folder_id: Uuid) {
         let mut tasks = self.tasks.lock().unwrap();
+        self.roots.retire(folder_id);
         if let Some(handle) = tasks.remove(&folder_id) {
             handle.abort();
         }
+        self.blocked_roots.lock().unwrap().remove(&folder_id);
         self.status.stop(folder_id);
     }
 
@@ -247,21 +325,39 @@ impl SyncEngine {
     /// initial daemon startup; use [`Self::start_folder`]/[`Self::stop_folder`]
     /// afterwards to react to configuration changes at runtime.
     pub fn start_all(&self, config: &AppConfig) {
-        let mut errors: HashMap<_, _> = local_roots::errors(&config.sync_folders)
+        let errors: HashMap<_, _> = local_roots::errors(&config.sync_folders)
             .into_iter()
             .collect();
         for folder in config.sync_folders.iter().filter(|f| f.enabled) {
-            if let Some(error) = errors.remove(&folder.id) {
+            if let Some(error) = errors.get(&folder.id) {
                 self.stop_folder(folder.id);
                 let generation = self.generation.fetch_add(1, Ordering::Relaxed);
                 let run = self.status.start(folder.id, generation);
                 run.finish("local roots", Err(error.to_string()));
+                self.blocked_roots.lock().unwrap().insert(folder.id);
                 let _ = self.events.send(SyncEvent::Error {
                     folder_id: Some(folder.id),
                     message: error.to_string(),
                 });
                 continue;
             }
+            self.start_folder(folder.clone());
+        }
+    }
+
+    /// Retry only bindings blocked by startup root validation, not unrelated failures.
+    pub fn reconcile_blocked_roots(&self, config: &AppConfig) {
+        let blocked = self.blocked_roots.lock().unwrap().clone();
+        if blocked.is_empty() {
+            return;
+        }
+        let errors: HashSet<_> = local_roots::errors(&config.sync_folders)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for folder in config.sync_folders.iter().filter(|folder| {
+            folder.enabled && blocked.contains(&folder.id) && !errors.contains(&folder.id)
+        }) {
             self.start_folder(folder.clone());
         }
     }
@@ -279,7 +375,7 @@ async fn run_folder(
         folder_id: folder.id,
     });
 
-    tokio::fs::create_dir_all(&folder.local_path).await?;
+    blocking_fs(|| std::fs::create_dir_all(&folder.local_path))?;
     let (owner_uid, owner_gid) = resolve_owner(&folder.owner_user, &folder.owner_group);
 
     let root_folder_id = folder
@@ -571,11 +667,12 @@ async fn preserve_local_path(
     let path = Path::new(key);
     let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
-    tokio::fs::rename(
-        folder.local_path.join(path),
-        folder.local_path.join(&conflict),
-    )
-    .await?;
+    blocking_fs(|| {
+        std::fs::rename(
+            folder.local_path.join(path),
+            folder.local_path.join(&conflict),
+        )
+    })?;
     state_db.queue_local_change(folder.id, &conflict_key)?;
     if tokio::fs::metadata(folder.local_path.join(&conflict))
         .await?
@@ -597,7 +694,8 @@ async fn atomic_download_checked(
     content: &[u8],
     expected: Option<&[u8]>,
 ) -> Result<bool, SyncError> {
-    use tokio::io::AsyncWriteExt;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let parent = path
         .parent()
         .ok_or_else(|| SyncError::Api("download has no parent".into()))?;
@@ -606,24 +704,24 @@ async fn atomic_download_checked(
             return Ok(false);
         }
     } else {
-        tokio::fs::create_dir_all(parent).await?;
+        blocking_fs(|| std::fs::create_dir_all(parent))?;
     }
     let temporary = parent.join(format!(".gdrive-download-{}", Uuid::new_v4()));
     let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
-            .await?;
-        match tokio::fs::metadata(path).await {
-            Ok(metadata) => file.set_permissions(metadata.permissions()).await?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        file.write_all(content).await?;
-        file.sync_all().await?;
-        drop(file);
+        blocking_fs(|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            match std::fs::metadata(path) {
+                Ok(metadata) => file.set_permissions(metadata.permissions())?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            file.write_all(content)?;
+            file.sync_all()
+        })?;
         if let Some(expected) = expected {
             let unchanged = match tokio::fs::read(path).await {
                 Ok(current) => current == expected,
@@ -631,16 +729,16 @@ async fn atomic_download_checked(
                 Err(error) => return Err(error.into()),
             };
             if !unchanged {
-                tokio::fs::remove_file(&temporary).await?;
+                blocking_fs(|| std::fs::remove_file(&temporary))?;
                 return Ok(false);
             }
         }
-        tokio::fs::rename(&temporary, path).await?;
+        blocking_fs(|| std::fs::rename(&temporary, path))?;
         Ok::<bool, SyncError>(true)
     }
     .await;
     if result.is_err() {
-        if let Err(error) = tokio::fs::remove_file(&temporary).await {
+        if let Err(error) = blocking_fs(|| std::fs::remove_file(&temporary)) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!("could not remove incomplete download: {error}");
             }
@@ -807,9 +905,9 @@ async fn initial_pull(
                             preserve_local_path(folder, state_db, &rel_path).await?;
                         }
                     } else if at_path.is_folder {
-                        tokio::fs::remove_dir_all(&local_path).await?;
+                        blocking_fs(|| std::fs::remove_dir_all(&local_path))?;
                     } else {
-                        tokio::fs::remove_file(&local_path).await?;
+                        blocking_fs(|| std::fs::remove_file(&local_path))?;
                     }
                     state_db.remove_file_state(folder.id, &rel_path)?;
                 }
@@ -829,7 +927,7 @@ async fn initial_pull(
             {
                 preserve_local_path(folder, state_db, &rel_path).await?;
             }
-            tokio::fs::create_dir_all(&local_path).await?;
+            blocking_fs(|| std::fs::create_dir_all(&local_path))?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, true)?;
             Box::pin(initial_pull(
@@ -921,9 +1019,9 @@ async fn relocate_remote_entry(
         return Ok(false);
     }
     if let Some(parent) = new.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        blocking_fs(|| std::fs::create_dir_all(parent))?;
     }
-    tokio::fs::rename(&old, &new).await?;
+    blocking_fs(|| std::fs::rename(&old, &new))?;
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, rel_path)?;
     Ok(true)
 }
@@ -1512,7 +1610,7 @@ async fn poll_remote_changes(
                         {
                             preserve_local_path(folder, state_db, &key).await?;
                         }
-                        tokio::fs::create_dir_all(folder.local_path.join(&rel_path)).await?;
+                        blocking_fs(|| std::fs::create_dir_all(folder.local_path.join(&rel_path)))?;
                         apply_ownership(&folder.local_path.join(&rel_path), owner_uid, owner_gid)?;
                         record_state(folder.id, state_db, &key, item, true)?;
                     }
@@ -1598,9 +1696,9 @@ async fn poll_remote_changes(
             status.active();
             if local_path.exists() {
                 if existing.is_folder {
-                    tokio::fs::remove_dir_all(&local_path).await?;
+                    blocking_fs(|| std::fs::remove_dir_all(&local_path))?;
                 } else {
-                    tokio::fs::remove_file(&local_path).await?;
+                    blocking_fs(|| std::fs::remove_file(&local_path))?;
                 }
             }
             state_db.remove_file_state(folder.id, &existing.local_rel_path)?;
@@ -1663,16 +1761,14 @@ mod tests {
 
     #[tokio::test]
     async fn startup_blocks_all_overlapping_roots_without_touching_them() {
-        let server = Server::start(vec![
-            Reply::json(r#"{"startPageToken":"start"}"#),
-            Reply::json(r#"{"files":[]}"#),
-            Reply::json(r#"{"changes":[],"newStartPageToken":"next"}"#),
-        ]);
+        let server = Server::start((0..10).map(|_| Reply::json(
+            r#"{"startPageToken":"start","files":[],"changes":[],"newStartPageToken":"next"}"#
+        )).collect());
         let root = std::env::temp_dir().join(format!("gdrive-overlap-{}", Uuid::new_v4()));
         let first = SyncFolder::new("one", root.join("files"), "", "");
         let second = SyncFolder::new("two", root.join("files/nested"), "", "");
         let unrelated = SyncFolder::new("unrelated", root.join("sibling"), "", "");
-        let config = AppConfig {
+        let mut config = AppConfig {
             sync_folders: vec![first.clone(), second.clone(), unrelated.clone()],
             ..AppConfig::default()
         };
@@ -1708,9 +1804,32 @@ mod tests {
                 .any(|error| error.contains("roots overlap")));
         }
         assert_eq!(engine.running_folders(), vec![unrelated.id]);
+        let unrelated_task = engine.tasks.lock().unwrap()[&unrelated.id].id();
+        config.sync_folders[1].enabled = false;
+        engine.stop_folder(second.id);
+        engine.reconcile_blocked_roots(&config);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(events.recv().await.unwrap(),
+                SyncEvent::InitialSyncComplete { folder_id, .. } if folder_id == first.id)
+            {
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.tasks.lock().unwrap()[&unrelated.id].id(),
+            unrelated_task
+        );
+        assert!(engine.running_folders().contains(&first.id));
+        assert!(engine
+            .sync_status()
+            .folders
+            .iter()
+            .all(|folder| folder.errors.is_empty()));
+        engine.stop_folder(first.id);
         engine.stop_folder(unrelated.id);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !engine.roots.lock().unwrap().is_empty() {
+            while !engine.roots.active.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1747,14 +1866,7 @@ mod tests {
             b"old"
         );
         engine.stop_folder(first.id);
-        assert!(!engine.roots.lock().unwrap().is_empty());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !engine.roots.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(!engine.roots.active.lock().unwrap().is_empty());
         engine.start_folder(second.clone());
         tokio::time::timeout(Duration::from_secs(2), async {
             while !matches!(events.recv().await.unwrap(),
@@ -1765,7 +1877,7 @@ mod tests {
         .unwrap();
         engine.stop_folder(second.id);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !engine.roots.lock().unwrap().is_empty() {
+            while !engine.roots.active.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1773,6 +1885,86 @@ mod tests {
         .unwrap();
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_ids_cannot_consume_a_startup_overlap_error() {
+        let server = Server::start(vec![]);
+        let (root, first, engine) = local_fixture(&server, b"keep").await;
+        let mut second = first.clone();
+        second.local_path = first.local_path.join("nested");
+        let config = AppConfig {
+            sync_folders: vec![first.clone(), second],
+            ..AppConfig::default()
+        };
+        engine.start_all(&config);
+        assert!(engine.running_folders().is_empty());
+        assert!(engine.sync_status().folders[0].errors[0].contains("roots overlap"));
+        assert!(!first.local_path.join("nested").exists());
+        assert_eq!(
+            std::fs::read(first.local_path.join("file.txt")).unwrap(),
+            b"keep"
+        );
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_worker_cannot_release_its_root_during_a_filesystem_mutation() {
+        let path = std::env::temp_dir().join(format!("gdrive-root-lifetime-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let root = local_roots::ResolvedRoot::new(&path).unwrap();
+        let roots = Arc::new(RootRegistry::default());
+        let folder_id = Uuid::new_v4();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let worker = tokio::spawn({
+            let roots = Arc::clone(&roots);
+            let root = root.clone();
+            async move {
+                let _lease = RootLease::acquire(roots, folder_id, 1, &root)
+                    .await
+                    .unwrap();
+                blocking_fs(|| {
+                    entered.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(3))
+                        .map_err(std::io::Error::other)?;
+                    std::fs::write(root.path.join("finished"), b"old mutation finished")
+                })
+                .unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
+        roots.retire(folder_id);
+        worker.abort();
+        let mut replacement = tokio::spawn({
+            let roots = Arc::clone(&roots);
+            async move {
+                let _lease = RootLease::acquire(roots, Uuid::new_v4(), 2, &root)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(root.path.join("finished")).unwrap(),
+                    b"old mutation finished"
+                );
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut replacement)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), replacement)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = worker.await;
+        assert!(roots.active.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     const UPLOADED_NEW: &str = r#"{"id":"new-id","name":"file.txt","mimeType":"text/plain","md5Checksum":"22af645d1859cb5ca6da0c484f1f37ea"}"#;

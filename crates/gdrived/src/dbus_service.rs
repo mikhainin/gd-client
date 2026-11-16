@@ -302,6 +302,7 @@ impl GDriveService {
         self.persist(&config)?;
         state.config = config;
         self.engine.stop_folder(folder_id);
+        self.engine.reconcile_blocked_roots(&state.config);
         Ok(())
     }
 
@@ -331,6 +332,7 @@ impl GDriveService {
             self.engine.start_folder(folder);
         } else {
             self.engine.stop_folder(folder_id);
+            self.engine.reconcile_blocked_roots(&state.config);
         }
         Ok(())
     }
@@ -523,6 +525,36 @@ mod tests {
             access_token: "fixture-token".into(),
             refresh_token: None,
             expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_or_disabling_a_conflict_restarts_the_other_blocked_binding() {
+        for remove in [false, true] {
+            let fixture = Fixture::new(AppConfig::default());
+            let first = fixture.folder("first");
+            let second = fixture.folder("first/nested");
+            {
+                let mut state = fixture.service.state.lock().await;
+                state.config.sync_folders = vec![first.clone(), second.clone()];
+                fixture.service.engine.start_all(&state.config);
+            }
+            assert!(fixture.service.engine.running_folders().is_empty());
+            if remove {
+                fixture
+                    .service
+                    .remove_sync_folder(second.id.to_string())
+                    .await
+                    .unwrap();
+            } else {
+                fixture
+                    .service
+                    .set_folder_enabled(second.id.to_string(), false)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(fixture.service.engine.running_folders(), vec![first.id]);
+            fixture.service.engine.stop_folder(first.id);
         }
     }
 

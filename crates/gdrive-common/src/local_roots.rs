@@ -6,6 +6,34 @@ use uuid::Uuid;
 
 use crate::{CommonError, SyncFolder};
 
+mod mounts;
+
+#[derive(Clone)]
+pub struct ResolvedRoot {
+    pub path: PathBuf,
+    backing: Vec<mounts::BackingRoot>,
+}
+
+impl ResolvedRoot {
+    pub fn new(path: &Path) -> Result<Self, CommonError> {
+        let path = resolve(path)?;
+        let backing = mounts::footprints(&path).map_err(|source| CommonError::LocalRoot {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { path, backing })
+    }
+
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.backing.iter().any(|first| {
+            other
+                .backing
+                .iter()
+                .any(|second| first.device == second.device && overlap(&first.path, &second.path))
+        })
+    }
+}
+
 /// Canonicalize existing components, preserving a normalized not-yet-created suffix.
 /// Dangling symlinks and uninspectable components fail closed.
 pub fn resolve(path: &Path) -> Result<PathBuf, CommonError> {
@@ -50,7 +78,7 @@ fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// Compare directory components, not string prefixes such as `photos`/`photos-old`.
-pub fn overlap(first: &Path, second: &Path) -> bool {
+fn overlap(first: &Path, second: &Path) -> bool {
     first.starts_with(second) || second.starts_with(first)
 }
 
@@ -59,17 +87,17 @@ pub fn errors(folders: &[SyncFolder]) -> Vec<(Uuid, CommonError)> {
     let mut errors = Vec::new();
     let mut roots = Vec::new();
     for folder in folders.iter().filter(|folder| folder.enabled) {
-        match resolve(&folder.local_path) {
+        match ResolvedRoot::new(&folder.local_path) {
             Ok(root) => roots.push((folder.id, root)),
             Err(error) => errors.push((folder.id, error)),
         }
     }
     for (index, (id, root)) in roots.iter().enumerate() {
         for (other_id, other) in &roots[index + 1..] {
-            if overlap(root, other) {
+            if root.overlaps(other) {
                 let conflict = || CommonError::OverlappingRoots {
-                    first: root.clone(),
-                    second: other.clone(),
+                    first: root.path.clone(),
+                    second: other.path.clone(),
                 };
                 errors.extend([(*id, conflict()), (*other_id, conflict())]);
             }
@@ -101,7 +129,7 @@ mod tests {
                 SyncFolder::new("sibling", root.join("real-sibling"), "", ""),
             ];
             let issues = errors(&folders);
-            assert_eq!(issues.len(), 2, "{first}, {second}");
+            assert_eq!(issues.len(), 2, "{first}, {second}: {issues:?}");
             assert_eq!(issues[0].0, folders[0].id);
             assert_eq!(issues[1].0, folders[1].id);
         }

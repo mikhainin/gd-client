@@ -34,7 +34,10 @@ the complete new configuration. Loading a missing file returns `AppConfig::defau
 malformed or unreadable files return errors rather than being reset.
 These helpers perform deserialization, not semantic validation of paths,
 ownership, folder overlap, or polling values. `validate_local_roots` separately
-rejects equal/nested enabled roots, including symlink aliases. Existing directory
+rejects equal/nested enabled roots, including symlink and bind-mount aliases.
+Linux mount information and descriptor mount IDs map each root and any nested
+mounts to their backing filesystem paths; unavailable or inconsistent mount
+information fails closed. Existing directory
 components are canonicalized before normalizing `..`; missing suffixes are
 allowed without creating anything. Dangling symlinks, non-directory components,
 and inaccessible paths fail explicitly with a preserved I/O source. Disabled
