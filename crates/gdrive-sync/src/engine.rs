@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::drive_client::{DriveClient, DriveFile, FOLDER_MIME_TYPE};
 use crate::error::SyncError;
 use crate::google_document;
-use crate::local_watcher::{is_download_staging, path_key, LocalChange, LocalWatcher};
+use crate::local_watcher::{is_internal_path, path_key, LocalChange, LocalWatcher};
 use crate::ownership::{apply_ownership, resolve_owner};
 use crate::state_db::{FileStateEntry, PendingUpload, StateDb};
 use crate::sync_status::{FolderRun, StatusTracker};
@@ -500,11 +500,10 @@ async fn preserve_local_path(
     let path = Path::new(key);
     let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
-    tokio::fs::rename(
-        folder.local_path.join(path),
-        folder.local_path.join(&conflict),
-    )
-    .await?;
+    crate::recovery::rename_no_replace(
+        &folder.local_path.join(path),
+        &folder.local_path.join(&conflict),
+    )?;
     state_db.queue_local_change(folder.id, &conflict_key)?;
     if tokio::fs::metadata(folder.local_path.join(&conflict))
         .await?
@@ -521,10 +520,50 @@ async fn atomic_download(path: &Path, content: &[u8]) -> Result<(), SyncError> {
         .map(|_| ())
 }
 
+async fn download_tracked(
+    path: &Path,
+    content: &[u8],
+    existing: &FileStateEntry,
+) -> Result<bool, SyncError> {
+    let current = match tokio::fs::read(path).await {
+        Ok(current) => current,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if existing.md5_checksum.as_ref() != Some(&format!("{:x}", md5::compute(&current))) {
+        return Ok(false);
+    }
+    atomic_download_checked(path, content, Some(&current)).await
+}
+
 async fn atomic_download_checked(
     path: &Path,
     content: &[u8],
     expected: Option<&[u8]>,
+) -> Result<bool, SyncError> {
+    atomic_download_with(path, content, expected, |_| Ok(())).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadPhase {
+    Checked,
+    Archived,
+}
+
+async fn atomic_download_with(
+    path: &Path,
+    content: &[u8],
+    expected: Option<&[u8]>,
+    mut before_publish: impl FnMut(DownloadPhase) -> std::io::Result<()>,
 ) -> Result<bool, SyncError> {
     use tokio::io::AsyncWriteExt;
     let parent = path
@@ -564,7 +603,15 @@ async fn atomic_download_checked(
                 return Ok(false);
             }
         }
-        tokio::fs::rename(&temporary, path).await?;
+        before_publish(DownloadPhase::Checked)?;
+        let archived = crate::recovery::archive(path)?;
+        if expected.is_some() && archived.is_none() {
+            tokio::fs::remove_file(&temporary).await?;
+            return Ok(false);
+        }
+        before_publish(DownloadPhase::Archived)?;
+        crate::recovery::rename_no_replace(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok::<bool, SyncError>(true)
     }
     .await;
@@ -735,10 +782,8 @@ async fn initial_pull(
                         if tokio::fs::try_exists(&local_path).await? {
                             preserve_local_path(folder, state_db, &rel_path).await?;
                         }
-                    } else if at_path.is_folder {
-                        tokio::fs::remove_dir_all(&local_path).await?;
                     } else {
-                        tokio::fs::remove_file(&local_path).await?;
+                        crate::recovery::archive(&local_path)?;
                     }
                     state_db.remove_file_state(folder.id, &rel_path)?;
                 }
@@ -783,14 +828,16 @@ async fn initial_pull(
             }
             let content = download_content(drive, &child).await?;
             if let Some(existing) = state_db.find_by_drive_id(folder.id, &child.id)? {
-                if local_file_changed(&local_path, &existing).await? {
+                if !download_tracked(&local_path, &content, &existing).await? {
                     state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
                     continue;
                 }
-            } else if tokio::fs::try_exists(&local_path).await? {
-                preserve_local_path(folder, state_db, &rel_path).await?;
+            } else {
+                if tokio::fs::try_exists(&local_path).await? {
+                    preserve_local_path(folder, state_db, &rel_path).await?;
+                }
+                atomic_download(&local_path, &content).await?;
             }
-            atomic_download(&local_path, &content).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, false)?;
             *synced += 1;
@@ -801,7 +848,13 @@ async fn initial_pull(
 }
 
 fn validate_remote_name(name: &str) -> Result<(), SyncError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name == crate::recovery::DIRECTORY
+        || name.contains('/')
+        || name.contains('\0')
+    {
         return Err(SyncError::Api(
             "Drive name cannot be represented safely as a local filename".into(),
         ));
@@ -852,7 +905,11 @@ async fn relocate_remote_entry(
     if let Some(parent) = new.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::rename(&old, &new).await?;
+    match crate::recovery::rename_no_replace(&old, &new) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, rel_path)?;
     Ok(true)
 }
@@ -966,8 +1023,12 @@ async fn queue_dirty_descendants(
         };
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
+            if entry.file_name() == crate::recovery::DIRECTORY {
+                crate::recovery::validate(&path)?;
+                continue;
+            }
             let relative = path.strip_prefix(&folder.local_path)?;
-            if is_download_staging(relative) {
+            if is_internal_path(relative) {
                 continue;
             }
             let key = path_key(relative)?;
@@ -1525,13 +1586,7 @@ async fn poll_remote_changes(
 
         if deleted {
             status.active();
-            if local_path.exists() {
-                if existing.is_folder {
-                    tokio::fs::remove_dir_all(&local_path).await?;
-                } else {
-                    tokio::fs::remove_file(&local_path).await?;
-                }
-            }
+            crate::recovery::archive(&local_path)?;
             state_db.remove_file_state(folder.id, &existing.local_rel_path)?;
             continue;
         }
@@ -1551,12 +1606,11 @@ async fn poll_remote_changes(
             }
             status.active();
             let content = download_content(drive, &remote_file).await?;
-            if local_file_changed(&local_path, &existing).await? {
+            if !download_tracked(&local_path, &content, &existing).await? {
                 state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
                 deferred = true;
                 continue;
             }
-            atomic_download(&local_path, &content).await?;
             apply_ownership(&local_path, owner_uid, owner_gid)?;
             record_state(
                 folder.id,
@@ -2040,6 +2094,78 @@ mod tests {
             .unwrap()
             .contains(&key));
         assert!(server.requests.try_iter().next().is_none());
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_publication_keeps_late_writes_and_never_replaces_a_new_destination() {
+        use std::io::Write;
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        let path = folder.local_path.join("file.txt");
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        atomic_download_with(&path, b"remote", Some(b"old"), |phase| {
+            if phase == DownloadPhase::Archived {
+                writer.write_all(b"-late")?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"remote");
+        let recovery = path.parent().unwrap().join(crate::recovery::DIRECTORY);
+        let entries: Vec<_> = std::fs::read_dir(&recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry.is_dir())
+            .collect();
+        assert_eq!(
+            std::fs::read(entries[0].join("file.txt")).unwrap(),
+            b"old-late"
+        );
+        let error = atomic_download_with(&path, b"new remote", Some(b"remote"), |phase| {
+            if phase == DownloadPhase::Archived {
+                std::fs::write(&path, b"new local")?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SyncError::Io(ref source)
+            if source.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new local");
+        assert!(
+            !atomic_download_with(&path, b"remote", Some(b"new local"), |phase| {
+                if phase == DownloadPhase::Checked {
+                    std::fs::remove_file(&path)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap()
+        );
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".gdrive-download-")));
+        queue_dirty_descendants(&folder, &engine.state_db, &folder.local_path)
+            .await
+            .unwrap();
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .iter()
+            .all(|key| !key.contains(crate::recovery::DIRECTORY)));
+        assert!(validate_remote_name(crate::recovery::DIRECTORY).is_err());
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

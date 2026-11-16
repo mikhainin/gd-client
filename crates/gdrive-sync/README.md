@@ -230,12 +230,25 @@ Office/PDF exports; other native Google file types and Drive shortcuts are not
 implemented.
 
 Uploads are not resumable; uploads and downloads buffer whole files in memory.
-Remote metadata writes are not conditional transactions, and filesystem
-checks are not atomic with the subsequent write/removal. Replacement retention
+Local replacement downloads and clean remote removals retain the displaced
+file/directory in its parent's `.gdrive-recovery/<entry-id>/<original-name>`.
+Renames retain the original inode, including subsequent writes through existing
+open handles; publication and remote moves use Linux `RENAME_NOREPLACE` and fail
+closed rather than overwriting a concurrently created destination. Detected dirty
+paths still use the visible conflict-copy workflow described above.
+Recovery directories are private, excluded from scans/uploads, and never cleaned
+automatically. Restore entries manually to an ordinary path after pausing sync.
+The name `.gdrive-recovery` is reserved at every depth: unmanaged existing paths
+and remote items with that name cause an explicit error, not silent adoption.
+Unsupported no-replace renames and cross-filesystem moves are errors, never
+copy-and-delete fallbacks. Recovery consumes local disk and is not an independent
+backup or protection against disk failure.
+
+Remote metadata writes are not conditional transactions. Replacement retention
 avoids the check-then-Trash content race without relying on unsupported v3
 conditional-write headers or the v2 API.
 Concurrent renames can still cause naming conflicts, which are reported rather
 than resolved by choosing an arbitrary ID. Explicit local deletions still trash
 their tracked remote items and are not transactional multi-client arbitration.
-Remote deletions remove unchanged local items; detected local edits are preserved
+Remote deletions move unchanged local items into recovery; detected local edits are preserved
 as conflict copies. Drive Trash and retained history are not independent backups.

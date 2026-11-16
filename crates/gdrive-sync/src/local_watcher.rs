@@ -57,7 +57,7 @@ impl LocalWatcher {
                         let Ok(relative) = path.strip_prefix(&watched_root) else {
                             continue;
                         };
-                        if relative.as_os_str().is_empty() || is_download_staging(relative) {
+                        if relative.as_os_str().is_empty() || is_internal_path(relative) {
                             continue;
                         }
                         let result = path_key(relative)
@@ -85,12 +85,11 @@ pub(crate) fn path_key(path: &Path) -> Result<String, SyncError> {
     Ok(std::str::from_utf8(path.as_os_str().as_bytes())?.to_owned())
 }
 
-pub(crate) fn is_download_staging(path: &Path) -> bool {
+pub(crate) fn is_internal_path(path: &Path) -> bool {
     path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| name.starts_with(".gdrive-download-"))
+        component.as_os_str().to_str().is_some_and(|name| {
+            name.starts_with(".gdrive-download-") || name == crate::recovery::DIRECTORY
+        })
     })
 }
 
@@ -108,6 +107,18 @@ fn classify(kind: &EventKind) -> Option<LocalChangeKind> {
 mod tests {
     use super::*;
     use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+
+    #[test]
+    fn recovery_entries_and_download_staging_never_enter_the_upload_queue() {
+        for key in [
+            ".gdrive-recovery/id/file",
+            "folder/.gdrive-recovery/id/child",
+            "folder/.gdrive-download-id",
+        ] {
+            assert!(is_internal_path(Path::new(key)));
+        }
+        assert!(!is_internal_path(Path::new("recovery/file")));
+    }
 
     #[test]
     fn non_utf8_paths_fail_explicitly_instead_of_aliasing_another_file() {

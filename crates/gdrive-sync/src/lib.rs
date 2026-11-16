@@ -13,4 +13,5 @@ pub mod state_db;
 
 pub use engine::{SyncEngine, SyncEvent};
 pub use error::SyncError;
+mod recovery;
 mod sync_status;
