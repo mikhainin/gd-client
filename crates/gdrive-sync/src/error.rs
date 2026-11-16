@@ -13,6 +13,9 @@ pub enum SyncError {
     #[error("local filesystem watcher error: {0}")]
     Notify(#[from] notify::Error),
 
+    #[error("local watch descriptor budget reached; unwatched directories use periodic scans")]
+    WatchLimit(#[source] tokio::sync::TryAcquireError),
+
     #[error("local filenames must be valid UTF-8; the path was not changed or normalized")]
     LocalPathEncoding(#[from] std::str::Utf8Error),
 

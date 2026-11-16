@@ -2760,6 +2760,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_directory_replacing_a_tracked_file_is_queued_not_a_fatal_download_error() {
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        let path = folder.local_path.join("file.txt");
+        let existing = engine
+            .state_db
+            .find_by_local_path(folder.id, "file.txt")
+            .unwrap()
+            .unwrap();
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!download_tracked(&folder, &path, b"remote", &existing)
+            .await
+            .unwrap());
+        scan_local_changes(&folder, &engine.state_db).await.unwrap();
+        assert!(engine
+            .state_db
+            .has_pending_local_change(folder.id, "file.txt")
+            .unwrap());
+        assert!(path.is_dir());
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn staged_publication_keeps_late_writes_and_never_replaces_a_new_destination() {
         use std::io::Write;
         let server = Server::start(vec![]);

@@ -248,6 +248,10 @@ feature in packaged binaries.
   Enumeration rejects descendant symlinks; registrations retain validated
   directory descriptors and translate descriptor-based events back to live paths.
   A failed inspection removes registrations absent from its verified prefix.
+  Refresh retains existing pins rather than duplicating the full descriptor set.
+  All folder watchers share at most one quarter of the process's soft file
+  descriptor limit (capped at 4096 pins); additional directories use periodic
+  scans and report an explicit watch-budget status instead of stopping sync.
   Refresh walks and recovery metadata writes/flushes use non-detached blocking
   sections, preserving root leases without occupying async executor workers.
   New live directories are picked up between engine iterations, with periodic

@@ -198,7 +198,7 @@ impl LocalFs<'_> {
         blocking_fs(|| {
             let pinned = self.file(path, libc::O_PATH | libc::O_NOFOLLOW)?;
             if !pinned.metadata()?.is_file() {
-                return Err(io::Error::other("local data must be a regular file"));
+                return Err(io::ErrorKind::IsADirectory.into());
             }
             let file = File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
             let mut content = Vec::new();

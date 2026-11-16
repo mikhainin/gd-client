@@ -6,10 +6,10 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SyncError;
 use crate::local_fs::{blocking_fs, Directory, LocalFs};
@@ -42,17 +42,35 @@ pub struct LocalWatcher {
     root: PathBuf,
     watched: HashMap<PathBuf, WatchedDirectory>,
     paths: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    budget: Arc<Semaphore>,
 }
 
 struct WatchedDirectory {
     directory: Directory,
     identity: (u64, u64),
+    _permit: OwnedSemaphorePermit,
 }
 
 impl WatchedDirectory {
     fn watch_path(&self) -> PathBuf {
         self.directory.path(OsStr::new("."))
     }
+}
+
+fn watch_budget() -> std::io::Result<Arc<Semaphore>> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    if let Some(budget) = BUDGET.get() {
+        return Ok(Arc::clone(budget));
+    }
+    let mut limit = std::mem::MaybeUninit::<nix::libc::rlimit>::uninit();
+    if unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let limit = unsafe { limit.assume_init() };
+    let permits = (limit.rlim_cur.min(16_384) / 4) as usize;
+    Ok(Arc::clone(
+        BUDGET.get_or_init(|| Arc::new(Semaphore::new(permits))),
+    ))
 }
 
 impl LocalWatcher {
@@ -62,6 +80,16 @@ impl LocalWatcher {
         folder_id: Uuid,
         state_db: Arc<StateDb>,
         sender: mpsc::UnboundedSender<Result<LocalChange, SyncError>>,
+    ) -> Result<Self, SyncError> {
+        Self::watch_with_budget(root, folder_id, state_db, sender, watch_budget()?)
+    }
+
+    fn watch_with_budget(
+        root: &Path,
+        folder_id: Uuid,
+        state_db: Arc<StateDb>,
+        sender: mpsc::UnboundedSender<Result<LocalChange, SyncError>>,
+        budget: Arc<Semaphore>,
     ) -> Result<Self, SyncError> {
         let watched_root = root.to_path_buf();
         let paths = Arc::new(Mutex::new(HashMap::<PathBuf, PathBuf>::new()));
@@ -108,8 +136,13 @@ impl LocalWatcher {
             root: root.to_path_buf(),
             watched: HashMap::new(),
             paths,
+            budget,
         };
-        watcher.refresh()?;
+        match watcher.refresh() {
+            Ok(()) => {}
+            Err(error @ SyncError::WatchLimit(_)) => tracing::warn!(%error),
+            Err(error) => return Err(error),
+        }
         Ok(watcher)
     }
 
@@ -149,15 +182,8 @@ impl LocalWatcher {
                             directories.push(path);
                         }
                     }
-                    let pin = items.into_directory();
-                    let metadata = pin.metadata()?;
-                    desired.insert(
-                        directory,
-                        WatchedDirectory {
-                            directory: pin,
-                            identity: (metadata.dev(), metadata.ino()),
-                        },
-                    );
+                    let metadata = items.into_directory().metadata()?;
+                    desired.insert(directory, (metadata.dev(), metadata.ino()));
                 }
                 Ok::<_, SyncError>(())
             })();
@@ -167,7 +193,7 @@ impl LocalWatcher {
                 .filter(|(path, watched)| {
                     desired
                         .get(*path)
-                        .is_none_or(|current| current.identity != watched.identity)
+                        .is_none_or(|current| *current != watched.identity)
                 })
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>()
@@ -186,10 +212,36 @@ impl LocalWatcher {
                 self.watched.remove(&path);
             }
             inspection?;
-            for (path, watched) in desired {
+            let mut exhausted = None;
+            for (path, identity) in desired {
                 if self.watched.contains_key(&path) {
                     continue;
                 }
+                let permit = match Arc::clone(&self.budget).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        exhausted.get_or_insert(SyncError::WatchLimit(error));
+                        continue;
+                    }
+                };
+                let directory = match LocalFs(&self.root).read_dir(&path) {
+                    Ok(items) => items.into_directory(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let metadata = directory.metadata()?;
+                if (metadata.dev(), metadata.ino()) != identity {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "directory identity changed before watch registration; retry",
+                    )
+                    .into());
+                }
+                let watched = WatchedDirectory {
+                    directory,
+                    identity,
+                    _permit: permit,
+                };
                 let registered = watched.watch_path();
                 self.paths
                     .lock()
@@ -207,7 +259,7 @@ impl LocalWatcher {
                     }
                 }
             }
-            Ok(())
+            exhausted.map_or(Ok(()), Err)
         })
     }
 }
@@ -241,6 +293,40 @@ mod tests {
     use super::*;
     use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
     use std::collections::HashSet;
+
+    #[test]
+    fn descriptor_budget_preserves_existing_pins_and_allows_polling_fallback() {
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        for index in 0..12 {
+            std::fs::create_dir_all(root.join(index.to_string())).unwrap();
+        }
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(4));
+        let mut watcher = LocalWatcher::watch_with_budget(
+            &root,
+            Uuid::new_v4(),
+            state,
+            sender,
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        assert_eq!(watcher.watched.len(), 4);
+        assert_eq!(budget.available_permits(), 0);
+        let pins: HashMap<_, _> = watcher
+            .watched
+            .iter()
+            .map(|(path, watched)| (path.clone(), watched.watch_path()))
+            .collect();
+        assert!(matches!(watcher.refresh(), Err(SyncError::WatchLimit(_))));
+        for (path, registered) in pins {
+            assert_eq!(watcher.watched[&path].watch_path(), registered);
+        }
+        drop(watcher);
+        assert_eq!(budget.available_permits(), 4);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
