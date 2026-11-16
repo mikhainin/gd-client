@@ -195,7 +195,11 @@ feature in packaged binaries.
   Only a confirmed HTTP 404 is treated as an absent recovery target or an
   already-removed Trash target; other failures remain errors.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
-  sync folder's local path. Read/access and metadata-only events, including
+  sync folder's local path. Individual nonrecursive registrations cover live
+  directories only; registration refreshes exclude recovery/staging trees and
+  remove watches when directories move into history. New live directories are
+  picked up between engine iterations, with periodic scans covering missed
+  notifications. Read/access and metadata-only events, including
   ownership changes made by the daemon, are ignored; content changes remain
   queued and reconciled. The watcher callback persists paths independently of
   the transfer loop, before sending a wake-up notification. Queue revisions
@@ -252,8 +256,13 @@ disappeared. A daemon stop or failed publication is not inferred as user deletio
 of the live Drive item. Marker/journal reads reject non-regular files.
 Recovery directories are private, excluded from scans/uploads, and never cleaned
 automatically. Restore entries manually to an ordinary path after pausing sync.
+The owner marker is synced in an excluded `.gdrive-recovery-init-<id>` staging
+directory before no-replace publication; an interrupted/failed initialization
+cannot publish an incomplete recovery store or block later retries.
 The name `.gdrive-recovery` is reserved at every depth: unmanaged existing paths
 and remote items with that name cause an explicit error, not silent adoption.
+The `.gdrive-download-` and `.gdrive-recovery-init-` prefixes are likewise reserved
+for internal staging and rejected in remote names.
 Unsupported no-replace renames and cross-filesystem moves are errors, never
 copy-and-delete fallbacks. Recovery consumes local disk and is not an independent
 backup or protection against disk failure.

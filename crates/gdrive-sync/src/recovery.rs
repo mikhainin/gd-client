@@ -5,6 +5,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub(crate) const DIRECTORY: &str = ".gdrive-recovery";
+pub(crate) const INITIALIZING_PREFIX: &str = ".gdrive-recovery-init-";
 const MARKER: &str = "g-client local recovery v1\n";
 
 pub(crate) fn validate(directory: &Path) -> std::io::Result<()> {
@@ -75,26 +76,54 @@ fn create_entry(path: &Path) -> std::io::Result<PathBuf> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("recovery path has no parent"))?;
-    let directory = parent.join(DIRECTORY);
-    match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
-        Ok(()) => {
-            let mut marker = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(directory.join("owner"))?;
-            marker.write_all(MARKER.as_bytes())?;
-            marker.sync_all()?;
-            std::fs::File::open(&directory)?.sync_all()?;
-            std::fs::File::open(parent)?.sync_all()?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => validate(&directory)?,
-        Err(error) => return Err(error),
-    }
+    let directory = initialize_store(parent, |marker| marker.write_all(MARKER.as_bytes()))?;
     let entry = directory.join(uuid::Uuid::new_v4().to_string());
     std::fs::DirBuilder::new().mode(0o700).create(&entry)?;
     std::fs::File::open(&directory)?.sync_all()?;
     Ok(entry)
+}
+
+fn initialize_store(
+    parent: &Path,
+    write_marker: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    let directory = parent.join(DIRECTORY);
+    match std::fs::symlink_metadata(&directory) {
+        Ok(_) => {
+            validate(&directory)?;
+            return Ok(directory);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let temporary = parent.join(format!("{INITIALIZING_PREFIX}{}", uuid::Uuid::new_v4()));
+    std::fs::DirBuilder::new().mode(0o700).create(&temporary)?;
+    let result = (|| {
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(temporary.join("owner"))?;
+        write_marker(&mut marker)?;
+        marker.sync_all()?;
+        drop(marker);
+        std::fs::File::open(&temporary)?.sync_all()?;
+        match rename_no_replace(&temporary, &directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                validate(&directory)?
+            }
+            Err(error) => return Err(error),
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(directory)
+    })();
+    if let Err(error) = std::fs::remove_dir_all(&temporary) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%error, "could not remove recovery initialization staging directory");
+        }
+    }
+    result
 }
 
 fn write_intent(
@@ -277,6 +306,11 @@ fn restore_queued(
             if !item.file_type()?.is_dir() {
                 continue;
             }
+            if item.file_name().to_str().is_some_and(|name| {
+                name.starts_with(INITIALIZING_PREFIX) || name.starts_with(".gdrive-download-")
+            }) {
+                continue;
+            }
             if item.file_name() != DIRECTORY {
                 directories.push(item.path());
                 continue;
@@ -397,6 +431,30 @@ fn restore_queued(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_or_interrupted_store_initialization_never_publishes_a_partial_marker() {
+        let root = std::env::temp_dir().join(format!("gdrive-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let error = initialize_store(&root, |marker| {
+            marker.write_all(b"partial")?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert!(!root.join(DIRECTORY).exists());
+        let interrupted = root.join(format!("{INITIALIZING_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&interrupted).unwrap();
+        std::fs::write(interrupted.join("owner"), b"partial").unwrap();
+        let store = initialize_store(&root, |marker| marker.write_all(MARKER.as_bytes())).unwrap();
+        validate(&store).unwrap();
+        restore_interrupted(&root, |_, _| Ok(false)).unwrap();
+        assert_eq!(
+            std::fs::read(interrupted.join("owner")).unwrap(),
+            b"partial"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn archived_files_and_directories_retain_writes_through_open_handles() {

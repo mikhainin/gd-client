@@ -217,7 +217,7 @@ async fn run_folder(
         .unwrap_or_else(|| "root".to_string());
 
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Result<LocalChange, SyncError>>();
-    let _watcher = LocalWatcher::watch(
+    let mut watcher = LocalWatcher::watch(
         &folder.local_path,
         folder.id,
         Arc::clone(&state_db),
@@ -270,6 +270,20 @@ async fn run_folder(
     poll_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        let registration = watcher.refresh();
+        status.finish(
+            "local watcher",
+            registration
+                .as_ref()
+                .map(|_| ())
+                .map_err(ToString::to_string),
+        );
+        if let Err(error) = registration {
+            let _ = events.send(SyncEvent::Error {
+                folder_id: Some(folder.id),
+                message: error.to_string(),
+            });
+        }
         tokio::select! {
             Some(change) = local_rx.recv() => {
                 if !coalesce_local_notifications(change, &mut local_rx, folder.id, &events, status) {
@@ -879,7 +893,7 @@ fn validate_remote_name(name: &str) -> Result<(), SyncError> {
     if name.is_empty()
         || name == "."
         || name == ".."
-        || name == crate::recovery::DIRECTORY
+        || is_internal_path(Path::new(name))
         || name.contains('/')
         || name.contains('\0')
     {
