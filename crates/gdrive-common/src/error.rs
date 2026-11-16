@@ -10,6 +10,19 @@ pub enum CommonError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("cannot resolve local sync root {path}: {source}")]
+    LocalRoot {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("local sync roots overlap: {first} and {second}; disable or remove one binding")]
+    OverlappingRoots {
+        first: std::path::PathBuf,
+        second: std::path::PathBuf,
+    },
+
     #[error("failed to parse configuration: {0}")]
     TomlDe(#[from] toml::de::Error),
 

@@ -9,6 +9,8 @@ Shared types and utilities used by `gdrived`, `gdrive-ui`, and `gdrive-sync`:
   `~/.config/gdrive-client/config.toml` and `~/.local/share/gdrive-client/`
   containing `sync-state.sqlite3` and `oauth-token.json`. Resolving a data
   path also creates the data directory.
+- `local_roots` — read-only root resolution and overlap diagnostics shared by
+  configuration validation and worker admission.
 - `error` — `CommonError` covers missing home directories, I/O, and TOML
   parsing/serialization, preserving underlying error sources.
 
@@ -31,7 +33,12 @@ a directory-sync failure after replacement is reported, but the file is already
 the complete new configuration. Loading a missing file returns `AppConfig::default()`;
 malformed or unreadable files return errors rather than being reset.
 These helpers perform deserialization, not semantic validation of paths,
-ownership, folder overlap, or polling values.
+ownership, folder overlap, or polling values. `validate_local_roots` separately
+rejects equal/nested enabled roots, including symlink aliases. Existing directory
+components are canonicalized before normalizing `..`; missing suffixes are
+allowed without creating anything. Dangling symlinks, non-directory components,
+and inaccessible paths fail explicitly with a preserved I/O source. Disabled
+bindings may overlap but must pass validation before they can be enabled.
 
 Omitted TOML `sync_folders` defaults to an empty list and omitted
 `poll_interval_secs` defaults to 60, also for `AppConfig::default()` and a missing

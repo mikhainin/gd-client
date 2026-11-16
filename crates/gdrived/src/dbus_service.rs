@@ -278,6 +278,11 @@ impl GDriveService {
         let mut state = self.state.lock().await;
         let mut config = state.config.clone();
         config.sync_folders.push(folder.clone());
+        if enabled {
+            config
+                .validate_local_roots()
+                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        }
         self.persist(&config)?;
         state.config = config;
 
@@ -314,6 +319,11 @@ impl GDriveService {
             .ok_or_else(|| zbus::fdo::Error::Failed(format!("no such sync folder: {id}")))?;
         folder.enabled = enabled;
         let folder = folder.clone();
+        if enabled {
+            config
+                .validate_local_roots()
+                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        }
         self.persist(&config)?;
         state.config = config;
 
@@ -514,6 +524,56 @@ mod tests {
             refresh_token: None,
             expires_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn overlapping_add_and_enable_leave_configuration_and_files_unchanged() {
+        let fixture = Fixture::new(AppConfig::default());
+        let first = fixture.folder("first");
+        let mut paused = fixture.folder("first/nested");
+        paused.enabled = false;
+        {
+            let mut state = fixture.service.state.lock().await;
+            state.config.sync_folders = vec![first.clone(), paused.clone()];
+            fixture.service.persist(&state.config).unwrap();
+        }
+        let before = std::fs::read(&fixture.service.config_path).unwrap();
+        for path in [&first.local_path, &first.local_path.join("another")] {
+            let error = fixture
+                .service
+                .add_sync_folder(
+                    "overlap".into(),
+                    "".into(),
+                    "".into(),
+                    path.to_string_lossy().into(),
+                    "".into(),
+                    "".into(),
+                    true,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, zbus::fdo::Error::InvalidArgs(_)));
+        }
+        assert!(matches!(
+            fixture
+                .service
+                .set_folder_enabled(paused.id.to_string(), true)
+                .await,
+            Err(zbus::fdo::Error::InvalidArgs(_))
+        ));
+        assert_eq!(std::fs::read(&fixture.service.config_path).unwrap(), before);
+        assert_eq!(
+            fixture.service.state.lock().await.config.sync_folders,
+            vec![first.clone(), paused]
+        );
+        assert!(!first.local_path.exists());
+        assert!(fixture.service.engine.running_folders().is_empty());
+        fixture
+            .service
+            .set_folder_enabled(first.id.to_string(), false)
+            .await
+            .unwrap();
+        assert!(!fixture.service.state.lock().await.config.sync_folders[0].enabled);
     }
 
     #[tokio::test]

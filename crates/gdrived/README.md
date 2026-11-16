@@ -26,7 +26,9 @@ On startup it:
    can request sign-in. An unreadable or malformed token cache is logged and
    treated as signed out.
 3. Starts the `gdrive_sync::SyncEngine` for every enabled sync folder when
-   a cached token is available.
+   a cached token is available, except bindings with overlapping or invalid local
+   roots. Affected bindings remain stopped with explicit status errors; unrelated
+   bindings still start and the D-Bus service remains available to correct settings.
 4. Serves the `org.gclient.GDrive1` interface (defined in
    `gdrive_common::dbus_api`, implemented in `dbus_service.rs`) on the
    session D-Bus bus, exposing `ListSyncFolders`/`AddSyncFolder`/
@@ -60,6 +62,9 @@ row layouts. Folder mutations save the candidate configuration before updating
 in-memory configuration or workers; save failures preserve those in-memory
 states; the on-disk file is either the complete previous or new configuration. See
 [configuration persistence](../gdrive-common/README.md#configuration).
+Adding or enabling an active binding rejects equal/nested local roots, including
+symlink aliases, before saving or starting workers. Disabled bindings may overlap;
+disabling or removing bindings remains possible when correcting an old conflict.
 Removing a sync folder,
 disabling it, or signing out stops workers without deleting local or remote
 files. Sign-out retains folder configuration and the sync-state database.

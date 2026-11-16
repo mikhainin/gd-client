@@ -19,6 +19,14 @@ feature in packaged binaries.
   polls Drive's Changes API for remote changes, including newly created items.
   Transfers are sequential within each folder; enabled folders have separate
   workers. A missing Drive folder ID selects "My Drive" (`root`).
+  Enabled local roots must not be equal or nested, including symlink aliases.
+  Startup blocks every affected binding before filesystem or Drive mutations,
+  reports per-folder errors, and leaves unrelated bindings runnable. Root leases
+  also reject overlapping direct `start_folder` calls and remain held until
+  cancelled workers drop; a restart waits up to two seconds for its predecessor.
+  Workers use the resolved local root. Disable sync before moving a root or
+  changing its ancestor directories; such external topology changes are not
+  coordinated with running workers.
   Live parent metadata resolves subtree membership, including moves into/out of
   the sync root; directory moves relocate descendant mappings together.
   Failed polls retain their cursor for replay after reconnect or restart.

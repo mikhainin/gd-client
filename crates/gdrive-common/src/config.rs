@@ -95,6 +95,17 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Validate enabled roots without creating directories or changing configuration.
+    pub fn validate_local_roots(&self) -> Result<(), CommonError> {
+        match crate::local_roots::errors(&self.sync_folders)
+            .into_iter()
+            .next()
+        {
+            Some((_, error)) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Loads the configuration from the default location, returning a
     /// default (empty) configuration if the file does not exist yet.
     pub fn load() -> Result<Self, CommonError> {
