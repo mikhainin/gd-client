@@ -42,7 +42,9 @@ information fails closed. Overlapping mount footprints within one root are
 rejected too: recursive bind
 aliases or duplicate mounted subtrees must not create traversal cycles or give
 one inode multiple live synchronization paths. Disjoint mounted trees remain
-supported. Mount paths are decoded as raw filesystem bytes, so
+supported, as do identity binds that hide the same subtree at its original
+location rather than creating a second visible alias. Mount paths are decoded
+as raw filesystem bytes, so
 an unrelated non-UTF-8 mount name does not prevent validation. Descriptor mount
 inspection uses `O_PATH`, never a data-reading open that could block on a FIFO.
 Existing directory

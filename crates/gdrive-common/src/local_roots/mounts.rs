@@ -114,15 +114,29 @@ fn from_mounts(
         device: mount.device.clone(),
         path: mount.root.join(relative),
     }];
-    for nested in mounts
+    let mut nested_mounts: Vec<_> = mounts
         .iter()
         .filter(|mount| mount.point != path && mount.point.starts_with(path))
-    {
+        .collect();
+    nested_mounts.sort_by_key(|mount| mount.point.components().count());
+    let mut visible_parents = vec![mount];
+    for nested in nested_mounts {
         match visible(&nested.point) {
-            Ok(id) if id == nested.id => backing.push(BackingRoot {
-                device: nested.device.clone(),
-                path: nested.root.clone(),
-            }),
+            Ok(id) if id == nested.id => {
+                let parent = visible_parents
+                    .iter()
+                    .filter(|parent| nested.point.starts_with(&parent.point))
+                    .max_by_key(|parent| parent.point.components().count())
+                    .unwrap();
+                let relative = nested.point.strip_prefix(&parent.point).unwrap();
+                if nested.device != parent.device || nested.root != parent.root.join(relative) {
+                    backing.push(BackingRoot {
+                        device: nested.device.clone(),
+                        path: nested.root.clone(),
+                    });
+                }
+                visible_parents.push(nested);
+            }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -157,6 +171,7 @@ mod tests {
             ("/data", "/data/child", false),
             ("/data", "/", false),
             ("/data", "/elsewhere", true),
+            ("/data", "/data/mounted", true),
         ] {
             let mounts = parse(
                 format!(
@@ -185,6 +200,20 @@ mod tests {
             })
         })
         .is_err());
+        let mounts = parse(
+            b"1 0 8:1 / / rw - ext4 /dev/fixture rw\n\
+            2 1 8:2 /external /data/first rw - ext4 /dev/other rw\n\
+            3 2 8:2 /external/child /data/first/child rw - ext4 /dev/other rw\n",
+        )
+        .unwrap();
+        assert!(from_mounts(Path::new("/data"), &mounts, |candidate| {
+            Ok(match candidate.to_str().unwrap() {
+                "/data/first" => 2,
+                "/data/first/child" => 3,
+                _ => 1,
+            })
+        })
+        .is_ok());
     }
 
     #[test]
