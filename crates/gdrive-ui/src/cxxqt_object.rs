@@ -15,14 +15,22 @@ fn mutation_outcome(
     result: Result<Response, String>,
     signing_in: bool,
     authentication_changed: bool,
+    waiting_for_sign_in: bool,
     current_message: Option<String>,
     success_message: Option<String>,
 ) -> (Option<String>, bool) {
-    let waiting = signing_in && !authentication_changed && matches!(&result, Ok(Response::Done));
+    let waiting = if signing_in {
+        !authentication_changed && matches!(&result, Ok(Response::Done))
+    } else {
+        waiting_for_sign_in
+    };
     let message = match result {
-        Ok(Response::Done) if signing_in && authentication_changed => current_message,
+        Ok(Response::Done) if authentication_changed || (!signing_in && waiting) => current_message,
         Ok(Response::Done) => success_message,
-        Err(error) => Some(error),
+        Err(error) => Some(match current_message.filter(|_| authentication_changed) {
+            Some(authentication) => format!("{error}; {authentication}"),
+            None => error,
+        }),
         _ => Some("unexpected response to daemon operation".to_string()),
     };
     (message, waiting)
@@ -61,13 +69,21 @@ mod tests {
                 Ok(Response::Done),
                 true,
                 true,
+                false,
                 failure.clone(),
                 Some("waiting".into())
             ),
             (failure, false),
         );
         assert_eq!(
-            mutation_outcome(Ok(Response::Done), true, true, None, Some("waiting".into())),
+            mutation_outcome(
+                Ok(Response::Done),
+                true,
+                true,
+                false,
+                None,
+                Some("waiting".into())
+            ),
             (None, false),
         );
         assert_eq!(
@@ -75,6 +91,7 @@ mod tests {
                 Ok(Response::Done),
                 true,
                 false,
+                true,
                 None,
                 Some("waiting".into())
             ),
@@ -85,10 +102,48 @@ mod tests {
                 Err("request failed".into()),
                 true,
                 false,
+                true,
                 None,
                 Some("waiting".into())
             ),
             (Some("request failed".into()), false),
+        );
+    }
+
+    #[test]
+    fn folder_mutations_preserve_sign_in_waits_and_concurrent_failures() {
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                false,
+                false,
+                true,
+                Some("waiting".into()),
+                None
+            ),
+            (Some("waiting".into()), true),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Err("folder failed".into()),
+                false,
+                false,
+                true,
+                Some("waiting".into()),
+                None
+            ),
+            (Some("folder failed".into()), true),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                false,
+                true,
+                false,
+                Some("sign-in failed".into()),
+                None
+            ),
+            (Some("sign-in failed".into()), false),
         );
     }
 
@@ -523,17 +578,21 @@ impl qobject::SyncManager {
             ));
             return;
         }
+        let signing_in = matches!(&request, Request::SignIn);
+        let signing_out = matches!(&request, Request::SignOut);
         self.as_mut().rust_mut().snapshot.cancel();
         self.as_mut().set_refreshing(false);
-        self.as_mut().rust_mut().operation_message = None;
-        self.as_mut().rust_mut().waiting_for_sign_in = false;
-        self.as_mut().rust_mut().sign_in_deadline.cancel();
+        if signing_in || signing_out {
+            self.as_mut().rust_mut().waiting_for_sign_in = signing_in;
+            self.as_mut().rust_mut().sign_in_deadline.cancel();
+        }
+        if signing_in || !self.waiting_for_sign_in {
+            self.as_mut().rust_mut().operation_message = None;
+        }
         self.as_mut().set_busy(true);
         self.as_mut()
             .set_status_message(QString::from("Working..."));
         let generation = self.as_mut().rust_mut().mutation.begin();
-        let signing_in = matches!(request, Request::SignIn);
-        self.as_mut().rust_mut().waiting_for_sign_in = signing_in;
         let authentication_revision = self.authentication_revision;
         match self.dispatch(request, move |mut object, result| {
             if !object.as_mut().rust_mut().mutation.finish(generation) {
@@ -544,6 +603,7 @@ impl qobject::SyncManager {
                 result,
                 signing_in,
                 object.authentication_revision != authentication_revision,
+                object.waiting_for_sign_in,
                 object.operation_message.clone(),
                 success_message,
             );
@@ -564,7 +624,9 @@ impl qobject::SyncManager {
                 }
             }
             Err(error) => {
-                self.as_mut().rust_mut().waiting_for_sign_in = false;
+                if signing_in {
+                    self.as_mut().rust_mut().waiting_for_sign_in = false;
+                }
                 self.as_mut().rust_mut().operation_message = Some(error.clone());
                 self.as_mut().set_busy(false);
                 self.as_mut().set_status_message(QString::from(&error));
@@ -643,6 +705,12 @@ impl qobject::SyncManager {
     }
 
     pub fn sign_in(self: Pin<&mut Self>) {
+        if self.waiting_for_sign_in {
+            self.set_status_message(QString::from(
+                "Sign-in is already in progress. Complete the browser consent.",
+            ));
+            return;
+        }
         if !self.authentication_ready {
             self.set_status_message(QString::from(
                 "Connecting to authentication service. Please try again.",

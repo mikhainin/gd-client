@@ -149,6 +149,8 @@ requested after subscribing so initial state and restarts do not rely on receivi
 a signal; periodic polling remains a fallback for authentication.
 `SignInFailed` clears the current sign-in wait and preserves its retry message
 across successful refreshes, even if it arrives before the `SignIn` method reply.
+Unrelated folder mutations retain the pending wait and deadline, and cannot
+overwrite a concurrently received authentication failure.
 Sign-in is accepted only after the subscriptions are ready. A subscription loss
 ends the current wait with a retry message; a cancellable ten-minute-ten-second
 UI deadline also handles missed completion signals, just beyond the daemon's
