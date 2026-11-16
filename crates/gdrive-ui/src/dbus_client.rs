@@ -138,11 +138,27 @@ async fn authentication_session(
             .await
     })
     .await?;
-    let proxy = bounded(CONTROL_TIMEOUT, GDrive1Proxy::new(&connection)).await?;
     let bus = bounded(CONTROL_TIMEOUT, zbus::fdo::DBusProxy::new(&connection)).await?;
     let mut owners = bounded(
         CONTROL_TIMEOUT,
         bus.receive_name_owner_changed_with_args(&[(0, gdrive_common::dbus_api::BUS_NAME)]),
+    )
+    .await?;
+    let owner = bounded(CONTROL_TIMEOUT, async {
+        bus.get_name_owner(
+            gdrive_common::dbus_api::BUS_NAME
+                .try_into()
+                .expect("valid bus name"),
+        )
+        .await
+        .map_err(zbus::Error::from)
+    })
+    .await?;
+    let proxy = bounded(
+        CONTROL_TIMEOUT,
+        GDrive1Proxy::builder(&connection)
+            .destination(owner.as_str())
+            .build(),
     )
     .await?;
     let mut signals = bounded(CONTROL_TIMEOUT, proxy.receive_authentication_changed()).await?;
@@ -152,9 +168,12 @@ async fn authentication_session(
     loop {
         tokio::select! {
             biased;
-            owner = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) => {
-                owner.ok_or("daemon owner stream closed")?;
-                return Ok(());
+            change = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) => {
+                let change = change.ok_or("daemon owner stream closed")?;
+                let args = change.args().map_err(|error| format!("invalid daemon owner signal: {error}"))?;
+                if args.old_owner().as_ref().is_some_and(|previous| previous.as_str() == owner.as_str()) {
+                    return Ok(());
+                }
             }
             signal = std::future::poll_fn(|cx| std::pin::Pin::new(&mut signals).poll_next(cx)) => {
                 let signal = signal.ok_or("authentication signal stream closed")?;
@@ -637,29 +656,40 @@ mod tests {
                 .unwrap(),
             Some(AuthenticationEvent::Unavailable)
         ));
-        assert!(matches!(
-            tokio::time::timeout(CONTROL_TIMEOUT, received.recv())
-                .await
-                .unwrap(),
-            Some(AuthenticationEvent::Ready)
-        ));
+        let absent = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                assert!(matches!(
+                    received.recv().await,
+                    Some(AuthenticationEvent::Unavailable)
+                ));
+            }
+        })
+        .await;
+        assert!(
+            absent.is_err(),
+            "an absent daemon must not announce authentication readiness"
+        );
         bounded(
             CONTROL_TIMEOUT,
             _service.request_name(gdrive_common::dbus_api::BUS_NAME),
         )
         .await
         .unwrap();
+        tokio::time::timeout(CONTROL_TIMEOUT, async {
+            loop {
+                match received.recv().await {
+                    Some(AuthenticationEvent::Ready) => break,
+                    Some(AuthenticationEvent::Unavailable) => {}
+                    _ => panic!("unexpected authentication event while acquiring owner"),
+                }
+            }
+        })
+        .await
+        .expect("authentication must become ready after owner acquisition");
+        assert!(matches!(execute(Request::SignIn).await, Ok(Response::Done)));
         assert!(matches!(
-            tokio::time::timeout(CONTROL_TIMEOUT, received.recv())
-                .await
-                .unwrap(),
-            Some(AuthenticationEvent::Unavailable)
-        ));
-        assert!(matches!(
-            tokio::time::timeout(CONTROL_TIMEOUT, received.recv())
-                .await
-                .unwrap(),
-            Some(AuthenticationEvent::Ready)
+            tokio::time::timeout(CONTROL_TIMEOUT, received.recv()).await.unwrap(),
+            Some(AuthenticationEvent::Failed(message)) if message == "fixture authorization declined"
         ));
         bounded(
             CONTROL_TIMEOUT,

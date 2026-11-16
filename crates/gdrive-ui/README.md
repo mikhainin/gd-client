@@ -151,7 +151,9 @@ a signal; periodic polling remains a fallback for authentication.
 across successful refreshes, even if it arrives before the `SignIn` method reply.
 Unrelated folder mutations retain the pending wait and deadline, and cannot
 overwrite a concurrently received authentication failure.
-Sign-in is accepted only after the subscriptions are ready. A subscription loss
+Sign-in is accepted only after subscriptions bind to an existing unique daemon
+owner; initial name acquisition is not treated as loss of an active session.
+A subscription loss
 ends the current wait with a retry message; a cancellable ten-minute-ten-second
 UI deadline also handles missed completion signals, just beyond the daemon's
 ten-minute authorization bound. The deadline does not block the GUI thread.
