@@ -302,6 +302,9 @@ def smoke(args):
                 )
 
             wait("production QML displays daemon folder/authentication and widget-backed menu", ui_connected)
+            wait("closing production Add clears native-picker loading", lambda: (
+                snapshot().get("pickerCancelledOnAddClose") is True
+            ))
             (run / "ui-connected.json").write_text(json.dumps(snapshot(), indent=2))
             local = run / "local/smoke.txt"
             wait("initial remote download completed", lambda: (

@@ -263,17 +263,6 @@ ApplicationWindow {
         }
         anchors.centerIn: parent
         width: Math.min(420, root.width - 40)
-        onClosed: syncManager.cancelLocalFolderPicker()
-
-        Connections {
-            target: syncManager
-            function onLocalFolderPicked(path) {
-                if (addDialog.visible) localPathField.text = path
-            }
-            function onLocalPickerUnavailable() {
-                if (addDialog.visible) localFolderDialog.open()
-            }
-        }
         height: Math.min(460, root.height - 40)
 
         property string currentPath: Platform.StandardPaths.writableLocation(Platform.StandardPaths.HomeLocation)
@@ -399,6 +388,17 @@ ApplicationWindow {
 
     Dialog {
         id: addDialog
+        onClosed: syncManager.cancelLocalFolderPicker()
+
+        Connections {
+            target: syncManager
+            function onLocalFolderPicked(path) {
+                if (addDialog.visible) localPathField.text = path
+            }
+            function onLocalPickerUnavailable() {
+                if (addDialog.visible) localFolderDialog.open()
+            }
+        }
         objectName: "addFolderDialog"
         title: qsTr("Add sync folder")
         modal: true
