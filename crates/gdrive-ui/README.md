@@ -148,9 +148,12 @@ seconds. Subscription setup calls have five-second deadlines. A snapshot is
 requested after subscribing so initial state and restarts do not rely on receiving
 a signal; periodic polling remains a fallback for authentication.
 Browsing and mutations still execute independently, not through a serial queue.
-These guarantees apply to D-Bus requests, not local filesystem operations
-or the synchronous `kdialog --version` probe and local-folder picker, which
-can block the GUI thread and have no explicit timeout.
+Native local-folder selection also runs on the background runtime, with a
+two-minute deadline and bounded child cleanup. A missing `kdialog` opens the
+built-in browser; cancellation, process failure and timeout are distinct outcomes.
+Closing Add aborts the owned picker and invalidates queued completions. No
+synchronous availability probe runs on the GUI thread. Local filesystem
+operations are not covered by the D-Bus deadlines.
 
 ## UI testing
 
@@ -169,6 +172,9 @@ disposable private D-Bus with no activatable services, using Qt offscreen/softwa
 It inspects visible QML connection, authentication, and folder text, the real
 Qt.labs.platform widget-backed menu, and explicitly constructs/triggers a
 `QMenu` in the same process to catch accidental `QGuiApplication` regressions.
+It also opens/closes the production Add dialog with injected picker-loading
+state and verifies the close handler clears it, without launching a native
+picker or submitting settings; picker child lifecycle is covered by unit tests.
 The stateful loopback Drive checks the synthetic bearer token and exercises
 initial download, a watched local modification/upload, an injected HTTP 503
 shown through the UI's sync-error state, remote download retry, and idle recovery.
@@ -195,7 +201,7 @@ handles are terminated, in reverse order. `--bin-dir` selects a separately
 staged build; otherwise `$CARGO_TARGET_DIR/debug` or `target/debug` is used.
 This is **offscreen native integration**, not live-window/AT-SPI validation
 or a pixel/screenshot comparison. It does not exercise interactive OAuth,
-Add/Browse controls, a real tray host, or real Google Drive.
+Add submission/Browse selection, a real tray host, or real Google Drive.
 
 ### Component and live-window tests
 

@@ -7,6 +7,7 @@ mod app_icon;
 mod application;
 pub mod cxxqt_object;
 mod dbus_client;
+mod local_picker;
 #[cfg(feature = "test-support")]
 mod smoke;
 

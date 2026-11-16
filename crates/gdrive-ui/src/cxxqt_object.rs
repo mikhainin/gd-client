@@ -124,6 +124,7 @@ pub mod qobject {
         #[qproperty(QString, drive_folders_json, cxx_name = "driveFoldersJson")]
         #[qproperty(QString, drive_folders_error, cxx_name = "driveFoldersError")]
         #[qproperty(bool, drive_folders_loading, cxx_name = "driveFoldersLoading")]
+        #[qproperty(bool, local_picker_loading, cxx_name = "localPickerLoading")]
         type SyncManager = super::SyncManagerRust;
 
         #[qinvokable]
@@ -188,19 +189,22 @@ pub mod qobject {
         fn create_local_folder(self: Pin<&mut Self>, parent_path: &QString, name: &QString)
             -> bool;
 
-        /// Whether a native folder-picker command (`kdialog`) is available,
-        /// so QML can prefer it over the built-in browser dialog.
-        #[qinvokable]
-        #[cxx_name = "nativeFolderPickerAvailable"]
-        fn native_folder_picker_available(self: Pin<&mut Self>) -> bool;
-
-        /// Runs `kdialog --getexistingdirectory` starting at `start_path`
-        /// and returns the chosen path, or an empty string if the user
-        /// cancelled. Only call this after checking
-        /// [`Self::native_folder_picker_available`].
+        /// Starts a bounded native picker away from the GUI thread.
         #[qinvokable]
         #[cxx_name = "pickLocalFolderNative"]
-        fn pick_local_folder_native(self: Pin<&mut Self>, start_path: &QString) -> QString;
+        fn pick_local_folder_native(self: Pin<&mut Self>, start_path: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "cancelLocalFolderPicker"]
+        fn cancel_local_folder_picker(self: Pin<&mut Self>);
+
+        #[qsignal]
+        #[cxx_name = "localFolderPicked"]
+        fn local_folder_picked(self: Pin<&mut Self>, path: QString);
+
+        #[qsignal]
+        #[cxx_name = "localPickerUnavailable"]
+        fn local_picker_unavailable(self: Pin<&mut Self>);
     }
 
     impl cxx_qt::Threading for SyncManager {}
@@ -223,6 +227,7 @@ pub struct SyncManagerRust {
     drive_folders_json: QString,
     drive_folders_error: QString,
     drive_folders_loading: bool,
+    local_picker_loading: bool,
     initialized: bool,
     operation_message: Option<String>,
     waiting_for_sign_in: bool,
@@ -230,6 +235,7 @@ pub struct SyncManagerRust {
     mutation: PendingRequest,
     browse: PendingRequest,
     portal: PendingRequest,
+    local_picker: PendingRequest,
     authentication_watch: PendingRequest,
     authentication_revision: u64,
     sync_status_watch: PendingRequest,
@@ -250,6 +256,7 @@ impl Default for SyncManagerRust {
             drive_folders_json: QString::from("[]"),
             drive_folders_error: QString::default(),
             drive_folders_loading: false,
+            local_picker_loading: false,
             initialized: false,
             operation_message: None,
             waiting_for_sign_in: false,
@@ -257,6 +264,7 @@ impl Default for SyncManagerRust {
             mutation: PendingRequest::default(),
             browse: PendingRequest::default(),
             portal: PendingRequest::default(),
+            local_picker: PendingRequest::default(),
             authentication_watch: PendingRequest::default(),
             authentication_revision: 0,
             sync_status_watch: PendingRequest::default(),
@@ -602,48 +610,48 @@ impl qobject::SyncManager {
         }
     }
 
-    pub fn native_folder_picker_available(self: Pin<&mut Self>) -> bool {
-        std::process::Command::new("kdialog")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+    pub fn pick_local_folder_native(mut self: Pin<&mut Self>, start_path: &QString) {
+        let generation = self.as_mut().rust_mut().local_picker.begin();
+        self.as_mut().set_local_picker_loading(true);
+        let start_path = start_path.to_string();
+        let qt_thread = self.qt_thread();
+        match dbus_client::spawn(async move {
+            let result = crate::local_picker::pick(&start_path).await;
+            if let Err(error) = qt_thread.queue(move |mut object| {
+                if !object.as_mut().rust_mut().local_picker.finish(generation) {
+                    return;
+                }
+                object.as_mut().set_local_picker_loading(false);
+                match result {
+                    Ok(crate::local_picker::Selection::Path(path)) => {
+                        object.as_mut().local_folder_picked(QString::from(path))
+                    }
+                    Ok(crate::local_picker::Selection::Unavailable) => {
+                        tracing::debug!("native picker unavailable; using built-in folder browser");
+                        object.as_mut().local_picker_unavailable();
+                    }
+                    Ok(crate::local_picker::Selection::Cancelled) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "local folder selection failed");
+                        object
+                            .as_mut()
+                            .set_status_message(QString::from(error.to_string()));
+                    }
+                }
+            }) {
+                tracing::debug!("could not deliver local folder selection to Qt: {error:?}");
+            }
+        }) {
+            Ok(handle) => self.as_mut().rust_mut().local_picker.attach(handle),
+            Err(error) => {
+                self.as_mut().set_local_picker_loading(false);
+                self.as_mut().set_status_message(QString::from(error));
+            }
+        }
     }
 
-    pub fn pick_local_folder_native(mut self: Pin<&mut Self>, start_path: &QString) -> QString {
-        use std::os::unix::process::CommandExt;
-
-        let start_path = start_path.to_string();
-        let mut command = std::process::Command::new("kdialog");
-        command.arg("--getexistingdirectory");
-        if !start_path.is_empty() {
-            command.arg(&start_path);
-        }
-
-        // Ask the kernel to send kdialog a SIGTERM if this process dies
-        // before it exits (e.g. gdrive-ui is killed while the picker is
-        // still open), so it doesn't linger as an orphan.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        match command.output() {
-            Ok(output) if output.status.success() => {
-                QString::from(String::from_utf8_lossy(&output.stdout).trim())
-            }
-            // Non-zero exit means the user cancelled the dialog - not an
-            // error, just nothing selected.
-            Ok(_) => QString::from(""),
-            Err(err) => {
-                self.as_mut()
-                    .set_status_message(QString::from(&format!("failed to run kdialog: {err}")));
-                QString::from("")
-            }
-        }
+    pub fn cancel_local_folder_picker(mut self: Pin<&mut Self>) {
+        self.as_mut().rust_mut().local_picker.cancel();
+        self.as_mut().set_local_picker_loading(false);
     }
 }
