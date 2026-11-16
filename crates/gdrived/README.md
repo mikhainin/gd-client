@@ -57,7 +57,7 @@ The bus name and interface are `org.gclient.GDrive1`; the object path is
 [`dbus_api.rs`](../gdrive-common/src/dbus_api.rs) defines method signatures and
 row layouts. Folder mutations save the candidate configuration before updating
 in-memory configuration or workers; save failures preserve those in-memory
-states, but not necessarily the on-disk file. See
+states; the on-disk file is either the complete previous or new configuration. See
 [configuration persistence](../gdrive-common/README.md#configuration).
 Removing a sync folder,
 disabling it, or signing out stops workers without deleting local or remote
