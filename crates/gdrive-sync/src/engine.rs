@@ -855,6 +855,7 @@ async fn atomic_download_checked(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DownloadPhase {
+    Staged,
     Checked,
     Archived,
 }
@@ -891,10 +892,20 @@ async fn atomic_download_with(
             file.write_all(content)?;
             file.sync_all()
         })?;
+        before_publish(DownloadPhase::Staged)?;
         if let Some(expected) = expected {
             let unchanged = match fs.read(path) {
                 Ok(current) => current == expected,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::NotADirectory
+                            | std::io::ErrorKind::IsADirectory
+                    ) =>
+                {
+                    false
+                }
                 Err(error) => return Err(error.into()),
             };
             if !unchanged {
@@ -2778,6 +2789,19 @@ mod tests {
         assert!(!download_tracked(&folder, &path, b"remote", &existing)
             .await
             .unwrap());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        assert!(
+            !atomic_download_with(&folder, &path, b"remote", Some(b"old"), |phase| {
+                if phase == DownloadPhase::Staged {
+                    std::fs::remove_file(&path)?;
+                    std::fs::create_dir(&path)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap()
+        );
         scan_local_changes(&folder, &engine.state_db).await.unwrap();
         assert!(engine
             .state_db

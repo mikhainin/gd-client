@@ -297,6 +297,8 @@ Renames retain the original inode, including subsequent writes through existing
 open handles; publication and remote moves use Linux `RENAME_NOREPLACE` and fail
 closed rather than overwriting a concurrently created destination. Detected dirty
 paths still use the visible conflict-copy workflow described above.
+A tracked file replaced by a directory during download or staging is deferred
+to the local-change queue rather than stopping the startup worker.
 Replacement/removal/move intent is synced before changing paths. Scans and remote
 polls reconcile it before processing missing tracked paths: restore an absent
 original without overwrite, or keep an already-published/new destination.
