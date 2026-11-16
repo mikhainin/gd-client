@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,6 +27,7 @@ impl StateDb {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         let db = Self {
             conn: Mutex::new(conn),
@@ -90,6 +91,16 @@ impl StateDb {
                 [],
             )?;
         }
+        let has_version: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('file_state') WHERE name = 'state_version')",
+            [], |row| row.get(0),
+        )?;
+        if !has_version {
+            transaction.execute(
+                "ALTER TABLE file_state ADD COLUMN state_version TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -117,15 +128,16 @@ impl StateDb {
     pub fn upsert_file_state(&self, entry: &FileStateEntry) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
             "INSERT INTO file_state
-                (sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum, remote_mime_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (sync_folder_id, local_rel_path, drive_file_id, is_folder, local_mtime_secs, drive_modified_time, md5_checksum, remote_mime_type, state_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(sync_folder_id, local_rel_path) DO UPDATE SET
                 drive_file_id = excluded.drive_file_id,
                 is_folder = excluded.is_folder,
                 local_mtime_secs = excluded.local_mtime_secs,
                 drive_modified_time = excluded.drive_modified_time,
                 md5_checksum = excluded.md5_checksum,
-                remote_mime_type = excluded.remote_mime_type",
+                remote_mime_type = excluded.remote_mime_type,
+                state_version = excluded.state_version",
             params![
                 entry.sync_folder_id.to_string(),
                 entry.local_rel_path,
@@ -135,6 +147,7 @@ impl StateDb {
                 entry.drive_modified_time,
                 entry.md5_checksum,
                 entry.remote_mime_type,
+                Uuid::new_v4().to_string(),
             ],
         )?;
         Ok(())
@@ -151,6 +164,17 @@ impl StateDb {
             params![sync_folder_id.to_string(), local_rel_path],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn file_state_version(
+        &self,
+        folder_id: Uuid,
+        path: &str,
+    ) -> Result<Option<String>, SyncError> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT state_version FROM file_state WHERE sync_folder_id = ?1 AND local_rel_path = ?2",
+            params![folder_id.to_string(), path], |row| row.get(0),
+        ).optional()?)
     }
 
     pub fn release_replaced_state(&self, folder_id: Uuid, path: &str) -> Result<(), SyncError> {
@@ -178,10 +202,11 @@ impl StateDb {
         new: &str,
     ) -> Result<(), SyncError> {
         self.conn.lock().unwrap().execute(
-            "UPDATE file_state SET local_rel_path = ?3 || substr(local_rel_path, length(?2) + 1)
+            "UPDATE file_state SET local_rel_path = ?3 || substr(local_rel_path, length(?2) + 1),
+                state_version = ?4
              WHERE sync_folder_id = ?1 AND
              (local_rel_path = ?2 OR substr(local_rel_path, 1, length(?2) + 1) = ?2 || '/')",
-            params![folder_id.to_string(), old, new],
+            params![folder_id.to_string(), old, new, Uuid::new_v4().to_string()],
         )?;
         Ok(())
     }

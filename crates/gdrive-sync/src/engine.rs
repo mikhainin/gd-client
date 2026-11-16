@@ -341,14 +341,17 @@ async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(
 }
 
 fn restore_local_intents(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
-    crate::recovery::restore_interrupted(&folder.local_path, |path| {
+    crate::recovery::restore_interrupted(&folder.local_path, |path, expected_version| {
         let relative = path
             .strip_prefix(&folder.local_path)
             .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))?;
         let key = path_key(relative).map_err(std::io::Error::other)?;
         state_db
-            .find_by_local_path(folder.id, &key)
-            .map(|entry| entry.is_some())
+            .file_state_version(folder.id, &key)
+            .map(|version| {
+                version.is_some()
+                    && expected_version.is_none_or(|expected| version.as_deref() == Some(expected))
+            })
             .map_err(std::io::Error::other)
     })?;
     Ok(())
@@ -515,10 +518,12 @@ async fn preserve_local_path(
     let path = Path::new(key);
     let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
+    let version = state_db.file_state_version(folder.id, key)?;
     crate::recovery::move_with_intent(
         &folder.local_path,
         &folder.local_path.join(path),
         &folder.local_path.join(&conflict),
+        version.as_deref(),
     )?;
     state_db.queue_local_change(folder.id, &conflict_key)?;
     if tokio::fs::metadata(folder.local_path.join(&conflict))
@@ -928,11 +933,14 @@ async fn relocate_remote_entry(
     if let Some(parent) = new.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let intent = match crate::recovery::move_with_intent(&folder.local_path, &old, &new) {
-        Ok(intent) => intent,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
+    let version = state_db.file_state_version(folder.id, &existing.local_rel_path)?;
+    let intent =
+        match crate::recovery::move_with_intent(&folder.local_path, &old, &new, version.as_deref())
+        {
+            Ok(intent) => intent,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, rel_path)?;
     crate::recovery::complete_replacement(&intent)?;
     Ok(true)
@@ -2267,8 +2275,17 @@ mod tests {
                 let original = folder.local_path.join("file.txt");
                 let target = folder.local_path.join("renamed.txt");
                 if moved {
-                    crate::recovery::move_with_intent(&folder.local_path, &original, &target)
+                    let version = engine
+                        .state_db
+                        .file_state_version(folder.id, "file.txt")
                         .unwrap();
+                    crate::recovery::move_with_intent(
+                        &folder.local_path,
+                        &original,
+                        &target,
+                        version.as_deref(),
+                    )
+                    .unwrap();
                 } else {
                     crate::recovery::archive_removal(&original)
                         .unwrap()
@@ -2311,6 +2328,63 @@ mod tests {
                 drop(engine);
                 tokio::fs::remove_dir_all(root).await.unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_rebindings_do_not_restore_conflicts_over_a_user_deletion() {
+        for (original_mapping, same_drive_id) in [(false, false), (true, false), (true, true)] {
+            let server = Server::start(vec![Reply::json("{}")]);
+            let (root, folder, mut engine) = local_fixture(&server, b"old").await;
+            let path = folder.local_path.join("file.txt");
+            let mut replacement = engine
+                .state_db
+                .find_by_local_path(folder.id, "file.txt")
+                .unwrap()
+                .unwrap();
+            if !original_mapping {
+                engine
+                    .state_db
+                    .remove_file_state(folder.id, "file.txt")
+                    .unwrap();
+            }
+            let conflict = preserve_local_path(&folder, &engine.state_db, "file.txt")
+                .await
+                .unwrap();
+            std::fs::write(&path, b"replacement").unwrap();
+            let id = if same_drive_id { "old-id" } else { "new-id" };
+            replacement.drive_file_id = Some(id.into());
+            engine.state_db.upsert_file_state(&replacement).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+            scan_local_changes(&folder, &engine.state_db).await.unwrap();
+            assert!(!path.exists());
+            assert_eq!(
+                std::fs::read(folder.local_path.join(conflict)).unwrap(),
+                b"old"
+            );
+            let status = engine.status.start(folder.id, 1);
+            assert!(handle_local_change(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root",
+                &LocalChange {
+                    path,
+                    kind: crate::local_watcher::LocalChangeKind::Modified
+                },
+                nix::unistd::Uid::current(),
+                nix::unistd::Gid::current(),
+                &status,
+            )
+            .await
+            .unwrap());
+            let requests: Vec<_> = server.requests.try_iter().collect();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with(&format!("PATCH /files/{id} ")));
+            assert!(requests[0].contains(r#""trashed":true"#));
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
         }
     }
 

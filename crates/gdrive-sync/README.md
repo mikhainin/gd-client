@@ -240,7 +240,13 @@ Replacement/removal/move intent is synced before changing paths. Scans and remot
 polls reconcile it before processing missing tracked paths: restore an absent
 original without overwrite, or keep an already-published/new destination.
 Removals and relocations consult committed database mappings so completed
-operations are not undone or reuploaded after a crash. Restores verify recorded
+operations are not undone or reuploaded after a crash. Move journals capture the
+original mapping's unique state version; each metadata upsert/relocation changes
+that version atomically, so a newly rebound path is never mistaken for the old
+mapping, even when its Drive ID and metadata are unchanged. SQLite uses
+full-synchronous WAL commits. Traversal skips vanished queued descendants after
+a directory restore but reports a missing root and other I/O failures.
+Restores verify recorded
 device/inode identity and fail explicitly if the expected source changed or
 disappeared. A daemon stop or failed publication is not inferred as user deletion
 of the live Drive item. Marker/journal reads reject non-regular files.

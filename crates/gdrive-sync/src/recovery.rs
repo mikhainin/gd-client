@@ -97,7 +97,13 @@ fn create_entry(path: &Path) -> std::io::Result<PathBuf> {
     Ok(entry)
 }
 
-fn write_intent(entry: &Path, path: &Path, kind: u8, target: Option<&Path>) -> std::io::Result<()> {
+fn write_intent(
+    entry: &Path,
+    path: &Path,
+    kind: u8,
+    target: Option<&Path>,
+    version: Option<&str>,
+) -> std::io::Result<()> {
     let directory = entry.parent().unwrap();
     let pending = directory.join("pending");
     match std::fs::DirBuilder::new().mode(0o700).create(&pending) {
@@ -128,6 +134,16 @@ fn write_intent(entry: &Path, path: &Path, kind: u8, target: Option<&Path>) -> s
         file.write_all(&[0])?;
         file.write_all(target.as_os_str().as_bytes())?;
     }
+    if kind == b'M' {
+        file.write_all(&[0])?;
+        match version {
+            Some(version) => {
+                file.write_all(b"1")?;
+                file.write_all(version.as_bytes())?;
+            }
+            None => file.write_all(b"0")?,
+        }
+    }
     file.sync_all()?;
     drop(file);
     rename_no_replace(&temporary, &pending.join(entry.file_name().unwrap()))?;
@@ -135,7 +151,12 @@ fn write_intent(entry: &Path, path: &Path, kind: u8, target: Option<&Path>) -> s
 }
 
 // The returned handle identifies the journal; the data itself remains at `to`.
-pub(crate) fn move_with_intent(root: &Path, from: &Path, to: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn move_with_intent(
+    root: &Path,
+    from: &Path,
+    to: &Path,
+    version: Option<&str>,
+) -> std::io::Result<PathBuf> {
     let relative = to
         .strip_prefix(root)
         .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidInput, source))?;
@@ -143,7 +164,7 @@ pub(crate) fn move_with_intent(root: &Path, from: &Path, to: &Path) -> std::io::
         return Err(std::io::Error::other("invalid recovery move target"));
     }
     let entry = create_entry(from)?;
-    write_intent(&entry, from, b'M', Some(relative))?;
+    write_intent(&entry, from, b'M', Some(relative), version)?;
     if let Err(error) = rename_no_replace(from, to) {
         complete_replacement(&entry.join(from.file_name().unwrap()))?;
         return Err(error);
@@ -173,7 +194,7 @@ fn archive_path(path: &Path, intent: Option<u8>) -> std::io::Result<Option<PathB
             .ok_or_else(|| std::io::Error::other("recovery path has no filename"))?,
     );
     if let Some(kind) = intent {
-        write_intent(&entry, path, kind, None)?;
+        write_intent(&entry, path, kind, None, None)?;
     }
     match rename_no_replace(path, &destination) {
         Ok(()) => {
@@ -227,11 +248,31 @@ fn normal_path(path: &Path) -> bool {
 
 pub(crate) fn restore_interrupted(
     root: &Path,
-    tracked: impl Fn(&Path) -> std::io::Result<bool>,
+    tracked: impl Fn(&Path, Option<&str>) -> std::io::Result<bool>,
 ) -> std::io::Result<()> {
-    let mut directories = vec![root.to_path_buf()];
+    restore_queued(root, vec![root.to_path_buf()], tracked)
+}
+
+fn restore_queued(
+    root: &Path,
+    mut directories: Vec<PathBuf>,
+    tracked: impl Fn(&Path, Option<&str>) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
     while let Some(directory) = directories.pop() {
-        for item in std::fs::read_dir(&directory)? {
+        let items = match std::fs::read_dir(&directory) {
+            Ok(items) => items,
+            Err(error)
+                if directory != root
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        for item in items {
             let item = item?;
             if !item.file_type()?.is_dir() {
                 continue;
@@ -286,6 +327,7 @@ pub(crate) fn restore_interrupted(
                     return Err(std::io::Error::other("recovery entry must be a directory"));
                 }
                 let handle = entry.join(name);
+                let mut version = None;
                 let archived = match kind {
                     b'R' | b'D' => handle.clone(),
                     b'M' => {
@@ -296,6 +338,22 @@ pub(crate) fn restore_interrupted(
                         if !normal_path(relative) {
                             return Err(std::io::Error::other("invalid recovery move target"));
                         }
+                        let identity = fields.next().ok_or_else(|| {
+                            std::io::Error::other("missing recovery mapping version")
+                        })?;
+                        match identity.split_first() {
+                            Some((b'1', bytes)) => {
+                                version = Some(std::str::from_utf8(bytes).map_err(|source| {
+                                    std::io::Error::new(std::io::ErrorKind::InvalidData, source)
+                                })?);
+                            }
+                            Some((b'0', [])) => {}
+                            _ => {
+                                return Err(std::io::Error::other(
+                                    "invalid recovery mapping version",
+                                ))
+                            }
+                        }
                         root.join(relative)
                     }
                     _ => return Err(std::io::Error::other("unknown recovery intent")),
@@ -304,7 +362,9 @@ pub(crate) fn restore_interrupted(
                     return Err(std::io::Error::other("invalid recovery intent"));
                 }
                 let destination = directory.join(name);
-                if kind != b'R' && !tracked(&destination)? {
+                if kind != b'R'
+                    && ((kind == b'M' && version.is_none()) || !tracked(&destination, version)?)
+                {
                     complete_replacement(&handle)?;
                     continue;
                 }
@@ -373,7 +433,7 @@ mod tests {
         std::fs::write(&path, b"old").unwrap();
         let archived = archive_replacement(&path).unwrap().unwrap();
         std::fs::write(&path, b"new").unwrap();
-        restore_interrupted(&root, |_| Ok(true)).unwrap();
+        restore_interrupted(&root, |_, _| Ok(true)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
         assert_eq!(std::fs::read(&archived).unwrap(), b"old");
         assert_eq!(
@@ -386,16 +446,37 @@ mod tests {
     }
 
     #[test]
+    fn restored_directory_moves_skip_already_queued_vanished_descendants() {
+        let root = std::env::temp_dir().join(format!("gdrive-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let original = root.join("original");
+        let moved = root.join("moved");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("child"), b"keep").unwrap();
+        move_with_intent(&root, &original, &moved, Some("version")).unwrap();
+        restore_queued(&root, vec![moved.clone(), root.clone()], |_, _| Ok(true)).unwrap();
+        assert_eq!(std::fs::read(original.join("child")).unwrap(), b"keep");
+        assert!(!moved.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            restore_interrupted(&root, |_, _| Ok(true))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn interrupted_moves_do_not_restore_a_replaced_unrelated_inode() {
         let root = std::env::temp_dir().join(format!("gdrive-recovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let original = root.join("original");
         let moved = root.join("moved");
         std::fs::write(&original, b"old").unwrap();
-        move_with_intent(&root, &original, &moved).unwrap();
+        move_with_intent(&root, &original, &moved, Some("version")).unwrap();
         std::fs::rename(&moved, root.join("kept")).unwrap();
         std::fs::write(&moved, b"unrelated").unwrap();
-        assert!(restore_interrupted(&root, |_| Ok(true)).is_err());
+        assert!(restore_interrupted(&root, |_, _| Ok(true)).is_err());
         assert!(!original.exists());
         assert_eq!(std::fs::read(moved).unwrap(), b"unrelated");
         assert_eq!(std::fs::read(root.join("kept")).unwrap(), b"old");
