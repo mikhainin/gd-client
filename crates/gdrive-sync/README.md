@@ -302,6 +302,10 @@ to the local-change queue rather than stopping the startup worker.
 Replacement/removal/move intent is synced before changing paths. Scans and remote
 polls reconcile it before processing missing tracked paths: restore an absent
 original without overwrite, or keep an already-published/new destination.
+Replay flushes both publication and archive parent names before clearing an
+intent, including already-present destinations and no-restore decisions.
+If a parent was removed, its nearest surviving ancestor is flushed; flush
+failures preserve the intent for a later retry.
 Removals and relocations consult committed database mappings so completed
 operations are not undone or reuploaded after a crash. Move journals capture the
 original mapping's unique state version; each metadata upsert/relocation changes

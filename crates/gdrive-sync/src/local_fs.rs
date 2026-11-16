@@ -270,6 +270,32 @@ impl LocalFs<'_> {
         blocking_fs(|| self.directory(path, false)?.0.sync_all())
     }
 
+    pub fn sync_parent(&self, path: &Path) -> io::Result<()> {
+        blocking_fs(|| {
+            let relative = path.strip_prefix(self.0).map_err(|_| invalid_path())?;
+            let parent = relative.parent().ok_or_else(invalid_path)?;
+            let mut directory = self.directory(self.0, false)?;
+            for component in parent.components() {
+                let Component::Normal(name) = component else {
+                    return Err(invalid_path());
+                };
+                match directory.child(name, false) {
+                    Ok(child) => directory = child,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            directory.0.sync_all()
+        })
+    }
+
     pub fn remove_dir(&self, path: &Path) -> io::Result<()> {
         blocking_fs(|| {
             let (parent, name) = self.parent(path)?;

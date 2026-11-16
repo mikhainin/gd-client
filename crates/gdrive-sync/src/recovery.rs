@@ -298,9 +298,23 @@ impl<'a> Recovery<'a> {
 
     fn restore_queued(
         &self,
-        mut directories: Vec<PathBuf>,
+        directories: Vec<PathBuf>,
         tracked: impl Fn(&Path, Option<&str>) -> std::io::Result<bool>,
     ) -> std::io::Result<()> {
+        self.restore_with(directories, tracked, |path| self.fs.sync_parent(path))
+    }
+
+    fn restore_with(
+        &self,
+        mut directories: Vec<PathBuf>,
+        tracked: impl Fn(&Path, Option<&str>) -> std::io::Result<bool>,
+        sync_parent: impl Fn(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let finish = |handle: &Path, destination: &Path, archived: &Path| {
+            sync_parent(destination)?;
+            sync_parent(archived)?;
+            self.complete_replacement(handle)
+        };
         while let Some(directory) = directories.pop() {
             let items = match self.fs.read_dir(&directory) {
                 Ok(items) => items,
@@ -417,11 +431,11 @@ impl<'a> Recovery<'a> {
                     if kind != b'R'
                         && ((kind == b'M' && version.is_none()) || !tracked(&destination, version)?)
                     {
-                        self.complete_replacement(&handle)?;
+                        finish(&handle, &destination, &archived)?;
                         continue;
                     }
                     if self.fs.try_exists(&destination)? {
-                        self.complete_replacement(&handle)?;
+                        finish(&handle, &destination, &archived)?;
                         continue;
                     }
                     let metadata = self.fs.metadata(&archived)?;
@@ -430,8 +444,6 @@ impl<'a> Recovery<'a> {
                     }
                     match self.fs.rename_no_replace(&archived, &destination) {
                         Ok(()) => {
-                            self.fs.sync_dir(archived.parent().unwrap())?;
-                            self.fs.sync_dir(&directory)?;
                             directories.push(destination.parent().unwrap().to_path_buf());
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -440,7 +452,7 @@ impl<'a> Recovery<'a> {
                                 && self.fs.try_exists(&destination)? => {}
                         Err(error) => return Err(error),
                     }
-                    self.complete_replacement(&handle)?;
+                    finish(&handle, &destination, &archived)?;
                 }
             }
         }
@@ -456,6 +468,43 @@ fn normal_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn replay_keeps_intents_until_publication_and_archive_names_are_durable() {
+        for fail_at in 0..2 {
+            let root =
+                std::env::temp_dir().join(format!("gdrive-recovery-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let source = root.join("file");
+            std::fs::write(&source, b"old").unwrap();
+            let recovery = Recovery::new(&root, uuid::Uuid::new_v4());
+            let archived = recovery.archive_replacement(&source).unwrap().unwrap();
+            std::fs::write(&source, b"published").unwrap();
+            let pending = root.join(DIRECTORY).join("pending");
+            let calls = std::cell::Cell::new(0);
+            let error = recovery
+                .restore_with(
+                    vec![root.clone()],
+                    |_, _| Ok(true),
+                    |path| {
+                        assert_eq!(std::fs::read_dir(&pending)?.count(), 1);
+                        let call = calls.replace(calls.get() + 1);
+                        if call == fail_at {
+                            return Err(std::io::ErrorKind::StorageFull.into());
+                        }
+                        recovery.fs.sync_parent(path)
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+            assert_eq!(std::fs::read_dir(&pending).unwrap().count(), 1);
+            assert_eq!(std::fs::read(&source).unwrap(), b"published");
+            assert_eq!(std::fs::read(&archived).unwrap(), b"old");
+            recovery.restore_interrupted(|_, _| Ok(true)).unwrap();
+            assert_eq!(std::fs::read_dir(pending).unwrap().count(), 0);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn move_intent_size_is_checked_before_publication_and_matches_the_reader_boundary() {
