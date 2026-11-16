@@ -143,7 +143,9 @@ feature in packaged binaries.
   The redirect listener is bound before opening the browser, has an eight-minute
   consent deadline and five-second request/response I/O deadlines, validates
   the generated state, and decodes exactly one authorization code. Incomplete
-  and oversized HTTP requests fail explicitly. The daemon additionally bounds
+  and oversized HTTP requests are rejected without ending consent. Failed,
+  idle and invalid-state connections do not cancel sign-in; only errors carrying
+  the matching state terminate it. The daemon additionally bounds
   the whole flow to ten minutes.
   The authorization-code exchange has a 15-second connection timeout and
   30-second request/body timeout, separate from refresh deadlines below.

@@ -346,6 +346,7 @@ async fn wait_for_redirect_code(
     tokio::time::timeout(deadline, async {
         loop {
             let (mut socket, _) = listener.accept().await?;
+            let connection = async {
             let request = tokio::time::timeout(io_timeout, async {
                 let mut request = Vec::new();
                 let mut buf = [0u8; 512];
@@ -371,13 +372,23 @@ async fn wait_for_redirect_code(
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
             );
-            tokio::time::timeout(io_timeout, async {
+            let reply = tokio::time::timeout(io_timeout, async {
                 socket.write_all(response.as_bytes()).await?;
                 socket.shutdown().await
             }).await.map_err(|source| SyncError::Timeout {
                 operation: "replying to the OAuth redirect", source: Box::new(source),
-            })??;
-            if let Some(code) = result? { return Ok(code); }
+            }).and_then(|result| result.map_err(SyncError::from));
+            if let Err(error) = reply {
+                tracing::warn!(%error, "could not reply to OAuth callback");
+            }
+            result
+            }.await;
+            match connection {
+                Ok(Some(code)) => return Ok(code),
+                Ok(None) => {}
+                Err(error @ SyncError::OAuthDeclined) => return Err(error),
+                Err(error) => tracing::debug!(%error, "ignored unsuccessful OAuth callback connection"),
+            }
         }
     }).await.map_err(|source| SyncError::Timeout {
         operation: "waiting for OAuth browser consent", source: Box::new(source),
@@ -407,14 +418,10 @@ fn redirect_code(request: &str, state: &str) -> Result<Option<String>, SyncError
     let pairs: Vec<_> = url.query_pairs().collect();
     let states: Vec<_> = pairs.iter().filter(|(key, _)| key == "state").collect();
     if states.len() != 1 || states[0].1 != state {
-        return Err(SyncError::OAuth(
-            "OAuth redirect state did not match; retry sign-in".into(),
-        ));
+        return Ok(None);
     }
     if pairs.iter().any(|(key, _)| key == "error") {
-        return Err(SyncError::OAuth(
-            "Google authorization was declined or failed".into(),
-        ));
+        return Err(SyncError::OAuthDeclined);
     }
     let codes: Vec<_> = pairs.iter().filter(|(key, _)| key == "code").collect();
     if codes.len() != 1 || codes[0].1.is_empty() {
@@ -518,16 +525,25 @@ mod tests {
             Some("a+b/c")
         );
         for target in [
-            "/?code=secret&state=wrong",
-            "/?code=secret",
             "/?code=one&code=two&state=nonce",
-            "/?code=secret&state=nonce&state=nonce",
             "/?error=access_denied&error_description=private&state=nonce",
         ] {
             let error =
                 redirect_code(&format!("GET {target} HTTP/1.1\r\n\r\n"), "nonce").unwrap_err();
             assert!(!error.to_string().contains("secret"));
             assert!(!error.to_string().contains("private"));
+        }
+        for target in [
+            "/?code=secret&state=wrong",
+            "/?code=secret",
+            "/?code=secret&state=nonce&state=nonce",
+            "/?error=access_denied&state=wrong",
+        ] {
+            assert!(
+                redirect_code(&format!("GET {target} HTTP/1.1\r\n\r\n"), "nonce")
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert!(redirect_code("GET /favicon.ico HTTP/1.1\r\n\r\n", "nonce")
             .unwrap()
@@ -568,6 +584,48 @@ mod tests {
             assert!(matches!(error, SyncError::Timeout { .. }));
             assert!(std::error::Error::source(&error).is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_state_and_idle_connections_do_not_cancel_browser_consent() {
+        let listener = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpListener::bind("127.0.0.1:0"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let browser = async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                for request in [
+                    Some("GET /?error=access_denied&state=wrong HTTP/1.1\r\n\r\n"),
+                    None,
+                    Some("GET /?code=valid&state=nonce HTTP/1.1\r\n\r\n"),
+                ] {
+                    let mut socket = tokio::net::TcpStream::connect(address).await?;
+                    if let Some(request) = request {
+                        socket.write_all(request.as_bytes()).await?;
+                    }
+                    let mut response = Vec::new();
+                    socket.read_to_end(&mut response).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let (code, ()) = tokio::join!(
+            wait_for_redirect_code(
+                listener,
+                "nonce",
+                Duration::from_secs(2),
+                Duration::from_millis(50)
+            ),
+            browser,
+        );
+        assert_eq!(code.unwrap(), "valid");
     }
 
     #[tokio::test]

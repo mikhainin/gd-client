@@ -61,6 +61,9 @@ pub enum SyncError {
     #[error("invalid OAuth token cache data")]
     OAuthCache(#[source] serde_json::Error),
 
+    #[error("Google authorization was declined or failed")]
+    OAuthDeclined,
+
     #[error("OAuth2 error: {0}")]
     OAuth(String),
 }
