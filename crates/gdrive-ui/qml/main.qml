@@ -263,6 +263,17 @@ ApplicationWindow {
         }
         anchors.centerIn: parent
         width: Math.min(420, root.width - 40)
+        onClosed: syncManager.cancelLocalFolderPicker()
+
+        Connections {
+            target: syncManager
+            function onLocalFolderPicked(path) {
+                if (addDialog.visible) localPathField.text = path
+            }
+            function onLocalPickerUnavailable() {
+                if (addDialog.visible) localFolderDialog.open()
+            }
+        }
         height: Math.min(460, root.height - 40)
 
         property string currentPath: Platform.StandardPaths.writableLocation(Platform.StandardPaths.HomeLocation)
@@ -442,19 +453,8 @@ ApplicationWindow {
                 AccessibleButton {
                     text: qsTr("Browse\u2026")
                     width: 84
-                    onClicked: {
-                        // Prefer a genuine native (KDE) folder picker via
-                        // `kdialog` when available; fall back to our own
-                        // FolderListModel-based browser otherwise.
-                        if (syncManager.nativeFolderPickerAvailable()) {
-                            var path = syncManager.pickLocalFolderNative(localPathField.text)
-                            if (path.length > 0) {
-                                localPathField.text = path
-                            }
-                        } else {
-                            localFolderDialog.open()
-                        }
-                    }
+                    enabled: !syncManager.localPickerLoading
+                    onClicked: syncManager.pickLocalFolderNative(localPathField.text)
                 }
             }
 

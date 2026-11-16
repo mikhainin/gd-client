@@ -7,6 +7,8 @@ mod application;
 pub mod cxxqt_object;
 #[path = "../src/dbus_client.rs"]
 mod dbus_client;
+#[path = "../src/local_picker.rs"]
+mod local_picker;
 
 use cxx_qt_lib::QString;
 

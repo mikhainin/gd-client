@@ -148,9 +148,12 @@ seconds. Subscription setup calls have five-second deadlines. A snapshot is
 requested after subscribing so initial state and restarts do not rely on receiving
 a signal; periodic polling remains a fallback for authentication.
 Browsing and mutations still execute independently, not through a serial queue.
-These guarantees apply to D-Bus requests, not local filesystem operations
-or the synchronous `kdialog --version` probe and local-folder picker, which
-can block the GUI thread and have no explicit timeout.
+Native local-folder selection also runs on the background runtime, with a
+two-minute deadline and bounded child cleanup. A missing `kdialog` opens the
+built-in browser; cancellation, process failure and timeout are distinct outcomes.
+Closing Add aborts the owned picker and invalidates queued completions. No
+synchronous availability probe runs on the GUI thread. Local filesystem
+operations are not covered by the D-Bus deadlines.
 
 ## UI testing
 
