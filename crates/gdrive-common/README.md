@@ -34,7 +34,8 @@ the complete new configuration. Loading a missing file returns `AppConfig::defau
 malformed or unreadable files return errors rather than being reset.
 These helpers perform deserialization, not semantic validation of paths,
 ownership, folder overlap, or polling values. `validate_local_roots` separately
-rejects equal/nested enabled roots, including symlink and bind-mount aliases.
+rejects equal/nested enabled roots, including symlink and bind-mount aliases,
+and duplicate enabled folder UUIDs even when their paths are disjoint.
 Linux mount information and descriptor mount IDs map each root and any nested
 mounts to their backing filesystem paths; unavailable or inconsistent mount
 information fails closed. Mount paths are decoded as raw filesystem bytes, so
@@ -48,7 +49,8 @@ bindings may overlap but must pass validation before they can be enabled.
 Case-insensitive aliases are not assumed distinct: existing directory components
 must be on the verified ext2/ext3/ext4, Btrfs, or tmpfs baseline, without the
 kernel casefold flag. FAT/exFAT, casefolded directories, and unverified
-filesystems are rejected explicitly, including ancestors of missing suffixes.
+filesystems are rejected explicitly, including canonical symlink-target
+ancestors and ancestors of missing suffixes.
 Directory-attribute inspection failures fail closed; older tmpfs kernels that
 lack both casefolding and the attribute ioctl are recognized separately.
 Runtime filesystem operations share these checks, including directories created

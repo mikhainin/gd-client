@@ -65,11 +65,6 @@ fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
                 if !std::fs::metadata(&canonical)?.is_dir() {
                     return Err(std::io::ErrorKind::NotADirectory.into());
                 }
-                let directory = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(&canonical)?;
-                verify_case_sensitive_directory(&directory)?;
                 resolved = canonical;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -82,7 +77,29 @@ fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
             Err(error) => return Err(error),
         }
     }
+    inspect_ancestors(&resolved, |_, directory| {
+        verify_case_sensitive_directory(directory)
+    })?;
     Ok(resolved)
+}
+
+fn inspect_ancestors(
+    path: &Path,
+    mut inspect: impl FnMut(&Path, &std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    for ancestor in path.ancestors() {
+        let directory = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(ancestor)
+        {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        inspect(ancestor, &directory)?;
+    }
+    Ok(())
 }
 
 /// Compare directory components, not string prefixes such as `photos`/`photos-old`.
@@ -92,9 +109,28 @@ fn overlap(first: &Path, second: &Path) -> bool {
 
 /// Return every affected enabled binding, leaving unrelated roots runnable.
 pub fn errors(folders: &[SyncFolder]) -> Vec<(Uuid, CommonError)> {
+    let mut seen = std::collections::HashSet::new();
+    let duplicates: std::collections::HashSet<_> = folders
+        .iter()
+        .filter(|folder| folder.enabled)
+        .filter_map(|folder| (!seen.insert(folder.id)).then_some(folder.id))
+        .collect();
     let mut errors = Vec::new();
     let mut roots = Vec::new();
     for folder in folders.iter().filter(|folder| folder.enabled) {
+        if duplicates.contains(&folder.id) {
+            errors.push((
+                folder.id,
+                CommonError::LocalRoot {
+                    path: folder.local_path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "duplicate enabled synchronization folder ID",
+                    ),
+                },
+            ));
+            continue;
+        }
         match ResolvedRoot::new(&folder.local_path) {
             Ok(root) => roots.push((folder.id, root)),
             Err(error) => errors.push((folder.id, error)),
@@ -119,6 +155,44 @@ mod tests {
     use super::*;
     use std::error::Error;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn canonical_targets_inspect_ancestors_even_with_a_missing_suffix() {
+        let root = std::env::temp_dir().join(format!("gdrive-roots-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("target/parent/leaf")).unwrap();
+        symlink(root.join("target/parent/leaf"), root.join("alias")).unwrap();
+        let resolved = resolve(&root.join("alias/future")).unwrap();
+        assert_eq!(resolved, root.join("target/parent/leaf/future"));
+        let error = inspect_ancestors(&resolved, |ancestor, _| {
+            if ancestor == root.join("target/parent") {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!root.join("target/parent/leaf/future").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_enabled_ids_are_rejected_even_for_disjoint_paths() {
+        let root = std::env::temp_dir().join(format!("gdrive-roots-{}", Uuid::new_v4()));
+        let first = SyncFolder::new("one", root.join("first"), "", "");
+        let mut second = SyncFolder::new("two", root.join("second"), "", "");
+        second.id = first.id;
+        let mut folders = [first, second];
+        let issues = errors(&folders);
+        assert_eq!(issues.len(), 2);
+        assert!(issues
+            .iter()
+            .all(|(_, error)| error.to_string().contains("duplicate enabled")));
+        assert!(!root.exists());
+        folders[0].enabled = false;
+        assert!(errors(&folders).is_empty());
+        assert!(!root.exists());
+    }
 
     #[test]
     fn equal_nested_and_symlinked_roots_conflict_without_creating_directories() {

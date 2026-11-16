@@ -69,11 +69,13 @@ disabling or removing bindings remains possible when correcting an old conflict.
 Casefolded or unverified filesystems are rejected, not treated as case-sensitive;
 see the [supported filesystem baseline](../gdrive-common/README.md#configuration).
 Read-only inspection runs outside the state lock with a three-second overall
-deadline, including queueing and startup snapshot retries. Only one inspection
-can run at once; a timed-out blocking read retains that slot until it exits,
+deadline, including queueing and startup snapshot retries. Daemon validation has
+one inspection slot; worker admission has a separate single slot with its own
+three-second deadline. A timed-out blocking read retains its slot until it exits,
 preventing repeated requests from accumulating blocked filesystem threads.
-Add/enable rechecks the original configuration before committing; concurrent
-changes require a retry rather than overwriting newer settings. Remove/disable
+Add/enable rechecks the original configuration and authentication session before
+committing; concurrent changes or sign-out require a retry rather than applying
+a stale request. Remove/disable
 commit and stop immediately, then inspect remaining root-blocked bindings
 without holding the state lock. Reconciliation failures appear in per-folder
 status and daemon logs; they do not misreport the committed mutation as failed.
@@ -113,8 +115,10 @@ request is rejected while one is pending. Its tokens are saved only when the
 current attempt completes. Completion saves the token and emits its signal
 under the state lock, then inspects a live configuration snapshot outside the
 lock. Applying the result rechecks both configuration and authentication
-generation under the lock, so a concurrent disable/remove or sign-out cannot
-be undone by a stale startup/sign-in snapshot.
+session revision under the lock, so a concurrent disable/remove or sign-out cannot
+be undone by a stale startup/sign-in snapshot. This revision changes on successful
+authentication and sign-out, independently of OAuth attempt generations; starting
+an attempt that later fails does not invalidate authenticated startup.
 `SignOut` cancels the pending attempt and invalidates late completions before
 deleting tokens. It awaits cancellation for up to two seconds to release the
 OAuth loopback listener before another sign-in can start. If cleanup exceeds

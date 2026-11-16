@@ -20,7 +20,8 @@ feature in packaged binaries.
   Transfers are sequential within each folder; enabled folders have separate
   workers. A missing Drive folder ID selects "My Drive" (`root`).
   Enabled local roots must not overlap, including symlink/bind-mount aliases
-  and backing trees reachable through nested mounts.
+  and backing trees reachable through nested mounts. Enabled folder UUIDs must
+  also be unique, even for disjoint roots.
   The supported filesystem baseline is non-casefolded ext2/ext3/ext4, Btrfs,
   and tmpfs, including root ancestors; other filesystems fail explicitly rather
   than guessing filename equivalence. Descendant symlinks and special files are
@@ -30,6 +31,9 @@ feature in packaged binaries.
   also reject overlapping direct `start_folder` calls and remain held until
   cancelled workers drop. Generations are registered before root resolution,
   so a stop during inspection prevents subsequent admission or mutation.
+  Read-only worker resolution shares one inspection slot and a three-second
+  queueing/execution deadline. A timed-out or cancelled lookup retains that slot
+  until its blocking read exits, but cannot admit a root or mutate files.
   Local mutations use non-detached blocking sections,
   yielding a multithreaded runtime's worker thread without allowing cancellation
   to release the root before the syscall finishes. Replacement workers wait in

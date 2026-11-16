@@ -26,6 +26,7 @@ const ROOT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
 struct ServiceState {
     config: AppConfig,
     sign_in_generation: u64,
+    session_revision: u64,
     sign_in: Option<JoinHandle<()>>,
     cancelling_sign_in: bool,
 }
@@ -43,6 +44,7 @@ impl ServiceState {
         }
         self.sign_in = None;
         engine.save_token(token, token_path)?;
+        self.session_revision = self.session_revision.wrapping_add(1);
         Ok(true)
     }
 
@@ -114,6 +116,7 @@ impl GDriveService {
             state: Arc::new(Mutex::new(ServiceState {
                 config,
                 sign_in_generation: 0,
+                session_revision: 0,
                 sign_in: None,
                 cancelling_sign_in: false,
             })),
@@ -177,28 +180,32 @@ impl GDriveService {
         Ok(())
     }
 
-    fn unchanged(state: &ServiceState, original: &AppConfig) -> zbus::fdo::Result<()> {
-        if state.config != *original {
+    fn unchanged(
+        state: &ServiceState,
+        original: &AppConfig,
+        session_revision: u64,
+    ) -> zbus::fdo::Result<()> {
+        if state.config != *original || state.session_revision != session_revision {
             return Err(zbus::fdo::Error::Failed(
-                "configuration changed during local root inspection; retry the operation".into(),
+                "configuration or authentication session changed during local root inspection; retry the operation".into(),
             ));
         }
         Ok(())
     }
 
-    pub async fn start_configured_folders(&self, generation: u64, only_blocked: bool) {
+    pub async fn start_configured_folders(&self, session_revision: u64, only_blocked: bool) {
         let deadline = tokio::time::Instant::now() + ROOT_INSPECTION_TIMEOUT;
         for _ in 0..3 {
             let original = {
                 let state = self.state.lock().await;
-                if state.sign_in_generation != generation {
+                if state.session_revision != session_revision {
                     return;
                 }
                 state.config.clone()
             };
             let result = self.inspect_roots(&original, deadline).await;
             let state = self.state.lock().await;
-            if state.sign_in_generation != generation {
+            if state.session_revision != session_revision {
                 return;
             }
             if state.config != original {
@@ -218,7 +225,7 @@ impl GDriveService {
             return;
         }
         let state = self.state.lock().await;
-        if state.sign_in_generation == generation {
+        if state.session_revision == session_revision {
             let error = SyncError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock,
                 "configuration kept changing during local root inspection; retry enabling the folder"));
             tracing::warn!(%error, "local sync root inspection interrupted");
@@ -286,8 +293,9 @@ impl GDriveService {
             Ok(true) => {
                 tracing::info!("sign-in succeeded");
                 Self::notify_authentication(emitter, true).await;
+                let session_revision = state.session_revision;
                 drop(state);
-                self.start_configured_folders(generation, false).await;
+                self.start_configured_folders(session_revision, false).await;
             }
             Ok(false) => {}
             Err(error) => {
@@ -376,14 +384,17 @@ impl GDriveService {
         folder.enabled = enabled;
         let id = folder.id;
 
-        let original = self.state.lock().await.config.clone();
+        let (original, session_revision) = {
+            let state = self.state.lock().await;
+            (state.config.clone(), state.session_revision)
+        };
         let mut config = original.clone();
         config.sync_folders.push(folder.clone());
         if enabled {
             self.validate_candidate(&config).await?;
         }
         let mut state = self.state.lock().await;
-        Self::unchanged(&state, &original)?;
+        Self::unchanged(&state, &original, session_revision)?;
         self.persist(&config)?;
         state.config = config;
 
@@ -403,9 +414,9 @@ impl GDriveService {
         self.persist(&config)?;
         state.config = config;
         self.engine.stop_folder_in_config(folder_id, &state.config);
-        let generation = state.sign_in_generation;
+        let session_revision = state.session_revision;
         drop(state);
-        self.start_configured_folders(generation, true).await;
+        self.start_configured_folders(session_revision, true).await;
         Ok(())
     }
 
@@ -414,7 +425,10 @@ impl GDriveService {
     async fn set_folder_enabled(&self, id: String, enabled: bool) -> zbus::fdo::Result<()> {
         let folder_id = parse_uuid(&id)?;
 
-        let original = self.state.lock().await.config.clone();
+        let (original, session_revision) = {
+            let state = self.state.lock().await;
+            (state.config.clone(), state.session_revision)
+        };
         let mut config = original.clone();
         let folder = config
             .sync_folders
@@ -427,7 +441,7 @@ impl GDriveService {
             self.validate_candidate(&config).await?;
         }
         let mut state = self.state.lock().await;
-        Self::unchanged(&state, &original)?;
+        Self::unchanged(&state, &original, session_revision)?;
         self.persist(&config)?;
         state.config = config;
 
@@ -435,9 +449,9 @@ impl GDriveService {
             self.engine.start_folder(folder);
         } else {
             self.engine.stop_folder_in_config(folder_id, &state.config);
-            let generation = state.sign_in_generation;
+            let session_revision = state.session_revision;
             drop(state);
-            self.start_configured_folders(generation, true).await;
+            self.start_configured_folders(session_revision, true).await;
         }
         Ok(())
     }
@@ -511,6 +525,7 @@ impl GDriveService {
     ) -> zbus::fdo::Result<()> {
         let (task, removal) = {
             let mut state = self.state.lock().await;
+            state.session_revision = state.session_revision.wrapping_add(1);
             let task = state.cancel_sign_in();
             self.engine.set_access_token(String::new());
             let removal = if self.token_path.exists() {
@@ -701,6 +716,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_add_and_enable_cannot_cross_session_invalidation() {
+        for enable in [false, true] {
+            let fixture = Fixture::new(AppConfig::default());
+            let mut folder = fixture.folder("pending");
+            folder.enabled = false;
+            {
+                let mut state = fixture.service.state.lock().await;
+                if enable {
+                    state.config.sync_folders.push(folder.clone());
+                }
+                fixture.service.persist(&state.config).unwrap();
+            }
+            let before = std::fs::read(&fixture.service.config_path).unwrap();
+            let permit = Arc::clone(&fixture.service.root_inspection)
+                .acquire_owned()
+                .await
+                .unwrap();
+            let pending = async {
+                if enable {
+                    fixture
+                        .service
+                        .set_folder_enabled(folder.id.to_string(), true)
+                        .await
+                } else {
+                    fixture
+                        .service
+                        .add_sync_folder(
+                            "pending".into(),
+                            "".into(),
+                            "".into(),
+                            folder.local_path.to_string_lossy().into(),
+                            "".into(),
+                            "".into(),
+                            true,
+                        )
+                        .await
+                        .map(|_| ())
+                }
+            };
+            tokio::pin!(pending);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                    .await
+                    .is_err()
+            );
+            fixture.service.state.lock().await.session_revision += 1;
+            drop(permit);
+            assert!(matches!(pending.await, Err(zbus::fdo::Error::Failed(_))));
+            assert_eq!(std::fs::read(&fixture.service.config_path).unwrap(), before);
+            assert!(!folder.local_path.exists());
+            assert!(fixture.service.engine.running_folders().is_empty());
+            if enable {
+                fixture
+                    .service
+                    .set_folder_enabled(folder.id.to_string(), true)
+                    .await
+                    .unwrap();
+            } else {
+                fixture
+                    .service
+                    .add_sync_folder(
+                        "after sign-out".into(),
+                        "".into(),
+                        "".into(),
+                        folder.local_path.to_string_lossy().into(),
+                        "".into(),
+                        "".into(),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(fixture.service.engine.running_folders().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_sign_in_attempt_does_not_invalidate_authenticated_startup() {
+        let fixture = Fixture::new(AppConfig::default());
+        let folder = fixture.folder("authenticated");
+        fixture
+            .service
+            .engine
+            .save_token(token(), &fixture.service.token_path)
+            .unwrap();
+        fixture
+            .service
+            .state
+            .lock()
+            .await
+            .config
+            .sync_folders
+            .push(folder.clone());
+        let permit = Arc::clone(&fixture.service.root_inspection)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let startup = fixture.service.start_configured_folders(0, false);
+        tokio::pin!(startup);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut startup)
+                .await
+                .is_err()
+        );
+        fixture.service.state.lock().await.sign_in_generation += 1;
+        drop(permit);
+        startup.await;
+        assert_eq!(fixture.service.engine.running_folders(), vec![folder.id]);
+        fixture.service.engine.stop_folder(folder.id);
+        assert!(fixture.service.is_authenticated().await.unwrap());
+    }
+
+    #[tokio::test]
     async fn delayed_startup_cannot_reverse_a_disable_or_sign_out() {
         for sign_out in [false, true] {
             let fixture = Fixture::new(AppConfig::default());
@@ -727,7 +855,7 @@ mod tests {
             {
                 let mut state = fixture.service.state.lock().await;
                 if sign_out {
-                    state.sign_in_generation += 1;
+                    state.session_revision += 1;
                 } else {
                     state.config.sync_folders[0].enabled = false;
                 }
@@ -1164,6 +1292,7 @@ mod tests {
             let mut signals = proxy.receive_authentication_changed().await.unwrap();
             assert!(proxy.is_authenticated().await.unwrap());
             proxy.sign_out().await.unwrap();
+            assert!(fixture.service.state.lock().await.session_revision > 0);
             let signal = std::future::poll_fn(|cx| std::pin::Pin::new(&mut signals).poll_next(cx))
                 .await
                 .unwrap();

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gdrive_common::{local_roots, AppConfig, CommonError, SyncFolder};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -69,6 +69,27 @@ pub struct SyncEngine {
     blocked_roots: Arc<Mutex<HashSet<Uuid>>>,
 }
 
+async fn inspect_root<T: Send + 'static>(
+    gate: Arc<Semaphore>,
+    deadline: Duration,
+    inspect: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, SyncError> {
+    tokio::time::timeout(deadline, async move {
+        let permit = gate.acquire_owned().await.map_err(std::io::Error::other)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            inspect()
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error)))
+    })
+    .await
+    .map_err(|source| SyncError::Timeout {
+        operation: "resolving a worker local root",
+        source: Box::new(source),
+    })?
+}
+
 struct RootEntry {
     folder_id: Uuid,
     root: Option<local_roots::ResolvedRoot>,
@@ -76,6 +97,7 @@ struct RootEntry {
 }
 
 struct RootRegistry {
+    resolution: Arc<Semaphore>,
     active: Mutex<HashMap<u64, RootEntry>>,
     changes: watch::Sender<()>,
 }
@@ -83,6 +105,7 @@ struct RootRegistry {
 impl Default for RootRegistry {
     fn default() -> Self {
         Self {
+            resolution: Arc::new(Semaphore::new(1)),
             active: Mutex::default(),
             changes: watch::channel(()).0,
         }
@@ -265,10 +288,15 @@ impl SyncEngine {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let run = self.status.start(folder_id, generation);
         let lease = RootLease::register(Arc::clone(&self.roots), folder_id, generation);
+        let resolution = Arc::clone(&self.roots.resolution);
 
         let handle = tokio::spawn(async move {
             let result = async {
-                let root = blocking_fs(|| local_roots::ResolvedRoot::new(&folder.local_path))?;
+                let path = folder.local_path.clone();
+                let root = inspect_root(resolution, Duration::from_secs(3), move || {
+                    local_roots::ResolvedRoot::new(&path)
+                })
+                .await??;
                 folder.local_path = root.path.clone();
                 loop {
                     match lease.admit(&root).await {
@@ -1962,6 +1990,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_inspection_keeps_its_slot_after_timeout_without_accumulating_jobs() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, stalled) = std::sync::mpsc::channel();
+        let first = tokio::spawn(inspect_root(
+            Arc::clone(&gate),
+            Duration::from_millis(20),
+            move || {
+                started.send(()).unwrap();
+                stalled.recv().unwrap();
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(SyncError::Timeout { .. })
+        ));
+        assert_eq!(gate.available_permits(), 0);
+        let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second = inspect_root(Arc::clone(&gate), Duration::from_millis(20), {
+            let invoked = Arc::clone(&invoked);
+            move || invoked.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert!(matches!(second, Err(SyncError::Timeout { .. })));
+        assert!(!invoked.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), gate.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+    }
+
+    #[tokio::test]
     async fn cancellation_before_admission_cannot_publish_an_active_root() {
         let path = std::env::temp_dir().join(format!("gdrive-pending-root-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();
@@ -1994,7 +2060,7 @@ mod tests {
         };
         engine.start_all(&config);
         assert!(engine.running_folders().is_empty());
-        assert!(engine.sync_status().folders[0].errors[0].contains("roots overlap"));
+        assert!(engine.sync_status().folders[0].errors[0].contains("duplicate enabled"));
         assert!(!first.local_path.join("nested").exists());
         assert_eq!(
             std::fs::read(first.local_path.join("file.txt")).unwrap(),
