@@ -7,6 +7,7 @@ pub mod drive_client;
 pub mod engine;
 pub mod error;
 mod google_document;
+mod local_fs;
 pub mod local_watcher;
 pub mod ownership;
 pub mod state_db;

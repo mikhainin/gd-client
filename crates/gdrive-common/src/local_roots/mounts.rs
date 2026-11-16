@@ -48,7 +48,7 @@ fn parse(text: &[u8]) -> io::Result<Vec<Mount>> {
         .filter(|line| !line.is_empty())
         .map(|line| {
             let fields: Vec<_> = line
-                .split(u8::is_ascii_whitespace)
+                .split(|byte| *byte == b' ')
                 .filter(|field| !field.is_empty())
                 .collect();
             if fields.len() < 10 || !fields[6..].contains(&b"-".as_slice()) {
@@ -210,14 +210,15 @@ mod tests {
         assert_eq!(mounts[0].point, Path::new("/mount\\name"));
         assert!(parse(b"2 1 0:4 net:[123] /namespace rw - nsfs nsfs rw").is_ok());
         assert!(parse(b"1 0 8:1 /bad\\00 /point rw - ext4 /dev/fixture rw").is_err());
-        let bytes = parse(b"1 0 8:1 /raw-\xff /mount-\xfe rw - ext4 /dev/fixture rw").unwrap();
+        let bytes =
+            parse(b"1 0 8:1 /raw-\xff /mount-\xfe\r\x0c rw - ext4 /dev/fixture rw").unwrap();
         assert_eq!(
             bytes[0].root,
             PathBuf::from(std::ffi::OsString::from_vec(b"/raw-\xff".to_vec()))
         );
         assert_eq!(
             bytes[0].point,
-            PathBuf::from(std::ffi::OsString::from_vec(b"/mount-\xfe".to_vec()))
+            PathBuf::from(std::ffi::OsString::from_vec(b"/mount-\xfe\r\x0c".to_vec()))
         );
     }
 }

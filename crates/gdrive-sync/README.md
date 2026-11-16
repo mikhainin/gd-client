@@ -21,6 +21,10 @@ feature in packaged binaries.
   workers. A missing Drive folder ID selects "My Drive" (`root`).
   Enabled local roots must not overlap, including symlink/bind-mount aliases
   and backing trees reachable through nested mounts.
+  The supported filesystem baseline is non-casefolded ext2/ext3/ext4, Btrfs,
+  and tmpfs, including root ancestors; other filesystems fail explicitly rather
+  than guessing filename equivalence. Descendant symlinks and special files are
+  unsupported. Root-level aliases are resolved before worker admission.
   Startup blocks every affected binding before filesystem or Drive mutations,
   reports per-folder errors, and leaves unrelated bindings runnable. Root leases
   also reject overlapping direct `start_folder` calls and remain held until
@@ -39,9 +43,16 @@ feature in packaged binaries.
   configuration lock without filesystem inspection. Those callers must
   revalidate the inspected snapshot before applying it. Direct `start_all`
   and `reconcile_blocked_roots` inspect synchronously.
-  Workers use the resolved local root. Disable sync before moving a root or
-  changing its ancestor directories; such external topology changes are not
-  coordinated with running workers.
+  Workers use the resolved local root. Local reads, directory creation, staging,
+  publication, relocation, removal, and ownership changes walk pinned directory
+  descriptors with Linux `openat2` no-symlink/beneath resolution. Parent-path
+  replacement cannot redirect a subsequent syscall through a symlink.
+  File reads pin and validate regular-file identity before opening data;
+  ownership changes use the pinned inode. This requires Linux 5.6 or newer and
+  accessible `/proc/self/fd`; there is no unsafe path-based fallback.
+  Disable sync before moving a root, changing its ancestors, mount topology,
+  or directory casefold settings. Descriptor pinning is not a filesystem
+  transaction or coordination with external directory moves.
   Live parent metadata resolves subtree membership, including moves into/out of
   the sync root; directory moves relocate descendant mappings together.
   Failed polls retain their cursor for replay after reconnect or restart.

@@ -45,6 +45,14 @@ components are canonicalized before normalizing `..`; missing suffixes are
 allowed without creating anything. Dangling symlinks, non-directory components,
 and inaccessible paths fail explicitly with a preserved I/O source. Disabled
 bindings may overlap but must pass validation before they can be enabled.
+Case-insensitive aliases are not assumed distinct: existing directory components
+must be on the verified ext2/ext3/ext4, Btrfs, or tmpfs baseline, without the
+kernel casefold flag. FAT/exFAT, casefolded directories, and unverified
+filesystems are rejected explicitly, including ancestors of missing suffixes.
+Directory-attribute inspection failures fail closed; older tmpfs kernels that
+lack both casefolding and the attribute ioctl are recognized separately.
+Runtime filesystem operations share these checks, including directories created
+or encountered below an admitted root. Validation never creates case-probe files.
 
 Omitted TOML `sync_folders` defaults to an empty list and omitted
 `poll_interval_secs` defaults to 60, also for `AppConfig::default()` and a missing

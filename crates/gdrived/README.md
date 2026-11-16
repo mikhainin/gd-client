@@ -66,6 +66,8 @@ states; the on-disk file is either the complete previous or new configuration. S
 Adding or enabling an active binding rejects equal/nested local roots, including
 symlink aliases, before saving or starting workers. Disabled bindings may overlap;
 disabling or removing bindings remains possible when correcting an old conflict.
+Casefolded or unverified filesystems are rejected, not treated as case-sensitive;
+see the [supported filesystem baseline](../gdrive-common/README.md#configuration).
 Read-only inspection runs outside the state lock with a three-second overall
 deadline, including queueing and startup snapshot retries. Only one inspection
 can run at once; a timed-out blocking read retains that slot until it exits,

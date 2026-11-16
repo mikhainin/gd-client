@@ -1,12 +1,15 @@
 //! Resolve local roots without creating them, and reject overlapping active bindings.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use uuid::Uuid;
 
 use crate::{CommonError, SyncFolder};
 
+mod case_sensitivity;
 mod mounts;
+pub use case_sensitivity::{verify_case_sensitive_directory, verify_local_filesystem};
 
 #[derive(Clone)]
 pub struct ResolvedRoot {
@@ -62,6 +65,11 @@ fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
                 if !std::fs::metadata(&canonical)?.is_dir() {
                     return Err(std::io::ErrorKind::NotADirectory.into());
                 }
+                let directory = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&canonical)?;
+                verify_case_sensitive_directory(&directory)?;
                 resolved = canonical;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
