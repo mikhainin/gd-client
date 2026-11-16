@@ -345,20 +345,15 @@ impl SyncEngine {
     /// initial daemon startup; use [`Self::start_folder`]/[`Self::stop_folder`]
     /// afterwards to react to configuration changes at runtime.
     pub fn start_all(&self, config: &AppConfig) {
-        let errors: HashMap<_, _> = local_roots::errors(&config.sync_folders)
-            .into_iter()
-            .collect();
+        self.start_all_inspected(config, local_roots::errors(&config.sync_folders));
+    }
+
+    /// Apply diagnostics prepared from the same configuration without filesystem I/O.
+    pub fn start_all_inspected(&self, config: &AppConfig, errors: Vec<(Uuid, CommonError)>) {
+        let errors: HashMap<_, _> = errors.into_iter().collect();
         for folder in config.sync_folders.iter().filter(|f| f.enabled) {
             if let Some(error) = errors.get(&folder.id) {
-                self.stop_folder(folder.id);
-                let generation = self.generation.fetch_add(1, Ordering::Relaxed);
-                let run = self.status.start(folder.id, generation);
-                run.finish("local roots", Err(error.to_string()));
-                self.blocked_roots.lock().unwrap().insert(folder.id);
-                let _ = self.events.send(SyncEvent::Error {
-                    folder_id: Some(folder.id),
-                    message: error.to_string(),
-                });
+                self.block_root(folder.id, &error.to_string());
                 continue;
             }
             self.start_folder(folder.clone());
@@ -366,6 +361,12 @@ impl SyncEngine {
     }
 
     pub fn stop_folder_and_reconcile(&self, folder_id: Uuid, config: &AppConfig) {
+        self.stop_folder_in_config(folder_id, config);
+        self.reconcile_blocked_roots(config);
+    }
+
+    /// Stop immediately, retaining retry eligibility for a remaining duplicate binding.
+    pub fn stop_folder_in_config(&self, folder_id: Uuid, config: &AppConfig) {
         let was_blocked = self.blocked_roots.lock().unwrap().contains(&folder_id);
         self.stop_folder(folder_id);
         if was_blocked
@@ -376,24 +377,53 @@ impl SyncEngine {
         {
             self.blocked_roots.lock().unwrap().insert(folder_id);
         }
-        self.reconcile_blocked_roots(config);
     }
 
     /// Retry only bindings blocked by startup root validation, not unrelated failures.
     pub fn reconcile_blocked_roots(&self, config: &AppConfig) {
+        self.reconcile_roots_inspected(config, local_roots::errors(&config.sync_folders));
+    }
+
+    /// Reconcile root-blocked workers using diagnostics for this configuration.
+    pub fn reconcile_roots_inspected(&self, config: &AppConfig, errors: Vec<(Uuid, CommonError)>) {
         let blocked = self.blocked_roots.lock().unwrap().clone();
         if blocked.is_empty() {
             return;
         }
-        let errors: HashSet<_> = local_roots::errors(&config.sync_folders)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let errors: HashSet<_> = errors.into_iter().map(|(id, _)| id).collect();
         for folder in config.sync_folders.iter().filter(|folder| {
             folder.enabled && blocked.contains(&folder.id) && !errors.contains(&folder.id)
         }) {
             self.start_folder(folder.clone());
         }
+    }
+
+    pub fn root_inspection_failed(
+        &self,
+        config: &AppConfig,
+        error: &SyncError,
+        only_blocked: bool,
+    ) {
+        let blocked = self.blocked_roots.lock().unwrap().clone();
+        for folder in config
+            .sync_folders
+            .iter()
+            .filter(|folder| folder.enabled && (!only_blocked || blocked.contains(&folder.id)))
+        {
+            self.block_root(folder.id, &error.to_string());
+        }
+    }
+
+    fn block_root(&self, folder_id: Uuid, message: &str) {
+        self.stop_folder(folder_id);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed);
+        let run = self.status.start(folder_id, generation);
+        run.finish("local roots", Err(message.to_owned()));
+        self.blocked_roots.lock().unwrap().insert(folder_id);
+        let _ = self.events.send(SyncEvent::Error {
+            folder_id: Some(folder_id),
+            message: message.to_owned(),
+        });
     }
 }
 

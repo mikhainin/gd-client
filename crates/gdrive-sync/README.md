@@ -34,6 +34,11 @@ feature in packaged binaries.
   root-blocked bindings, without restarting unrelated workers or failures.
   A remaining enabled binding with a duplicate configured UUID retains its
   root-blocked retry marker when another occurrence is disabled.
+  The daemon prepares root diagnostics off-lock and uses
+  `start_all_inspected`/`reconcile_roots_inspected` to apply them under its
+  configuration lock without filesystem inspection. Those callers must
+  revalidate the inspected snapshot before applying it. Direct `start_all`
+  and `reconcile_blocked_roots` inspect synchronously.
   Workers use the resolved local root. Disable sync before moving a root or
   changing its ancestor directories; such external topology changes are not
   coordinated with running workers.

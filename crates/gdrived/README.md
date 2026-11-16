@@ -25,11 +25,7 @@ On startup it:
    If none is available, it still starts the D-Bus service so `gdrive-ui`
    can request sign-in. An unreadable or malformed token cache is logged and
    treated as signed out.
-3. Starts the `gdrive_sync::SyncEngine` for every enabled sync folder when
-   a cached token is available, except bindings with overlapping or invalid local
-   roots. Affected bindings remain stopped with explicit status errors; unrelated
-   bindings still start and the D-Bus service remains available to correct settings.
-4. Serves the `org.gclient.GDrive1` interface (defined in
+3. Serves the `org.gclient.GDrive1` interface (defined in
    `gdrive_common::dbus_api`, implemented in `dbus_service.rs`) on the
    session D-Bus bus, exposing `ListSyncFolders`/`AddSyncFolder`/
    `RemoveSyncFolder`/`SetFolderEnabled`/`IsAuthenticated`/`SignIn`/
@@ -39,6 +35,11 @@ On startup it:
    interaction; `SignOut` deletes the cached token and stops all running
    folders. Successful sign-in and sign-out emit `AuthenticationChanged(b)`;
    current-attempt failures emit `SignInFailed(s)`.
+4. After claiming the bus name, inspects enabled local roots and starts the
+   `gdrive_sync::SyncEngine` when a cached token is available. Overlapping or
+   invalid bindings remain stopped with explicit status errors; unrelated
+   bindings still start. Inspection is bounded and does not hold the service
+   state lock, so stalled root metadata cannot prevent D-Bus access.
 
 The daemon also opens `sync-state.sqlite3` under
 `$XDG_DATA_HOME/gdrive-client` (normally `~/.local/share/gdrive-client`);
@@ -65,6 +66,15 @@ states; the on-disk file is either the complete previous or new configuration. S
 Adding or enabling an active binding rejects equal/nested local roots, including
 symlink aliases, before saving or starting workers. Disabled bindings may overlap;
 disabling or removing bindings remains possible when correcting an old conflict.
+Read-only inspection runs outside the state lock with a three-second overall
+deadline, including queueing and startup snapshot retries. Only one inspection
+can run at once; a timed-out blocking read retains that slot until it exits,
+preventing repeated requests from accumulating blocked filesystem threads.
+Add/enable rechecks the original configuration before committing; concurrent
+changes require a retry rather than overwriting newer settings. Remove/disable
+commit and stop immediately, then inspect remaining root-blocked bindings
+without holding the state lock. Reconciliation failures appear in per-folder
+status and daemon logs; they do not misreport the committed mutation as failed.
 Removing a sync folder,
 disabling it, or signing out stops workers without deleting local or remote
 files. Sign-out retains folder configuration and the sync-state database.
@@ -98,9 +108,11 @@ even while signed out; this does not authenticate them.
 
 The OAuth flow has a ten-minute overall deadline, and a duplicate `SignIn`
 request is rejected while one is pending. Its tokens are saved only when the
-current attempt completes. Completion reads the live configuration and starts
-enabled folders while holding the same state lock used by folder mutations,
-so a concurrent disable/remove cannot be undone by a stale sign-in snapshot.
+current attempt completes. Completion saves the token and emits its signal
+under the state lock, then inspects a live configuration snapshot outside the
+lock. Applying the result rechecks both configuration and authentication
+generation under the lock, so a concurrent disable/remove or sign-out cannot
+be undone by a stale startup/sign-in snapshot.
 `SignOut` cancels the pending attempt and invalidates late completions before
 deleting tokens. It awaits cancellation for up to two seconds to release the
 OAuth loopback listener before another sign-in can start. If cleanup exceeds

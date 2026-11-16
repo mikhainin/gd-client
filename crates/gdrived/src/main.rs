@@ -2,10 +2,9 @@
 //! with Google Drive.
 //!
 //! On startup it loads the persisted configuration and cached OAuth token,
-//! starts the sync engine for every enabled folder, and exposes a D-Bus
-//! interface (see [`dbus_service`]) on the session bus at
+//! exposes a D-Bus interface (see [`dbus_service`]) on the session bus at
 //! `org.gclient.GDrive1` so the `gdrive-ui` application can list/add/remove/
-//! toggle sync folders at runtime.
+//! toggle sync folders at runtime, then validates and starts enabled folders.
 
 mod dbus_service;
 
@@ -65,10 +64,6 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut events = engine.subscribe();
     let status_changes = engine.subscribe_status();
-    if authenticated {
-        engine.start_all(&config);
-    }
-
     let service = dbus_service::GDriveService::new(
         config,
         config_path,
@@ -81,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         zbus::connection::Builder::session()
             .method_timeout(std::time::Duration::from_secs(5))
             .name(BUS_NAME)
-            .serve_at(OBJECT_PATH, service)
+            .serve_at(OBJECT_PATH, service.clone())
             .build(),
     )
     .await??;
@@ -107,6 +102,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    if authenticated {
+        service.start_configured_folders(0, false).await;
+    }
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutting down");

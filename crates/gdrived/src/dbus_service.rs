@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gdrive_common::dbus_api::{DriveFolderRow, SyncFolderRow, SyncStatus};
-use gdrive_common::{AppConfig, SyncFolder};
+use gdrive_common::{local_roots, AppConfig, CommonError, SyncFolder};
 use gdrive_sync::auth::{self, OAuthConfig};
 use gdrive_sync::{SyncEngine, SyncError};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zbus::interface;
@@ -21,6 +21,7 @@ use zbus::object_server::SignalEmitter;
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SIGN_IN_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+const ROOT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct ServiceState {
     config: AppConfig,
@@ -42,7 +43,6 @@ impl ServiceState {
         }
         self.sign_in = None;
         engine.save_token(token, token_path)?;
-        engine.start_all(&self.config);
         Ok(true)
     }
 
@@ -75,6 +75,7 @@ pub struct GDriveService {
     config_path: PathBuf,
     token_path: PathBuf,
     engine: SyncEngine,
+    root_inspection: Arc<Semaphore>,
 }
 
 impl GDriveService {
@@ -119,6 +120,7 @@ impl GDriveService {
             config_path,
             token_path,
             engine,
+            root_inspection: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -126,6 +128,103 @@ impl GDriveService {
         config
             .save_to(&self.config_path)
             .map_err(|e| zbus::fdo::Error::Failed(format!("failed to save configuration: {e}")))
+    }
+
+    async fn inspect_roots(
+        &self,
+        config: &AppConfig,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<(Uuid, CommonError)>, SyncError> {
+        if !config.sync_folders.iter().any(|folder| folder.enabled) {
+            return Ok(Vec::new());
+        }
+        let folders = config.sync_folders.clone();
+        let gate = Arc::clone(&self.root_inspection);
+        tokio::time::timeout_at(deadline, async move {
+            let permit = gate.acquire_owned().await.map_err(std::io::Error::other)?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                local_roots::errors(&folders)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error)))
+        })
+        .await
+        .map_err(|source| SyncError::Timeout {
+            operation: "inspecting local sync roots",
+            source: Box::new(source),
+        })?
+    }
+
+    async fn validate_candidate(&self, config: &AppConfig) -> zbus::fdo::Result<()> {
+        let errors = self
+            .inspect_roots(
+                config,
+                tokio::time::Instant::now() + ROOT_INSPECTION_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "local root inspection failed before configuration commit");
+                if matches!(error, SyncError::Timeout { .. }) {
+                    zbus::fdo::Error::Timeout(error.to_string())
+                } else {
+                    zbus::fdo::Error::Failed(error.to_string())
+                }
+            })?;
+        if let Some((_, error)) = errors.first() {
+            return Err(zbus::fdo::Error::InvalidArgs(error.to_string()));
+        }
+        Ok(())
+    }
+
+    fn unchanged(state: &ServiceState, original: &AppConfig) -> zbus::fdo::Result<()> {
+        if state.config != *original {
+            return Err(zbus::fdo::Error::Failed(
+                "configuration changed during local root inspection; retry the operation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn start_configured_folders(&self, generation: u64, only_blocked: bool) {
+        let deadline = tokio::time::Instant::now() + ROOT_INSPECTION_TIMEOUT;
+        for _ in 0..3 {
+            let original = {
+                let state = self.state.lock().await;
+                if state.sign_in_generation != generation {
+                    return;
+                }
+                state.config.clone()
+            };
+            let result = self.inspect_roots(&original, deadline).await;
+            let state = self.state.lock().await;
+            if state.sign_in_generation != generation {
+                return;
+            }
+            if state.config != original {
+                continue;
+            }
+            match result {
+                Ok(errors) if only_blocked => {
+                    self.engine.reconcile_roots_inspected(&original, errors)
+                }
+                Ok(errors) => self.engine.start_all_inspected(&original, errors),
+                Err(error) => {
+                    tracing::error!(%error, "local sync root inspection failed");
+                    self.engine
+                        .root_inspection_failed(&original, &error, only_blocked);
+                }
+            }
+            return;
+        }
+        let state = self.state.lock().await;
+        if state.sign_in_generation == generation {
+            let error = SyncError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock,
+                "configuration kept changing during local root inspection; retry enabling the folder"));
+            tracing::warn!(%error, "local sync root inspection interrupted");
+            self.engine
+                .root_inspection_failed(&state.config, &error, only_blocked);
+        }
     }
 
     async fn finish_sign_in_cancellation(
@@ -187,6 +286,8 @@ impl GDriveService {
             Ok(true) => {
                 tracing::info!("sign-in succeeded");
                 Self::notify_authentication(emitter, true).await;
+                drop(state);
+                self.start_configured_folders(generation, false).await;
             }
             Ok(false) => {}
             Err(error) => {
@@ -275,14 +376,14 @@ impl GDriveService {
         folder.enabled = enabled;
         let id = folder.id;
 
-        let mut state = self.state.lock().await;
-        let mut config = state.config.clone();
+        let original = self.state.lock().await.config.clone();
+        let mut config = original.clone();
         config.sync_folders.push(folder.clone());
         if enabled {
-            config
-                .validate_local_roots()
-                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+            self.validate_candidate(&config).await?;
         }
+        let mut state = self.state.lock().await;
+        Self::unchanged(&state, &original)?;
         self.persist(&config)?;
         state.config = config;
 
@@ -301,8 +402,10 @@ impl GDriveService {
         config.sync_folders.retain(|f| f.id != folder_id);
         self.persist(&config)?;
         state.config = config;
-        self.engine
-            .stop_folder_and_reconcile(folder_id, &state.config);
+        self.engine.stop_folder_in_config(folder_id, &state.config);
+        let generation = state.sign_in_generation;
+        drop(state);
+        self.start_configured_folders(generation, true).await;
         Ok(())
     }
 
@@ -311,8 +414,8 @@ impl GDriveService {
     async fn set_folder_enabled(&self, id: String, enabled: bool) -> zbus::fdo::Result<()> {
         let folder_id = parse_uuid(&id)?;
 
-        let mut state = self.state.lock().await;
-        let mut config = state.config.clone();
+        let original = self.state.lock().await.config.clone();
+        let mut config = original.clone();
         let folder = config
             .sync_folders
             .iter_mut()
@@ -321,18 +424,20 @@ impl GDriveService {
         folder.enabled = enabled;
         let folder = folder.clone();
         if enabled {
-            config
-                .validate_local_roots()
-                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+            self.validate_candidate(&config).await?;
         }
+        let mut state = self.state.lock().await;
+        Self::unchanged(&state, &original)?;
         self.persist(&config)?;
         state.config = config;
 
         if enabled {
             self.engine.start_folder(folder);
         } else {
-            self.engine
-                .stop_folder_and_reconcile(folder_id, &state.config);
+            self.engine.stop_folder_in_config(folder_id, &state.config);
+            let generation = state.sign_in_generation;
+            drop(state);
+            self.start_configured_folders(generation, true).await;
         }
         Ok(())
     }
@@ -529,6 +634,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_inspection_is_bounded_off_lock_and_rejects_stale_candidates() {
+        for change_config in [false, true] {
+            let fixture = Fixture::new(AppConfig::default());
+            let permit = Arc::clone(&fixture.service.root_inspection)
+                .acquire_owned()
+                .await
+                .unwrap();
+            let path = fixture.root.join("inspected");
+            let request = fixture.service.add_sync_folder(
+                "inspected".into(),
+                "".into(),
+                "".into(),
+                path.to_string_lossy().into(),
+                "".into(),
+                "".into(),
+                true,
+            );
+            tokio::pin!(request);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut request)
+                    .await
+                    .is_err()
+            );
+            let state =
+                tokio::time::timeout(Duration::from_millis(100), fixture.service.state.lock())
+                    .await
+                    .unwrap();
+            assert!(state.config.sync_folders.is_empty());
+            drop(state);
+            if change_config {
+                fixture
+                    .service
+                    .add_sync_folder(
+                        "other".into(),
+                        "".into(),
+                        "".into(),
+                        fixture.root.join("other").to_string_lossy().into(),
+                        "".into(),
+                        "".into(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                drop(permit);
+                assert!(matches!(request.await, Err(zbus::fdo::Error::Failed(_))));
+                let config = AppConfig::load_from(&fixture.service.config_path).unwrap();
+                assert_eq!(config.sync_folders.len(), 1);
+                assert_eq!(config.sync_folders[0].display_name, "other");
+            } else {
+                assert!(matches!(request.await, Err(zbus::fdo::Error::Timeout(_))));
+                assert!(!fixture.service.config_path.exists());
+                assert!(fixture
+                    .service
+                    .state
+                    .lock()
+                    .await
+                    .config
+                    .sync_folders
+                    .is_empty());
+                drop(permit);
+            }
+            assert!(!path.exists());
+            assert!(fixture.service.engine.running_folders().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_startup_cannot_reverse_a_disable_or_sign_out() {
+        for sign_out in [false, true] {
+            let fixture = Fixture::new(AppConfig::default());
+            let folder = fixture.folder("delayed");
+            fixture
+                .service
+                .state
+                .lock()
+                .await
+                .config
+                .sync_folders
+                .push(folder.clone());
+            let permit = Arc::clone(&fixture.service.root_inspection)
+                .acquire_owned()
+                .await
+                .unwrap();
+            let startup = fixture.service.start_configured_folders(0, false);
+            tokio::pin!(startup);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut startup)
+                    .await
+                    .is_err()
+            );
+            {
+                let mut state = fixture.service.state.lock().await;
+                if sign_out {
+                    state.sign_in_generation += 1;
+                } else {
+                    state.config.sync_folders[0].enabled = false;
+                }
+            }
+            drop(permit);
+            startup.await;
+            assert!(!folder.local_path.exists());
+            assert!(fixture.service.engine.running_folders().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn removing_or_disabling_a_conflict_restarts_the_other_blocked_binding() {
         for (remove, duplicate_id) in [(false, false), (true, false), (false, true)] {
             let fixture = Fixture::new(AppConfig::default());
@@ -714,6 +925,7 @@ mod tests {
                 )
                 .unwrap());
         }
+        fixture.service.start_configured_folders(1, false).await;
         assert_eq!(
             fixture.service.engine.running_folders(),
             vec![parse_uuid(&added).unwrap()]
