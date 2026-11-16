@@ -313,6 +313,9 @@ Restores verify recorded
 device/inode identity and fail explicitly if the expected source changed or
 disappeared. A daemon stop or failed publication is not inferred as user deletion
 of the live Drive item. Marker/journal reads reject non-regular files.
+Move intents exceeding the bounded reader's 8192-byte format limit are rejected
+before creating recovery entries or moving data, rather than publishing an
+unreadable pending journal.
 Recovery operations use the same descriptor-rooted, no-symlink filesystem
 operations as live synchronization, including bounded regular-file metadata reads.
 Unsupported or inaccessible destinations remain errors and do not clear intents.

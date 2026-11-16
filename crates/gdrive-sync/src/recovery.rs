@@ -8,6 +8,36 @@ use crate::local_fs::{blocking_fs, LocalFs};
 pub(crate) const DIRECTORY: &str = ".gdrive-recovery";
 pub(crate) const INITIALIZING_PREFIX: &str = ".gdrive-recovery-init-";
 const MARKER: &str = "g-client local recovery v2\n";
+const MAX_INTENT_BYTES: usize = 8192;
+
+fn check_intent_size(
+    path: &Path,
+    kind: u8,
+    target: Option<&Path>,
+    version: Option<&str>,
+) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("recovery path has no filename"))?;
+    let mut length = 17usize.saturating_add(name.as_bytes().len());
+    if let Some(target) = target {
+        length = length
+            .saturating_add(1)
+            .saturating_add(target.as_os_str().as_bytes().len());
+    }
+    if kind == b'M' {
+        length = length
+            .saturating_add(2)
+            .saturating_add(version.map_or(0, str::len));
+    }
+    if length > MAX_INTENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "recovery intent exceeds the supported size; shorten the destination path",
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) struct Recovery<'a> {
     fs: LocalFs<'a>,
@@ -117,6 +147,7 @@ impl<'a> Recovery<'a> {
         target: Option<&Path>,
         version: Option<&str>,
     ) -> std::io::Result<()> {
+        check_intent_size(path, kind, target, version)?;
         blocking_fs(|| {
             let directory = entry.parent().unwrap();
             let pending = directory.join("pending");
@@ -175,6 +206,7 @@ impl<'a> Recovery<'a> {
         if !normal_path(relative) {
             return Err(std::io::Error::other("invalid recovery move target"));
         }
+        check_intent_size(from, b'M', Some(relative), version)?;
         let entry = self.create_entry(from)?;
         self.write_intent(&entry, from, b'M', Some(relative), version)?;
         if let Err(error) = self.fs.rename_no_replace(from, to) {
@@ -315,7 +347,9 @@ impl<'a> Recovery<'a> {
                     let _id = uuid::Uuid::parse_str(id.to_str().unwrap_or_default()).map_err(
                         |source| std::io::Error::new(std::io::ErrorKind::InvalidData, source),
                     )?;
-                    let intent = self.fs.read_limited(&pending.join(&id), 8192)?;
+                    let intent = self
+                        .fs
+                        .read_limited(&pending.join(&id), MAX_INTENT_BYTES as u64)?;
                     if intent.len() < 18 {
                         return Err(std::io::Error::other("invalid recovery intent"));
                     }
@@ -422,6 +456,37 @@ fn normal_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn move_intent_size_is_checked_before_publication_and_matches_the_reader_boundary() {
+        let root = std::env::temp_dir().join(format!("gdrive-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("file");
+        std::fs::write(&source, b"keep").unwrap();
+        let recovery = Recovery::new(&root, uuid::Uuid::new_v4());
+        let relative = PathBuf::from(format!("{}x", "a/".repeat(4080)));
+        let oversized = root.join(relative.with_file_name("xx"));
+        let error = recovery
+            .move_with_intent(&source, &oversized, Some("version"))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!root.join(DIRECTORY).exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"keep");
+        let entry = recovery.create_entry(&source).unwrap();
+        recovery
+            .write_intent(&entry, &source, b'M', Some(&relative), Some("version"))
+            .unwrap();
+        let pending = root.join(DIRECTORY).join("pending");
+        let journal = pending.join(entry.file_name().unwrap());
+        assert_eq!(
+            std::fs::metadata(journal).unwrap().len(),
+            MAX_INTENT_BYTES as u64
+        );
+        recovery.restore_interrupted(|_, _| Ok(false)).unwrap();
+        assert_eq!(std::fs::read_dir(pending).unwrap().count(), 0);
+        assert_eq!(std::fs::read(source).unwrap(), b"keep");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn stalled_marker_writes_do_not_occupy_the_only_async_worker() {
