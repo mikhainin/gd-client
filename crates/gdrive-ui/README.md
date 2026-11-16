@@ -147,6 +147,16 @@ daemon ownership changes replace it, and transport failures retry after three
 seconds. Subscription setup calls have five-second deadlines. A snapshot is
 requested after subscribing so initial state and restarts do not rely on receiving
 a signal; periodic polling remains a fallback for authentication.
+`SignInFailed` clears the current sign-in wait and preserves its retry message
+across successful refreshes, even if it arrives before the `SignIn` method reply.
+Unrelated folder mutations retain the pending wait and deadline, and cannot
+overwrite a concurrently received authentication failure.
+Sign-in is accepted only after subscriptions bind to an existing unique daemon
+owner; initial name acquisition is not treated as loss of an active session.
+A subscription loss
+ends the current wait with a retry message; a cancellable ten-minute-ten-second
+UI deadline also handles missed completion signals, just beyond the daemon's
+ten-minute authorization bound. The deadline does not block the GUI thread.
 Browsing and mutations still execute independently, not through a serial queue.
 Native local-folder selection also runs on the background runtime, with a
 two-minute deadline and bounded child cleanup. A missing `kdialog` opens the

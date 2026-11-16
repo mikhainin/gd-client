@@ -36,14 +36,12 @@ impl ServiceState {
         token: auth::StoredToken,
         token_path: &std::path::Path,
         engine: &SyncEngine,
-    ) -> zbus::fdo::Result<bool> {
+    ) -> Result<bool, SyncError> {
         if self.sign_in_generation != generation {
             return Ok(false);
         }
         self.sign_in = None;
-        engine
-            .save_token(token, token_path)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("failed to save token: {e}")))?;
+        engine.save_token(token, token_path)?;
         engine.start_all(&self.config);
         Ok(true)
     }
@@ -155,15 +153,53 @@ impl GDriveService {
     }
 
     async fn notify_authentication(emitter: &SignalEmitter<'_>, authenticated: bool) {
-        match tokio::time::timeout(
-            SIGNAL_TIMEOUT,
+        Self::notify(
+            "AuthenticationChanged",
             Self::authentication_changed(emitter, authenticated),
         )
-        .await
-        {
+        .await;
+    }
+
+    async fn notify(name: &str, signal: impl std::future::Future<Output = zbus::Result<()>>) {
+        match tokio::time::timeout(SIGNAL_TIMEOUT, signal).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!("failed to emit AuthenticationChanged: {error}"),
-            Err(_) => tracing::warn!("AuthenticationChanged emission timed out"),
+            Ok(Err(error)) => {
+                tracing::warn!(signal = name, %error, "authentication signal emission failed")
+            }
+            Err(_) => tracing::warn!(signal = name, "authentication signal emission timed out"),
+        }
+    }
+
+    async fn finish_sign_in(
+        &self,
+        generation: u64,
+        result: Result<auth::StoredToken, SyncError>,
+        emitter: &SignalEmitter<'_>,
+    ) {
+        let mut state = self.state.lock().await;
+        if state.sign_in_generation != generation {
+            return;
+        }
+        state.sign_in = None;
+        match result.and_then(|token| {
+            state.complete_sign_in(generation, token, &self.token_path, &self.engine)
+        }) {
+            Ok(true) => {
+                tracing::info!("sign-in succeeded");
+                Self::notify_authentication(emitter, true).await;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(%error, "sign-in failed");
+                let message = if matches!(&error, SyncError::Timeout { .. }) {
+                    "Sign-in timed out. Please try again."
+                } else if matches!(error, SyncError::OAuthDeclined) {
+                    "Google authorization was declined. Please try again."
+                } else {
+                    "Sign-in failed. Check daemon logs and try again."
+                };
+                Self::notify("SignInFailed", Self::sign_in_failed(emitter, message)).await;
+            }
         }
     }
 }
@@ -302,7 +338,7 @@ impl GDriveService {
     /// and returns immediately; the browser consent step can take an
     /// several minutes, so it must not block this D-Bus call (and
     /// therefore the caller's UI thread). Successful completion emits
-    /// [`Self::authentication_changed`].
+    /// [`Self::authentication_changed`]; failures emit [`Self::sign_in_failed`].
     async fn sign_in(
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -344,29 +380,7 @@ impl GDriveService {
             })
             .and_then(|result| result);
 
-            let mut state = service.state.lock().await;
-            if state.sign_in_generation != generation {
-                return;
-            }
-            state.sign_in = None;
-            match result {
-                Ok(token) => {
-                    match state.complete_sign_in(
-                        generation,
-                        token,
-                        &service.token_path,
-                        &service.engine,
-                    ) {
-                        Ok(true) => {
-                            tracing::info!("sign-in succeeded");
-                            Self::notify_authentication(&emitter, true).await;
-                        }
-                        Ok(false) => {}
-                        Err(error) => tracing::error!("sign-in failed: {error}"),
-                    }
-                }
-                Err(err) => tracing::error!("sign-in failed: {err}"),
-            }
+            service.finish_sign_in(generation, result, &emitter).await;
         });
         state.sign_in = Some(task);
 
@@ -441,6 +455,9 @@ impl GDriveService {
         emitter: &SignalEmitter<'_>,
         authenticated: bool,
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn sign_in_failed(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
 }
 
 fn parse_uuid(id: &str) -> zbus::fdo::Result<Uuid> {
@@ -716,7 +733,8 @@ mod tests {
         let error = state
             .complete_sign_in(0, token(), &fixture.root, &fixture.service.engine)
             .unwrap_err();
-        assert!(error.to_string().contains("failed to save token"));
+        assert!(matches!(error, SyncError::Io(_)));
+        assert!(std::error::Error::source(&error).is_some());
         assert!(fixture.service.engine.running_folders().is_empty());
     }
 
@@ -766,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated bus: dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrived -- --ignored"]
-    async fn sign_out_emits_signal_and_invalidates_pending_sign_in() {
+    async fn authentication_signals_cover_cancellation_and_current_attempt_failures() {
         use zbus::export::futures_core::Stream;
 
         assert_eq!(std::env::var("GDRIVE_UI_TEST_BUS").as_deref(), Ok("1"));
@@ -855,8 +873,49 @@ mod tests {
                 )
                 .unwrap());
             assert!(!fixture.service.token_path.exists());
+            let generation = state.sign_in_generation;
+            drop(state);
+            let interface = connection
+                .object_server()
+                .interface::<_, GDriveService>(gdrive_common::dbus_api::OBJECT_PATH)
+                .await
+                .unwrap();
+            let emitter = interface.signal_emitter();
+            let mut failures = proxy.receive_sign_in_failed().await.unwrap();
+            fixture
+                .service
+                .finish_sign_in(generation - 1, Err(SyncError::OAuthDeclined), emitter)
+                .await;
+            assert!(tokio::time::timeout(
+                Duration::from_millis(25),
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut failures).poll_next(cx))
+            )
+            .await
+            .is_err());
+            fixture
+                .service
+                .finish_sign_in(generation, Err(SyncError::OAuthDeclined), emitter)
+                .await;
+            let failure =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut failures).poll_next(cx))
+                    .await
+                    .unwrap();
+            assert!(failure.args().unwrap().message.contains("declined"));
+            std::fs::create_dir(&fixture.service.token_path).unwrap();
+            fixture
+                .service
+                .finish_sign_in(generation, Ok(token()), emitter)
+                .await;
+            let failure =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut failures).poll_next(cx))
+                    .await
+                    .unwrap();
+            let args = failure.args().unwrap();
+            assert!(args.message.starts_with("Sign-in failed."));
+            assert!(!args.message.contains("fixture-token"));
+            assert!(!fixture.service.state.lock().await.sign_in_busy());
         })
         .await
-        .expect("private-bus sign-out must complete within five seconds");
+        .expect("private-bus authentication checks must complete within five seconds");
     }
 }

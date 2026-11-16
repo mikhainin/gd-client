@@ -42,6 +42,8 @@ pub enum Response {
 pub enum AuthenticationEvent {
     Ready,
     Changed(bool),
+    Failed(String),
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -117,7 +119,9 @@ async fn sync_status_session(notify: &(impl Fn(SyncStatusEvent) + Sync)) -> Resu
 
 pub async fn watch_authentication(notify: impl Fn(AuthenticationEvent) + Send + Sync + 'static) {
     loop {
-        if let Err(error) = authentication_session(&notify).await {
+        let result = authentication_session(&notify).await;
+        notify(AuthenticationEvent::Unavailable);
+        if let Err(error) = result {
             tracing::warn!("authentication subscription interrupted: {error}");
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
@@ -134,27 +138,54 @@ async fn authentication_session(
             .await
     })
     .await?;
-    let proxy = bounded(CONTROL_TIMEOUT, GDrive1Proxy::new(&connection)).await?;
     let bus = bounded(CONTROL_TIMEOUT, zbus::fdo::DBusProxy::new(&connection)).await?;
     let mut owners = bounded(
         CONTROL_TIMEOUT,
         bus.receive_name_owner_changed_with_args(&[(0, gdrive_common::dbus_api::BUS_NAME)]),
     )
     .await?;
+    let owner = bounded(CONTROL_TIMEOUT, async {
+        bus.get_name_owner(
+            gdrive_common::dbus_api::BUS_NAME
+                .try_into()
+                .expect("valid bus name"),
+        )
+        .await
+        .map_err(zbus::Error::from)
+    })
+    .await?;
+    let proxy = bounded(
+        CONTROL_TIMEOUT,
+        GDrive1Proxy::builder(&connection)
+            .destination(owner.as_str())
+            .build(),
+    )
+    .await?;
     let mut signals = bounded(CONTROL_TIMEOUT, proxy.receive_authentication_changed()).await?;
+    let mut failures = bounded(CONTROL_TIMEOUT, proxy.receive_sign_in_failed()).await?;
     notify(AuthenticationEvent::Ready);
 
     loop {
         tokio::select! {
+            biased;
+            change = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) => {
+                let change = change.ok_or("daemon owner stream closed")?;
+                let args = change.args().map_err(|error| format!("invalid daemon owner signal: {error}"))?;
+                if args.old_owner().as_ref().is_some_and(|previous| previous.as_str() == owner.as_str()) {
+                    return Ok(());
+                }
+            }
             signal = std::future::poll_fn(|cx| std::pin::Pin::new(&mut signals).poll_next(cx)) => {
                 let signal = signal.ok_or("authentication signal stream closed")?;
                 let args = signal.args()
                     .map_err(|error| format!("invalid AuthenticationChanged signal: {error}"))?;
                 notify(AuthenticationEvent::Changed(args.authenticated));
             }
-            owner = std::future::poll_fn(|cx| std::pin::Pin::new(&mut owners).poll_next(cx)) => {
-                owner.ok_or("daemon owner stream closed")?;
-                return Ok(());
+            signal = std::future::poll_fn(|cx| std::pin::Pin::new(&mut failures).poll_next(cx)) => {
+                let signal = signal.ok_or("sign-in failure signal stream closed")?;
+                let args = signal.args()
+                    .map_err(|error| format!("invalid SignInFailed signal: {error}"))?;
+                notify(AuthenticationEvent::Failed(args.message.to_owned()));
             }
         }
     }
@@ -461,6 +492,20 @@ mod tests {
             emitter: &zbus::object_server::SignalEmitter<'_>,
             authenticated: bool,
         ) -> zbus::Result<()>;
+
+        async fn sign_in(
+            &self,
+            #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        ) -> zbus::fdo::Result<()> {
+            Self::sign_in_failed(&emitter, "fixture authorization declined").await?;
+            Ok(())
+        }
+
+        #[zbus(signal)]
+        async fn sign_in_failed(
+            emitter: &zbus::object_server::SignalEmitter<'_>,
+            message: &str,
+        ) -> zbus::Result<()>;
     }
 
     #[tokio::test]
@@ -593,6 +638,12 @@ mod tests {
             Some(AuthenticationEvent::Changed(false))
         ));
 
+        assert!(matches!(execute(Request::SignIn).await, Ok(Response::Done)));
+        assert!(matches!(
+            tokio::time::timeout(CONTROL_TIMEOUT, received.recv()).await.unwrap(),
+            Some(AuthenticationEvent::Failed(message)) if message == "fixture authorization declined"
+        ));
+
         bounded(
             CONTROL_TIMEOUT,
             _service.release_name(gdrive_common::dbus_api::BUS_NAME),
@@ -603,19 +654,42 @@ mod tests {
             tokio::time::timeout(CONTROL_TIMEOUT, received.recv())
                 .await
                 .unwrap(),
-            Some(AuthenticationEvent::Ready)
+            Some(AuthenticationEvent::Unavailable)
         ));
+        let absent = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                assert!(matches!(
+                    received.recv().await,
+                    Some(AuthenticationEvent::Unavailable)
+                ));
+            }
+        })
+        .await;
+        assert!(
+            absent.is_err(),
+            "an absent daemon must not announce authentication readiness"
+        );
         bounded(
             CONTROL_TIMEOUT,
             _service.request_name(gdrive_common::dbus_api::BUS_NAME),
         )
         .await
         .unwrap();
+        tokio::time::timeout(CONTROL_TIMEOUT, async {
+            loop {
+                match received.recv().await {
+                    Some(AuthenticationEvent::Ready) => break,
+                    Some(AuthenticationEvent::Unavailable) => {}
+                    _ => panic!("unexpected authentication event while acquiring owner"),
+                }
+            }
+        })
+        .await
+        .expect("authentication must become ready after owner acquisition");
+        assert!(matches!(execute(Request::SignIn).await, Ok(Response::Done)));
         assert!(matches!(
-            tokio::time::timeout(CONTROL_TIMEOUT, received.recv())
-                .await
-                .unwrap(),
-            Some(AuthenticationEvent::Ready)
+            tokio::time::timeout(CONTROL_TIMEOUT, received.recv()).await.unwrap(),
+            Some(AuthenticationEvent::Failed(message)) if message == "fixture authorization declined"
         ));
         bounded(
             CONTROL_TIMEOUT,

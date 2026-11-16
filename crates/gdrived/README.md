@@ -35,7 +35,8 @@ On startup it:
    `gdrive_sync::auth::authorize`'s PKCE flow via `xdg-open`, so the
    D-Bus call itself returns immediately rather than blocking on browser
    interaction; `SignOut` deletes the cached token and stops all running
-   folders. Successful sign-in and sign-out emit `AuthenticationChanged(b)`.
+   folders. Successful sign-in and sign-out emit `AuthenticationChanged(b)`;
+   current-attempt failures emit `SignInFailed(s)`.
 
 The daemon also opens `sync-state.sqlite3` under
 `$XDG_DATA_HOME/gdrive-client` (normally `~/.local/share/gdrive-client`);
@@ -100,12 +101,14 @@ deleting tokens. It awaits cancellation for up to two seconds to release the
 OAuth loopback listener before another sign-in can start. If cleanup exceeds
 that deadline, sign-out reports a timeout and new sign-ins remain rejected
 until the aborted task has actually finished. Signals are emitted in state-change order, with a two-second
-emission deadline; delivery failures are logged and clients can recover by
-querying `IsAuthenticated`.
+emission deadline; delivery failures are logged. Clients can recover cached
+authentication state by querying `IsAuthenticated`.
 
 `SignIn` returning successfully only confirms that the background attempt was
-started. Later browser, token-exchange or persistence failures are logged;
-there is no sign-in-failure signal. See the daemon journal for diagnosis.
+started. Later browser, token-exchange or persistence failures are logged and
+emit `SignInFailed(s)` with a credential-free retry message. Obsolete/cancelled
+attempts emit nothing. Delivery is bounded but not durable; a disconnected
+client cannot recover a missed failure by querying `IsAuthenticated`.
 
 Cached OAuth expiry and refresh tokens are retained at startup and after sign-in.
 All Drive calls renew expired credentials automatically, persist renewed tokens,
@@ -141,7 +144,7 @@ dbus-run-session -- env GDRIVE_UI_TEST_BUS=1 cargo test -p gdrived -- --ignored
 ```
 
 The private-bus case verifies Drive ID/path transport, status snapshots/signals, fatal sync failures,
-explicit stop, sign-out signals and cancellation without a real
+explicit stop, sign-out/failure signals, token-save failure and cancellation without a real
 Google account or the user's daemon.
 
 ## OAuth client configuration

@@ -46,7 +46,8 @@ Other than the optional Drive ID/path, folder fields must be present in TOML.
   service separately, so both sides must match
   [the shared signatures](src/dbus_api.rs); zbus does not check this across
   independent crates at compile time. The contract includes
-  `AuthenticationChanged(b)` after successful sign-in/out. Clients query
+  `AuthenticationChanged(b)` after successful sign-in/out and `SignInFailed(s)`
+  for asynchronous sign-in failure, with a credential-free retry message. Clients query
   `IsAuthenticated` for initial/reconnected cached-token state, not a live
   credential-validity check. The workspace uses zbus 6's asynchronous
   proxy/service APIs on Tokio. The shared trait does not configure call

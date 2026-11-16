@@ -11,6 +11,31 @@ use crate::dbus_client::{
     self, AuthenticationEvent, PendingRequest, Request, Response, SyncStatusEvent,
 };
 
+fn mutation_outcome(
+    result: Result<Response, String>,
+    signing_in: bool,
+    authentication_changed: bool,
+    waiting_for_sign_in: bool,
+    current_message: Option<String>,
+    success_message: Option<String>,
+) -> (Option<String>, bool) {
+    let waiting = if signing_in {
+        !authentication_changed && matches!(&result, Ok(Response::Done))
+    } else {
+        waiting_for_sign_in
+    };
+    let message = match result {
+        Ok(Response::Done) if authentication_changed || (!signing_in && waiting) => current_message,
+        Ok(Response::Done) => success_message,
+        Err(error) => Some(match current_message.filter(|_| authentication_changed) {
+            Some(authentication) => format!("{error}; {authentication}"),
+            None => error,
+        }),
+        _ => Some("unexpected response to daemon operation".to_string()),
+    };
+    (message, waiting)
+}
+
 fn summarize_sync_status(snapshot: &gdrive_common::dbus_api::SyncStatus) -> (&'static str, String) {
     let errors: Vec<_> = snapshot
         .folders
@@ -32,9 +57,95 @@ fn summarize_sync_status(snapshot: &gdrive_common::dbus_api::SyncStatus) -> (&'s
 }
 
 #[cfg(test)]
-mod tray_status_tests {
-    use super::summarize_sync_status;
+mod tests {
+    use super::{mutation_outcome, summarize_sync_status, Response};
     use gdrive_common::dbus_api::{FolderSyncStatus, SyncStatus};
+
+    #[test]
+    fn early_sign_in_failure_survives_method_completion_without_waiting_again() {
+        let failure = Some("Sign-in failed".to_string());
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                true,
+                true,
+                false,
+                failure.clone(),
+                Some("waiting".into())
+            ),
+            (failure, false),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                true,
+                true,
+                false,
+                None,
+                Some("waiting".into())
+            ),
+            (None, false),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                true,
+                false,
+                true,
+                None,
+                Some("waiting".into())
+            ),
+            (Some("waiting".into()), true),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Err("request failed".into()),
+                true,
+                false,
+                true,
+                None,
+                Some("waiting".into())
+            ),
+            (Some("request failed".into()), false),
+        );
+    }
+
+    #[test]
+    fn folder_mutations_preserve_sign_in_waits_and_concurrent_failures() {
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                false,
+                false,
+                true,
+                Some("waiting".into()),
+                None
+            ),
+            (Some("waiting".into()), true),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Err("folder failed".into()),
+                false,
+                false,
+                true,
+                Some("waiting".into()),
+                None
+            ),
+            (Some("folder failed".into()), true),
+        );
+        assert_eq!(
+            mutation_outcome(
+                Ok(Response::Done),
+                false,
+                true,
+                false,
+                Some("sign-in failed".into()),
+                None
+            ),
+            (Some("sign-in failed".into()), false),
+        );
+    }
 
     #[test]
     fn one_folders_error_overrides_another_folders_activity() {
@@ -237,6 +348,8 @@ pub struct SyncManagerRust {
     portal: PendingRequest,
     local_picker: PendingRequest,
     authentication_watch: PendingRequest,
+    authentication_ready: bool,
+    sign_in_deadline: PendingRequest,
     authentication_revision: u64,
     sync_status_watch: PendingRequest,
 }
@@ -266,6 +379,8 @@ impl Default for SyncManagerRust {
             portal: PendingRequest::default(),
             local_picker: PendingRequest::default(),
             authentication_watch: PendingRequest::default(),
+            authentication_ready: false,
+            sign_in_deadline: PendingRequest::default(),
             authentication_revision: 0,
             sync_status_watch: PendingRequest::default(),
         }
@@ -315,13 +430,28 @@ impl qobject::SyncManager {
         let qt_thread = self.qt_thread();
         match dbus_client::spawn(dbus_client::watch_authentication(move |event| {
             if let Err(error) = qt_thread.queue(move |mut object| {
-                if let AuthenticationEvent::Changed(authenticated) = event {
-                    let revision = object.authentication_revision.wrapping_add(1);
-                    object.as_mut().rust_mut().authentication_revision = revision;
-                    object.as_mut().set_authenticated(authenticated);
-                    if object.waiting_for_sign_in {
-                        object.as_mut().rust_mut().operation_message = None;
-                        object.as_mut().rust_mut().waiting_for_sign_in = false;
+                match event {
+                    AuthenticationEvent::Changed(authenticated) => {
+                        let revision = object.authentication_revision.wrapping_add(1);
+                        object.as_mut().rust_mut().authentication_revision = revision;
+                        object.as_mut().set_authenticated(authenticated);
+                        if object.waiting_for_sign_in {
+                            object.as_mut().rust_mut().operation_message = None;
+                            object.as_mut().rust_mut().waiting_for_sign_in = false;
+                            object.as_mut().rust_mut().sign_in_deadline.cancel();
+                        }
+                    }
+                    AuthenticationEvent::Failed(message) => {
+                        object.as_mut().fail_sign_in(message);
+                    }
+                    AuthenticationEvent::Ready => {
+                        object.as_mut().rust_mut().authentication_ready = true
+                    }
+                    AuthenticationEvent::Unavailable => {
+                        object.as_mut().rust_mut().authentication_ready = false;
+                        object.as_mut().fail_sign_in(
+                            "Authentication connection interrupted. Please sign in again.".into(),
+                        );
                     }
                 }
                 object.as_mut().rust_mut().snapshot.cancel();
@@ -405,6 +535,7 @@ impl qobject::SyncManager {
                                 if authenticated && object.waiting_for_sign_in {
                                     object.as_mut().rust_mut().operation_message = None;
                                     object.as_mut().rust_mut().waiting_for_sign_in = false;
+                                    object.as_mut().rust_mut().sign_in_deadline.cancel();
                                 }
                             }
                             Err(error) => {
@@ -447,44 +578,96 @@ impl qobject::SyncManager {
             ));
             return;
         }
+        let signing_in = matches!(&request, Request::SignIn);
+        let signing_out = matches!(&request, Request::SignOut);
         self.as_mut().rust_mut().snapshot.cancel();
         self.as_mut().set_refreshing(false);
-        self.as_mut().rust_mut().operation_message = None;
-        self.as_mut().rust_mut().waiting_for_sign_in = false;
+        if signing_in || signing_out {
+            self.as_mut().rust_mut().waiting_for_sign_in = signing_in;
+            self.as_mut().rust_mut().sign_in_deadline.cancel();
+        }
+        if signing_in || !self.waiting_for_sign_in {
+            self.as_mut().rust_mut().operation_message = None;
+        }
         self.as_mut().set_busy(true);
         self.as_mut()
             .set_status_message(QString::from("Working..."));
         let generation = self.as_mut().rust_mut().mutation.begin();
-        let signing_in = matches!(request, Request::SignIn);
         let authentication_revision = self.authentication_revision;
         match self.dispatch(request, move |mut object, result| {
             if !object.as_mut().rust_mut().mutation.finish(generation) {
                 return;
             }
             object.as_mut().set_busy(false);
-            let sign_in_started = signing_in && matches!(&result, Ok(Response::Done));
-            let message = match result {
-                Ok(Response::Done)
-                    if signing_in && object.authentication_revision != authentication_revision =>
-                {
-                    None
-                }
-                Ok(Response::Done) => success_message,
-                Err(error) => Some(error),
-                _ => Some("unexpected response to daemon operation".to_string()),
-            };
+            let (message, waiting) = mutation_outcome(
+                result,
+                signing_in,
+                object.authentication_revision != authentication_revision,
+                object.waiting_for_sign_in,
+                object.operation_message.clone(),
+                success_message,
+            );
             if let Some(message) = &message {
                 object.as_mut().set_status_message(QString::from(message));
             }
-            object.as_mut().rust_mut().waiting_for_sign_in = sign_in_started && message.is_some();
+            object.as_mut().rust_mut().waiting_for_sign_in = waiting;
+            if !waiting {
+                object.as_mut().rust_mut().sign_in_deadline.cancel();
+            }
             object.as_mut().rust_mut().operation_message = message;
             object.refresh();
         }) {
-            Ok(handle) => self.as_mut().rust_mut().mutation.attach(handle),
+            Ok(handle) => {
+                self.as_mut().rust_mut().mutation.attach(handle);
+                if signing_in {
+                    self.as_mut().arm_sign_in_deadline();
+                }
+            }
             Err(error) => {
+                if signing_in {
+                    self.as_mut().rust_mut().waiting_for_sign_in = false;
+                }
+                self.as_mut().rust_mut().operation_message = Some(error.clone());
                 self.as_mut().set_busy(false);
                 self.as_mut().set_status_message(QString::from(&error));
             }
+        }
+    }
+
+    fn fail_sign_in(mut self: Pin<&mut Self>, message: String) {
+        if !self.waiting_for_sign_in {
+            return;
+        }
+        let revision = self.authentication_revision.wrapping_add(1);
+        self.as_mut().rust_mut().authentication_revision = revision;
+        self.as_mut().rust_mut().waiting_for_sign_in = false;
+        self.as_mut().rust_mut().sign_in_deadline.cancel();
+        self.as_mut().rust_mut().operation_message = Some(message.clone());
+        self.set_status_message(QString::from(message));
+    }
+
+    fn arm_sign_in_deadline(mut self: Pin<&mut Self>) {
+        let generation = self.as_mut().rust_mut().sign_in_deadline.begin();
+        let qt_thread = self.qt_thread();
+        match dbus_client::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10 * 60 + 10)).await;
+            if let Err(error) = qt_thread.queue(move |mut object| {
+                if object
+                    .as_mut()
+                    .rust_mut()
+                    .sign_in_deadline
+                    .finish(generation)
+                {
+                    object.fail_sign_in(
+                        "Sign-in completion was not received. Please try again.".into(),
+                    );
+                }
+            }) {
+                tracing::debug!("could not deliver sign-in deadline to Qt: {error:?}");
+            }
+        }) {
+            Ok(handle) => self.as_mut().rust_mut().sign_in_deadline.attach(handle),
+            Err(error) => self.fail_sign_in(error),
         }
     }
 
@@ -522,6 +705,18 @@ impl qobject::SyncManager {
     }
 
     pub fn sign_in(self: Pin<&mut Self>) {
+        if self.waiting_for_sign_in {
+            self.set_status_message(QString::from(
+                "Sign-in is already in progress. Complete the browser consent.",
+            ));
+            return;
+        }
+        if !self.authentication_ready {
+            self.set_status_message(QString::from(
+                "Connecting to authentication service. Please try again.",
+            ));
+            return;
+        }
         self.mutate(
             Request::SignIn,
             Some("opened browser for Google sign-in; waiting for you to finish...".to_string()),
