@@ -1,8 +1,9 @@
 //! Watches a local directory tree for filesystem changes using the
 //! `notify` crate (inotify on Linux, kqueue on BSD/macOS).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,7 +38,7 @@ pub struct LocalWatcher {
     // it stops the underlying OS watch.
     watcher: RecommendedWatcher,
     root: PathBuf,
-    watched: HashSet<PathBuf>,
+    watched: HashMap<PathBuf, (u64, u64)>,
 }
 
 impl LocalWatcher {
@@ -79,18 +80,21 @@ impl LocalWatcher {
         let mut watcher = Self {
             watcher,
             root: root.to_path_buf(),
-            watched: HashSet::new(),
+            watched: HashMap::new(),
         };
         watcher.refresh()?;
         Ok(watcher)
     }
 
-    pub(crate) fn refresh(&mut self) -> Result<(), SyncError> {
-        let mut desired = HashSet::new();
+    /// Reconcile live-directory registrations after topology or inode changes.
+    pub fn refresh(&mut self) -> Result<(), SyncError> {
+        let mut desired = HashMap::new();
         let mut directories = vec![self.root.clone()];
         while let Some(directory) = directories.pop() {
-            let items = match std::fs::read_dir(&directory) {
-                Ok(items) => items,
+            let contents = std::fs::metadata(&directory)
+                .and_then(|metadata| std::fs::read_dir(&directory).map(|items| (metadata, items)));
+            let (metadata, items) = match contents {
+                Ok(contents) => contents,
                 Err(error)
                     if directory != self.root
                         && matches!(
@@ -102,7 +106,7 @@ impl LocalWatcher {
                 }
                 Err(error) => return Err(error.into()),
             };
-            desired.insert(directory);
+            desired.insert(directory, (metadata.dev(), metadata.ino()));
             for item in items {
                 let item = item?;
                 if item.file_type()?.is_dir()
@@ -114,8 +118,9 @@ impl LocalWatcher {
         }
         for path in self
             .watched
-            .difference(&desired)
-            .cloned()
+            .iter()
+            .filter(|(path, identity)| desired.get(*path) != Some(*identity))
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>()
         {
             match self.watcher.unwatch(&path) {
@@ -129,14 +134,15 @@ impl LocalWatcher {
             }
             self.watched.remove(&path);
         }
-        for path in desired
-            .difference(&self.watched)
-            .cloned()
+        for (path, identity) in desired
+            .iter()
+            .filter(|(path, _)| !self.watched.contains_key(*path))
+            .map(|(path, identity)| (path.clone(), *identity))
             .collect::<Vec<_>>()
         {
             match self.watcher.watch(&path, RecursiveMode::NonRecursive) {
                 Ok(()) => {
-                    self.watched.insert(path);
+                    self.watched.insert(path, identity);
                 }
                 Err(error) if matches!(error.kind, notify::ErrorKind::PathNotFound) => {}
                 Err(error) => return Err(error.into()),
@@ -174,6 +180,7 @@ fn classify(kind: &EventKind) -> Option<LocalChangeKind> {
 mod tests {
     use super::*;
     use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+    use std::collections::HashSet;
 
     #[test]
     fn recovery_entries_and_download_staging_never_enter_the_upload_queue() {
@@ -210,7 +217,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn kernel_watches_exclude_history_and_refresh_live_directory_moves() {
+    async fn kernel_watches_exclude_history_and_refresh_replaced_live_directories() {
         use std::os::unix::fs::MetadataExt;
         let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
         let root = fixture.join("local");
@@ -231,8 +238,10 @@ mod tests {
             assert!(!watches.contains(&std::fs::metadata(path).unwrap().ino()));
         }
         std::fs::rename(root.join("live"), recovery.join("moved")).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
         watcher.refresh().unwrap();
         let watches = kernel_watch_inodes();
+        assert!(watches.contains(&std::fs::metadata(&live).unwrap().ino()));
         assert!(!watches.contains(&std::fs::metadata(recovery.join("moved")).unwrap().ino()));
         assert!(!watches.contains(
             &std::fs::metadata(recovery.join("moved/deep"))

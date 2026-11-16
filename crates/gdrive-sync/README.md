@@ -197,7 +197,9 @@ feature in packaged binaries.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
   sync folder's local path. Individual nonrecursive registrations cover live
   directories only; registration refreshes exclude recovery/staging trees and
-  remove watches when directories move into history. New live directories are
+  remove watches when directories move into history. Device/inode changes also
+  replace stale registrations when a new live directory reuses the same path.
+  New live directories are
   picked up between engine iterations, with periodic scans covering missed
   notifications. Read/access and metadata-only events, including
   ownership changes made by the daemon, are ignored; content changes remain
