@@ -34,6 +34,8 @@ feature in packaged binaries.
   Read-only worker resolution shares one inspection slot and a three-second
   queueing/execution deadline. A timed-out or cancelled lookup retains that slot
   until its blocking read exits, but cannot admit a root or mutate files.
+  Resolution timeouts remain visible in status and retry at the polling interval,
+  so a delayed lookup does not permanently stop otherwise valid bindings.
   Local mutations use non-detached blocking sections,
   yielding a multithreaded runtime's worker thread without allowing cancellation
   to release the root before the syscall finishes. Replacement workers wait in

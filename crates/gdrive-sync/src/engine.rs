@@ -292,15 +292,21 @@ impl SyncEngine {
 
         let handle = tokio::spawn(async move {
             let result = async {
-                let path = folder.local_path.clone();
-                let root = inspect_root(resolution, Duration::from_secs(3), move || {
-                    local_roots::ResolvedRoot::new(&path)
-                })
-                .await??;
-                folder.local_path = root.path.clone();
-                loop {
-                    match lease.admit(&root).await {
-                        Ok(()) => break,
+                let root = loop {
+                    let path = folder.local_path.clone();
+                    let result = async {
+                        let root = inspect_root(
+                            Arc::clone(&resolution),
+                            Duration::from_secs(3),
+                            move || local_roots::ResolvedRoot::new(&path),
+                        )
+                        .await??;
+                        lease.admit(&root).await?;
+                        Ok::<_, SyncError>(root)
+                    }
+                    .await;
+                    match result {
+                        Ok(root) => break root,
                         Err(error @ SyncError::Timeout { .. }) => {
                             run.finish("local roots", Err(error.to_string()));
                             let _ = events.send(SyncEvent::Error {
@@ -311,7 +317,8 @@ impl SyncEngine {
                         }
                         Err(error) => return Err(error),
                     }
-                }
+                };
+                folder.local_path = root.path.clone();
                 run.finish("local roots", Ok(()));
                 run_folder(
                     folder.clone(),
@@ -1977,6 +1984,61 @@ mod tests {
         })
         .await
         .unwrap();
+        engine.stop_folder(second.id);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !engine.roots.active.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workers_retry_resolution_timeouts_without_manual_restart() {
+        let server = Server::start(vec![]);
+        let (root, first, mut engine) = local_fixture(&server, b"old").await;
+        engine.poll_interval_secs = 5;
+        let second = SyncFolder::new("other", root.join("other"), "", "");
+        let permit = Arc::clone(&engine.roots.resolution)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut events = engine.subscribe();
+        engine.start_folder(first.clone());
+        engine.start_folder(second.clone());
+        let mut waiting = HashSet::new();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while waiting.len() < 2 {
+                if let SyncEvent::Error {
+                    folder_id: Some(id),
+                    message,
+                } = events.recv().await.unwrap()
+                {
+                    assert!(message.contains("resolving a worker local root"));
+                    waiting.insert(id);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(waiting, HashSet::from([first.id, second.id]));
+        assert_eq!(engine.running_folders().len(), 2);
+        drop(permit);
+        let mut started = HashSet::new();
+        tokio::time::timeout(Duration::from_secs(7), async {
+            while started.len() < 2 {
+                if let SyncEvent::FolderStarted { folder_id } = events.recv().await.unwrap() {
+                    started.insert(folder_id);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(started, waiting);
+        engine.stop_folder(first.id);
         engine.stop_folder(second.id);
         tokio::time::timeout(Duration::from_secs(2), async {
             while !engine.roots.active.lock().unwrap().is_empty() {
