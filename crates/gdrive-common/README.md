@@ -38,7 +38,14 @@ rejects equal/nested enabled roots, including symlink and bind-mount aliases,
 and duplicate enabled folder UUIDs even when their paths are disjoint.
 Linux mount information and descriptor mount IDs map each root and any nested
 mounts to their backing filesystem paths; unavailable or inconsistent mount
-information fails closed. Mount paths are decoded as raw filesystem bytes, so
+information fails closed. Overlapping mount footprints within one root are
+rejected too: recursive bind
+aliases or duplicate mounted subtrees must not create traversal cycles or give
+one inode multiple live synchronization paths. Disjoint mounted trees remain
+supported. Self-overlap checks exclude regions hidden by nested mounts, accepting
+identity binds and sources visible only through one alias. Cross-root checks
+retain their conservative backing footprints. Mount paths are decoded
+as raw filesystem bytes, so
 an unrelated non-UTF-8 mount name does not prevent validation. Descriptor mount
 inspection uses `O_PATH`, never a data-reading open that could block on a FIFO.
 Existing directory
