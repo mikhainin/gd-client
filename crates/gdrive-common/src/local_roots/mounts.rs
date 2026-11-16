@@ -128,6 +128,15 @@ fn from_mounts(
             Err(error) => return Err(error),
         }
     }
+    for (index, first) in backing.iter().enumerate() {
+        if backing[index + 1..].iter().any(|second| {
+            first.device == second.device && super::overlap(&first.path, &second.path)
+        }) {
+            return Err(invalid(
+                "local sync root contains overlapping mount aliases",
+            ));
+        }
+    }
     Ok(backing)
 }
 
@@ -140,6 +149,43 @@ pub(super) fn footprints(path: &Path) -> io::Result<Vec<BackingRoot>> {
 mod tests {
     use super::*;
     use crate::local_roots::ResolvedRoot;
+
+    #[test]
+    fn self_aliased_mount_trees_are_rejected_before_recursive_traversal() {
+        for (root, nested, expected) in [
+            ("/data", "/data", false),
+            ("/data", "/data/child", false),
+            ("/data", "/", false),
+            ("/data", "/elsewhere", true),
+        ] {
+            let mounts = parse(
+                format!(
+                    "1 0 8:1 / / rw - ext4 /dev/fixture rw\n\
+                 2 1 8:1 {nested} {root}/mounted rw - ext4 /dev/fixture rw\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let result = from_mounts(Path::new(root), &mounts, |candidate| {
+                Ok(if candidate == Path::new(root) { 1 } else { 2 })
+            });
+            assert_eq!(result.is_ok(), expected, "nested source {nested}");
+        }
+        let mounts = parse(
+            b"1 0 8:1 / / rw - ext4 /dev/fixture rw\n\
+            2 1 8:1 /external /data/first rw - ext4 /dev/fixture rw\n\
+            3 1 8:1 /external /data/second rw - ext4 /dev/fixture rw\n",
+        )
+        .unwrap();
+        assert!(from_mounts(Path::new("/data"), &mounts, |candidate| {
+            Ok(match candidate.to_str().unwrap() {
+                "/data/first" => 2,
+                "/data/second" => 3,
+                _ => 1,
+            })
+        })
+        .is_err());
+    }
 
     #[test]
     fn fifo_mount_inspection_does_not_open_it_for_io() {
