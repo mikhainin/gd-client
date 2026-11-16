@@ -300,6 +300,12 @@ Restores verify recorded
 device/inode identity and fail explicitly if the expected source changed or
 disappeared. A daemon stop or failed publication is not inferred as user deletion
 of the live Drive item. Marker/journal reads reject non-regular files.
+Recovery operations use the same descriptor-rooted, no-symlink filesystem
+operations as live synchronization, including bounded regular-file metadata reads.
+Unsupported or inaccessible destinations remain errors and do not clear intents.
+Each store's owner marker includes the configured folder UUID; moving a store
+between bindings fails explicitly rather than interpreting its root-relative
+journals against another binding's mappings.
 Recovery directories are private, excluded from scans/uploads, and never cleaned
 automatically. Restore entries manually to an ordinary path after pausing sync.
 The owner marker is synced in an excluded `.gdrive-recovery-init-<id>` staging

@@ -225,7 +225,10 @@ mod tests {
         std::fs::create_dir_all(&live).unwrap();
         let saved = root.join("saved");
         std::fs::write(&saved, b"history").unwrap();
-        crate::recovery::archive(&saved).unwrap().unwrap();
+        crate::recovery::Recovery::new(&root, uuid::Uuid::nil())
+            .archive(&saved)
+            .unwrap()
+            .unwrap();
         let recovery = root.join(crate::recovery::DIRECTORY);
         let history = recovery.join("older/deep");
         std::fs::create_dir_all(&history).unwrap();

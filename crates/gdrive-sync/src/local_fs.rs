@@ -4,7 +4,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, FileType, Metadata, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use gdrive_common::local_roots::{verify_case_sensitive_directory, verify_local_filesystem};
@@ -181,11 +181,22 @@ impl LocalFs<'_> {
     }
 
     pub fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.read_limited(path, u64::MAX)
+    }
+
+    pub fn read_limited(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
         blocking_fs(|| {
             let pinned = self.file(path, libc::O_PATH | libc::O_NOFOLLOW)?;
-            let mut file = File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
+            if !pinned.metadata()?.is_file() {
+                return Err(io::Error::other("local data must be a regular file"));
+            }
+            let file = File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))?;
             let mut content = Vec::new();
-            file.read_to_end(&mut content)?;
+            file.take(limit.saturating_add(1))
+                .read_to_end(&mut content)?;
+            if content.len() as u64 > limit {
+                return Err(io::Error::other("local metadata is too large"));
+            }
             Ok(content)
         })
     }
@@ -213,12 +224,46 @@ impl LocalFs<'_> {
         })
     }
 
-    pub fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+    pub fn rename_no_replace(&self, from: &Path, to: &Path) -> io::Result<()> {
         blocking_fs(|| {
             self.metadata(from)?;
             let (source, name) = self.parent(from)?;
             let (destination, new_name) = self.parent(to)?;
-            std::fs::rename(source.path(&name), destination.path(&new_name))
+            let name = CString::new(name.as_encoded_bytes())?;
+            let new_name = CString::new(new_name.as_encoded_bytes())?;
+            if unsafe {
+                libc::renameat2(
+                    source.0.as_raw_fd(),
+                    name.as_ptr(),
+                    destination.0.as_raw_fd(),
+                    new_name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+
+    pub fn create_private_dir(&self, path: &Path) -> io::Result<()> {
+        blocking_fs(|| {
+            let (parent, name) = self.parent(path)?;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(parent.path(&name))
+        })
+    }
+
+    pub fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        blocking_fs(|| self.directory(path, false)?.0.sync_all())
+    }
+
+    pub fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        blocking_fs(|| {
+            let (parent, name) = self.parent(path)?;
+            std::fs::remove_dir(parent.path(&name))
         })
     }
 
@@ -286,7 +331,7 @@ mod tests {
         assert!(fs.metadata(&root.join("pointer")).is_err());
         assert!(fs.create_new(&root.join("sub/new")).is_err());
         assert!(fs
-            .rename(&root.join("source"), &root.join("sub/sentinel"))
+            .rename_no_replace(&root.join("source"), &root.join("sub/sentinel"))
             .is_err());
         assert!(fs.remove_file(&root.join("sub/sentinel")).is_err());
         assert!(fs.remove_dir_all(&root.join("sub/new")).is_err());

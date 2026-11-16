@@ -24,6 +24,7 @@ use crate::google_document;
 use crate::local_fs::{blocking_fs, LocalFs};
 use crate::local_watcher::{is_internal_path, path_key, LocalChange, LocalWatcher};
 use crate::ownership::resolve_owner;
+use crate::recovery::Recovery;
 use crate::state_db::{FileStateEntry, PendingUpload, StateDb};
 use crate::sync_status::{FolderRun, StatusTracker};
 
@@ -604,19 +605,22 @@ async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(
 }
 
 fn restore_local_intents(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
-    crate::recovery::restore_interrupted(&folder.local_path, |path, expected_version| {
-        let relative = path
-            .strip_prefix(&folder.local_path)
-            .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))?;
-        let key = path_key(relative).map_err(std::io::Error::other)?;
-        state_db
-            .file_state_version(folder.id, &key)
-            .map(|version| {
-                version.is_some()
-                    && expected_version.is_none_or(|expected| version.as_deref() == Some(expected))
-            })
-            .map_err(std::io::Error::other)
-    })?;
+    Recovery::new(&folder.local_path, folder.id).restore_interrupted(
+        |path, expected_version| {
+            let relative = path
+                .strip_prefix(&folder.local_path)
+                .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))?;
+            let key = path_key(relative).map_err(std::io::Error::other)?;
+            state_db
+                .file_state_version(folder.id, &key)
+                .map(|version| {
+                    version.is_some()
+                        && expected_version
+                            .is_none_or(|expected| version.as_deref() == Some(expected))
+                })
+                .map_err(std::io::Error::other)
+        },
+    )?;
     Ok(())
 }
 
@@ -782,8 +786,7 @@ async fn preserve_local_path(
     let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
     let version = state_db.file_state_version(folder.id, key)?;
-    crate::recovery::move_with_intent(
-        &folder.local_path,
+    Recovery::new(&folder.local_path, folder.id).move_with_intent(
         &folder.local_path.join(path),
         &folder.local_path.join(&conflict),
         version.as_deref(),
@@ -858,6 +861,7 @@ async fn atomic_download_with(
 ) -> Result<bool, SyncError> {
     use std::io::Write;
     let fs = LocalFs(&folder.local_path);
+    let recovery = Recovery::new(&folder.local_path, folder.id);
     let parent = path
         .parent()
         .ok_or_else(|| SyncError::Api("download has no parent".into()))?;
@@ -892,16 +896,16 @@ async fn atomic_download_with(
             }
         }
         before_publish(DownloadPhase::Checked)?;
-        let archived = crate::recovery::archive_replacement(path)?;
+        let archived = recovery.archive_replacement(path)?;
         if expected.is_some() && archived.is_none() {
             fs.remove_file(&temporary)?;
             return Ok(false);
         }
         before_publish(DownloadPhase::Archived)?;
-        crate::recovery::rename_no_replace(&temporary, path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        fs.rename_no_replace(&temporary, path)?;
+        fs.sync_dir(parent)?;
         if let Some(archived) = archived {
-            crate::recovery::complete_replacement(&archived)?;
+            recovery.complete_replacement(&archived)?;
         }
         Ok::<bool, SyncError>(true)
     }
@@ -1075,11 +1079,12 @@ async fn initial_pull(
                         }
                         None
                     } else {
-                        crate::recovery::archive_removal(&local_path)?
+                        Recovery::new(&folder.local_path, folder.id).archive_removal(&local_path)?
                     };
                     state_db.remove_file_state(folder.id, &rel_path)?;
                     if let Some(archived) = archived {
-                        crate::recovery::complete_replacement(&archived)?;
+                        Recovery::new(&folder.local_path, folder.id)
+                            .complete_replacement(&archived)?;
                     }
                 }
             }
@@ -1201,15 +1206,17 @@ async fn relocate_remote_entry(
         LocalFs(&folder.local_path).create_dir_all(parent)?;
     }
     let version = state_db.file_state_version(folder.id, &existing.local_rel_path)?;
-    let intent =
-        match crate::recovery::move_with_intent(&folder.local_path, &old, &new, version.as_deref())
-        {
-            Ok(intent) => intent,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
+    let intent = match Recovery::new(&folder.local_path, folder.id).move_with_intent(
+        &old,
+        &new,
+        version.as_deref(),
+    ) {
+        Ok(intent) => intent,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, rel_path)?;
-    crate::recovery::complete_replacement(&intent)?;
+    Recovery::new(&folder.local_path, folder.id).complete_replacement(&intent)?;
     Ok(true)
 }
 
@@ -1331,7 +1338,7 @@ async fn queue_dirty_descendants(
             let (name, file_type) = entry?;
             let path = directory.join(&name);
             if name == crate::recovery::DIRECTORY {
-                crate::recovery::validate(&path)?;
+                Recovery::new(&folder.local_path, folder.id).validate(&path)?;
                 continue;
             }
             let relative = path.strip_prefix(&folder.local_path)?;
@@ -1907,10 +1914,11 @@ async fn poll_remote_changes(
 
         if deleted {
             status.active();
-            let archived = crate::recovery::archive_removal(&local_path)?;
+            let archived =
+                Recovery::new(&folder.local_path, folder.id).archive_removal(&local_path)?;
             state_db.remove_file_state(folder.id, &existing.local_rel_path)?;
             if let Some(archived) = archived {
-                crate::recovery::complete_replacement(&archived)?;
+                Recovery::new(&folder.local_path, folder.id).complete_replacement(&archived)?;
             }
             continue;
         }
@@ -2781,7 +2789,8 @@ mod tests {
                     .is_err()
                 );
             } else {
-                crate::recovery::archive_replacement(&path)
+                Recovery::new(&folder.local_path, folder.id)
+                    .archive_replacement(&path)
                     .unwrap()
                     .unwrap();
             }
@@ -2834,15 +2843,12 @@ mod tests {
                         .state_db
                         .file_state_version(folder.id, "file.txt")
                         .unwrap();
-                    crate::recovery::move_with_intent(
-                        &folder.local_path,
-                        &original,
-                        &target,
-                        version.as_deref(),
-                    )
-                    .unwrap();
+                    Recovery::new(&folder.local_path, folder.id)
+                        .move_with_intent(&original, &target, version.as_deref())
+                        .unwrap();
                 } else {
-                    crate::recovery::archive_removal(&original)
+                    Recovery::new(&folder.local_path, folder.id)
+                        .archive_removal(&original)
                         .unwrap()
                         .unwrap();
                 }
