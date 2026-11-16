@@ -16,3 +16,4 @@ directories = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 zbus = { workspace = true }
+libc = { workspace = true }

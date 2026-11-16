@@ -24,12 +24,16 @@ feature in packaged binaries.
   Startup blocks every affected binding before filesystem or Drive mutations,
   reports per-folder errors, and leaves unrelated bindings runnable. Root leases
   also reject overlapping direct `start_folder` calls and remain held until
-  cancelled workers drop. Local mutations use non-detached blocking sections,
+  cancelled workers drop. Generations are registered before root resolution,
+  so a stop during inspection prevents subsequent admission or mutation.
+  Local mutations use non-detached blocking sections,
   yielding a multithreaded runtime's worker thread without allowing cancellation
   to release the root before the syscall finishes. Replacement workers wait in
   bounded two-second attempts for retiring roots, reporting timeouts and retrying
   at the polling interval. Removing/disabling a startup conflict rechecks only
   root-blocked bindings, without restarting unrelated workers or failures.
+  A remaining enabled binding with a duplicate configured UUID retains its
+  root-blocked retry marker when another occurrence is disabled.
   Workers use the resolved local root. Disable sync before moving a root or
   changing its ancestor directories; such external topology changes are not
   coordinated with running workers.

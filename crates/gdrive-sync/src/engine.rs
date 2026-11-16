@@ -70,7 +70,7 @@ pub struct SyncEngine {
 
 struct RootEntry {
     folder_id: Uuid,
-    root: local_roots::ResolvedRoot,
+    root: Option<local_roots::ResolvedRoot>,
     retiring: bool,
 }
 
@@ -105,41 +105,62 @@ struct RootLease {
 }
 
 impl RootLease {
+    fn register(roots: Arc<RootRegistry>, folder_id: Uuid, generation: u64) -> Self {
+        roots.active.lock().unwrap().insert(
+            generation,
+            RootEntry {
+                folder_id,
+                root: None,
+                retiring: false,
+            },
+        );
+        Self { roots, generation }
+    }
+
+    #[cfg(test)]
     async fn acquire(
         roots: Arc<RootRegistry>,
         folder_id: Uuid,
         generation: u64,
         root: &local_roots::ResolvedRoot,
     ) -> Result<Self, SyncError> {
+        let lease = Self::register(roots, folder_id, generation);
+        lease.admit(root).await?;
+        Ok(lease)
+    }
+
+    async fn admit(&self, root: &local_roots::ResolvedRoot) -> Result<(), SyncError> {
         let acquire = async {
-            let mut changes = roots.changes.subscribe();
+            let mut changes = self.roots.changes.subscribe();
             loop {
                 {
-                    let mut active = roots.active.lock().unwrap();
+                    let mut active = self.roots.active.lock().unwrap();
+                    if active
+                        .get(&self.generation)
+                        .is_none_or(|entry| entry.retiring)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "folder stopped before local root admission",
+                        )
+                        .into());
+                    }
                     let conflicts: Vec<_> = active
-                        .values()
-                        .filter(|entry| root.overlaps(&entry.root))
+                        .iter()
+                        .filter(|(generation, _)| **generation != self.generation)
+                        .filter_map(|(_, entry)| entry.root.as_ref().map(|root| (entry, root)))
+                        .filter(|(_, other)| root.overlaps(other))
                         .collect();
-                    if let Some(other) = conflicts.iter().find(|entry| !entry.retiring) {
+                    if let Some((_, other)) = conflicts.iter().find(|(entry, _)| !entry.retiring) {
                         return Err(CommonError::OverlappingRoots {
                             first: root.path.clone(),
-                            second: other.root.path.clone(),
+                            second: other.path.clone(),
                         }
                         .into());
                     }
                     if conflicts.is_empty() {
-                        active.insert(
-                            generation,
-                            RootEntry {
-                                folder_id,
-                                root: root.clone(),
-                                retiring: false,
-                            },
-                        );
-                        return Ok(Self {
-                            roots: Arc::clone(&roots),
-                            generation,
-                        });
+                        active.get_mut(&self.generation).unwrap().root = Some(root.clone());
+                        return Ok(());
                     }
                 }
                 changes.changed().await.map_err(std::io::Error::other)?;
@@ -161,7 +182,7 @@ impl Drop for RootLease {
     }
 }
 
-fn blocking_fs<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+fn blocking_fs<T>(operation: impl FnOnce() -> T) -> T {
     // Unlike detached tokio::fs work, mutations cannot outlive this worker's lease.
     if tokio::runtime::Handle::try_current()
         .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
@@ -253,16 +274,15 @@ impl SyncEngine {
         let folder_id = folder.id;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let run = self.status.start(folder_id, generation);
-        let roots = Arc::clone(&self.roots);
+        let lease = RootLease::register(Arc::clone(&self.roots), folder_id, generation);
 
         let handle = tokio::spawn(async move {
             let result = async {
-                let root = local_roots::ResolvedRoot::new(&folder.local_path)?;
+                let root = blocking_fs(|| local_roots::ResolvedRoot::new(&folder.local_path))?;
                 folder.local_path = root.path.clone();
-                let _lease = loop {
-                    match RootLease::acquire(Arc::clone(&roots), folder_id, generation, &root).await
-                    {
-                        Ok(lease) => break lease,
+                loop {
+                    match lease.admit(&root).await {
+                        Ok(()) => break,
                         Err(error @ SyncError::Timeout { .. }) => {
                             run.finish("local roots", Err(error.to_string()));
                             let _ = events.send(SyncEvent::Error {
@@ -273,7 +293,7 @@ impl SyncEngine {
                         }
                         Err(error) => return Err(error),
                     }
-                };
+                }
                 run.finish("local roots", Ok(()));
                 run_folder(
                     folder.clone(),
@@ -343,6 +363,20 @@ impl SyncEngine {
             }
             self.start_folder(folder.clone());
         }
+    }
+
+    pub fn stop_folder_and_reconcile(&self, folder_id: Uuid, config: &AppConfig) {
+        let was_blocked = self.blocked_roots.lock().unwrap().contains(&folder_id);
+        self.stop_folder(folder_id);
+        if was_blocked
+            && config
+                .sync_folders
+                .iter()
+                .any(|folder| folder.id == folder_id && folder.enabled)
+        {
+            self.blocked_roots.lock().unwrap().insert(folder_id);
+        }
+        self.reconcile_blocked_roots(config);
     }
 
     /// Retry only bindings blocked by startup root validation, not unrelated failures.
@@ -1885,6 +1919,27 @@ mod tests {
         .unwrap();
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_admission_cannot_publish_an_active_root() {
+        let path = std::env::temp_dir().join(format!("gdrive-pending-root-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let root = local_roots::ResolvedRoot::new(&path).unwrap();
+        let roots = Arc::new(RootRegistry::default());
+        let id = Uuid::new_v4();
+        let pending = RootLease::register(Arc::clone(&roots), id, 1);
+        roots.retire(id);
+        assert!(matches!(pending.admit(&root).await,
+            Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted));
+        let replacement = RootLease::acquire(Arc::clone(&roots), Uuid::new_v4(), 2, &root)
+            .await
+            .unwrap();
+        assert!(roots.active.lock().unwrap()[&1].retiring);
+        drop(pending);
+        drop(replacement);
+        assert!(roots.active.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]
