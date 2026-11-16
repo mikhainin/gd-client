@@ -2,15 +2,17 @@
 //! `notify` crate (inotify on Linux, kqueue on BSD/macOS).
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::error::SyncError;
+use crate::local_fs::{blocking_fs, Directory, LocalFs};
 use crate::state_db::StateDb;
 use uuid::Uuid;
 
@@ -38,7 +40,19 @@ pub struct LocalWatcher {
     // it stops the underlying OS watch.
     watcher: RecommendedWatcher,
     root: PathBuf,
-    watched: HashMap<PathBuf, (u64, u64)>,
+    watched: HashMap<PathBuf, WatchedDirectory>,
+    paths: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+}
+
+struct WatchedDirectory {
+    directory: Directory,
+    identity: (u64, u64),
+}
+
+impl WatchedDirectory {
+    fn watch_path(&self) -> PathBuf {
+        self.directory.path(OsStr::new("."))
+    }
 }
 
 impl LocalWatcher {
@@ -50,12 +64,24 @@ impl LocalWatcher {
         sender: mpsc::UnboundedSender<Result<LocalChange, SyncError>>,
     ) -> Result<Self, SyncError> {
         let watched_root = root.to_path_buf();
+        let paths = Arc::new(Mutex::new(HashMap::<PathBuf, PathBuf>::new()));
+        let event_paths = Arc::clone(&paths);
         let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
             Ok(event) => {
                 let Some(kind) = classify(&event.kind) else {
                     return;
                 };
-                for path in event.paths.clone() {
+                for event_path in &event.paths {
+                    let path = {
+                        let paths = event_paths.lock().unwrap();
+                        paths.iter().find_map(|(registered, logical)| {
+                            event_path
+                                .strip_prefix(registered)
+                                .ok()
+                                .map(|relative| logical.join(relative))
+                        })
+                    };
+                    let Some(path) = path else { continue };
                     let Ok(relative) = path.strip_prefix(&watched_root) else {
                         continue;
                     };
@@ -81,6 +107,7 @@ impl LocalWatcher {
             watcher,
             root: root.to_path_buf(),
             watched: HashMap::new(),
+            paths,
         };
         watcher.refresh()?;
         Ok(watcher)
@@ -88,67 +115,100 @@ impl LocalWatcher {
 
     /// Reconcile live-directory registrations after topology or inode changes.
     pub fn refresh(&mut self) -> Result<(), SyncError> {
-        let mut desired = HashMap::new();
-        let mut directories = vec![self.root.clone()];
-        while let Some(directory) = directories.pop() {
-            let contents = std::fs::metadata(&directory)
-                .and_then(|metadata| std::fs::read_dir(&directory).map(|items| (metadata, items)));
-            let (metadata, items) = match contents {
-                Ok(contents) => contents,
-                Err(error)
-                    if directory != self.root
-                        && matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) =>
-                {
-                    continue
+        self.refresh_with(|_| Ok(()))
+    }
+
+    fn refresh_with(
+        &mut self,
+        mut before_open: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<(), SyncError> {
+        blocking_fs(|| {
+            let mut desired = HashMap::new();
+            let mut directories = vec![self.root.clone()];
+            let inspection = (|| {
+                while let Some(directory) = directories.pop() {
+                    before_open(&directory)?;
+                    let mut items = match LocalFs(&self.root).read_dir(&directory) {
+                        Ok(items) => items,
+                        Err(error)
+                            if directory != self.root
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::NotADirectory
+                                ) =>
+                        {
+                            continue
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    for item in items.by_ref() {
+                        let (name, file_type) = item?;
+                        let path = directory.join(name);
+                        if file_type.is_dir() && !is_internal_path(path.strip_prefix(&self.root)?) {
+                            directories.push(path);
+                        }
+                    }
+                    let pin = items.into_directory();
+                    let metadata = pin.metadata()?;
+                    desired.insert(
+                        directory,
+                        WatchedDirectory {
+                            directory: pin,
+                            identity: (metadata.dev(), metadata.ino()),
+                        },
+                    );
                 }
-                Err(error) => return Err(error.into()),
-            };
-            desired.insert(directory, (metadata.dev(), metadata.ino()));
-            for item in items {
-                let item = item?;
-                if item.file_type()?.is_dir()
-                    && !is_internal_path(item.path().strip_prefix(&self.root)?)
-                {
-                    directories.push(item.path());
+                Ok::<_, SyncError>(())
+            })();
+            for path in self
+                .watched
+                .iter()
+                .filter(|(path, watched)| {
+                    desired
+                        .get(*path)
+                        .is_none_or(|current| current.identity != watched.identity)
+                })
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+            {
+                let registered = self.watched[&path].watch_path();
+                match self.watcher.unwatch(&registered) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind,
+                            notify::ErrorKind::WatchNotFound | notify::ErrorKind::PathNotFound
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                self.paths.lock().unwrap().remove(&registered);
+                self.watched.remove(&path);
+            }
+            inspection?;
+            for (path, watched) in desired {
+                if self.watched.contains_key(&path) {
+                    continue;
+                }
+                let registered = watched.watch_path();
+                self.paths
+                    .lock()
+                    .unwrap()
+                    .insert(registered.clone(), path.clone());
+                match self.watcher.watch(&registered, RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        self.watched.insert(path, watched);
+                    }
+                    Err(error) => {
+                        self.paths.lock().unwrap().remove(&registered);
+                        if !matches!(error.kind, notify::ErrorKind::PathNotFound) {
+                            return Err(error.into());
+                        }
+                    }
                 }
             }
-        }
-        for path in self
-            .watched
-            .iter()
-            .filter(|(path, identity)| desired.get(*path) != Some(*identity))
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>()
-        {
-            match self.watcher.unwatch(&path) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind,
-                        notify::ErrorKind::WatchNotFound | notify::ErrorKind::PathNotFound
-                    ) => {}
-                Err(error) => return Err(error.into()),
-            }
-            self.watched.remove(&path);
-        }
-        for (path, identity) in desired
-            .iter()
-            .filter(|(path, _)| !self.watched.contains_key(*path))
-            .map(|(path, identity)| (path.clone(), *identity))
-            .collect::<Vec<_>>()
-        {
-            match self.watcher.watch(&path, RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    self.watched.insert(path, identity);
-                }
-                Err(error) if matches!(error.kind, notify::ErrorKind::PathNotFound) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -181,6 +241,69 @@ mod tests {
     use super::*;
     use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
     use std::collections::HashSet;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_symlink_swaps_cannot_watch_another_tree_or_leave_history_watched() {
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        let other = fixture.join("other/deep");
+        std::fs::create_dir_all(root.join("live/deep")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir(root.join(crate::recovery::DIRECTORY)).unwrap();
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut watcher = LocalWatcher::watch(&root, Uuid::new_v4(), state, sender).unwrap();
+        let archived = root.join(crate::recovery::DIRECTORY).join("moved");
+        assert!(watcher
+            .refresh_with(|path| {
+                if path == root.join("live") {
+                    std::fs::rename(path, &archived)?;
+                    std::os::unix::fs::symlink(other.parent().unwrap(), path)?;
+                }
+                Ok(())
+            })
+            .is_err());
+        let watches = kernel_watch_inodes();
+        for path in [
+            &other,
+            other.parent().unwrap(),
+            &archived,
+            &archived.join("deep"),
+        ] {
+            assert!(!watches.contains(&std::fs::metadata(path).unwrap().ino()));
+        }
+        drop(watcher);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stalled_refresh_does_not_occupy_the_only_async_worker() {
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut watcher = LocalWatcher::watch(&root, Uuid::new_v4(), state, sender).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let mut started = Some(started);
+            watcher.refresh_with(|_| {
+                if let Some(started) = started.take() {
+                    started.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            })
+        });
+        ready.await.unwrap();
+        assert!(!task.is_finished());
+        resume.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
 
     #[test]
     fn recovery_entries_and_download_staging_never_enter_the_upload_queue() {

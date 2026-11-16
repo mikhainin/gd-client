@@ -23,11 +23,17 @@ pub(crate) fn blocking_fs<T>(operation: impl FnOnce() -> T) -> T {
 
 pub(crate) struct LocalFs<'a>(pub &'a Path);
 
-struct Directory(File);
+pub(crate) struct Directory(File);
 
 pub(crate) struct DirectoryEntries {
     _directory: Directory,
     entries: std::fs::ReadDir,
+}
+
+impl DirectoryEntries {
+    pub fn into_directory(self) -> Directory {
+        self._directory
+    }
 }
 
 impl Iterator for DirectoryEntries {
@@ -44,6 +50,10 @@ impl Iterator for DirectoryEntries {
 }
 
 impl Directory {
+    pub fn metadata(&self) -> io::Result<Metadata> {
+        self.0.metadata()
+    }
+
     fn child(&self, name: &OsStr, create: bool) -> io::Result<Self> {
         let open = || open_at(self.0.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY);
         let file = match open() {
@@ -72,7 +82,7 @@ impl Directory {
         Ok(self)
     }
 
-    fn path(&self, name: &OsStr) -> PathBuf {
+    pub fn path(&self, name: &OsStr) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.0.as_raw_fd())).join(name)
     }
 }

@@ -3,7 +3,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::local_fs::LocalFs;
+use crate::local_fs::{blocking_fs, LocalFs};
 
 pub(crate) const DIRECTORY: &str = ".gdrive-recovery";
 pub(crate) const INITIALIZING_PREFIX: &str = ".gdrive-recovery-init-";
@@ -85,8 +85,10 @@ impl<'a> Recovery<'a> {
         self.fs.create_private_dir(&temporary)?;
         let result = (|| {
             let mut marker = self.fs.create_new(&temporary.join("owner"))?;
-            write_marker(&mut marker)?;
-            marker.sync_all()?;
+            blocking_fs(|| {
+                write_marker(&mut marker)?;
+                marker.sync_all()
+            })?;
             drop(marker);
             self.fs.sync_dir(&temporary)?;
             match self.fs.rename_no_replace(&temporary, &directory) {
@@ -115,47 +117,49 @@ impl<'a> Recovery<'a> {
         target: Option<&Path>,
         version: Option<&str>,
     ) -> std::io::Result<()> {
-        let directory = entry.parent().unwrap();
-        let pending = directory.join("pending");
-        match self.fs.create_private_dir(&pending) {
-            Ok(()) => {
-                self.fs.sync_dir(directory)?;
+        blocking_fs(|| {
+            let directory = entry.parent().unwrap();
+            let pending = directory.join("pending");
+            match self.fs.create_private_dir(&pending) {
+                Ok(()) => {
+                    self.fs.sync_dir(directory)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !self.fs.metadata(&pending)?.is_dir() {
+                        return Err(std::io::Error::other(
+                            "recovery pending path must be a directory",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !self.fs.metadata(&pending)?.is_dir() {
-                    return Err(std::io::Error::other(
-                        "recovery pending path must be a directory",
-                    ));
+            let temporary = entry.join(".intent");
+            let mut file = self.fs.create_new(&temporary)?;
+            let metadata = self.fs.metadata(path)?;
+            file.write_all(&[kind])?;
+            file.write_all(&metadata.dev().to_le_bytes())?;
+            file.write_all(&metadata.ino().to_le_bytes())?;
+            file.write_all(path.file_name().unwrap().as_bytes())?;
+            if let Some(target) = target {
+                file.write_all(&[0])?;
+                file.write_all(target.as_os_str().as_bytes())?;
+            }
+            if kind == b'M' {
+                file.write_all(&[0])?;
+                match version {
+                    Some(version) => {
+                        file.write_all(b"1")?;
+                        file.write_all(version.as_bytes())?;
+                    }
+                    None => file.write_all(b"0")?,
                 }
             }
-            Err(error) => return Err(error),
-        }
-        let temporary = entry.join(".intent");
-        let mut file = self.fs.create_new(&temporary)?;
-        let metadata = self.fs.metadata(path)?;
-        file.write_all(&[kind])?;
-        file.write_all(&metadata.dev().to_le_bytes())?;
-        file.write_all(&metadata.ino().to_le_bytes())?;
-        file.write_all(path.file_name().unwrap().as_bytes())?;
-        if let Some(target) = target {
-            file.write_all(&[0])?;
-            file.write_all(target.as_os_str().as_bytes())?;
-        }
-        if kind == b'M' {
-            file.write_all(&[0])?;
-            match version {
-                Some(version) => {
-                    file.write_all(b"1")?;
-                    file.write_all(version.as_bytes())?;
-                }
-                None => file.write_all(b"0")?,
-            }
-        }
-        file.sync_all()?;
-        drop(file);
-        self.fs
-            .rename_no_replace(&temporary, &pending.join(entry.file_name().unwrap()))?;
-        self.fs.sync_dir(&pending)
+            file.sync_all()?;
+            drop(file);
+            self.fs
+                .rename_no_replace(&temporary, &pending.join(entry.file_name().unwrap()))?;
+            self.fs.sync_dir(&pending)
+        })
     }
 
     // The returned handle identifies the journal; the data itself remains at `to`.
@@ -418,6 +422,29 @@ fn normal_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stalled_marker_writes_do_not_occupy_the_only_async_worker() {
+        let root = std::env::temp_dir().join(format!("gdrive-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let directory = root.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let recovery = Recovery::new(&directory, uuid::Uuid::nil());
+            recovery.initialize_store(&directory, |marker| {
+                started.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(2))
+                    .map_err(std::io::Error::other)?;
+                marker.write_all(recovery.marker().as_bytes())
+            })
+        });
+        ready.await.unwrap();
+        assert!(!task.is_finished());
+        resume.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn moved_journals_cannot_be_consumed_by_another_binding() {

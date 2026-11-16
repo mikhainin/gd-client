@@ -245,6 +245,11 @@ feature in packaged binaries.
   directories only; registration refreshes exclude recovery/staging trees and
   remove watches when directories move into history. Device/inode changes also
   replace stale registrations when a new live directory reuses the same path.
+  Enumeration rejects descendant symlinks; registrations retain validated
+  directory descriptors and translate descriptor-based events back to live paths.
+  A failed inspection removes registrations absent from its verified prefix.
+  Refresh walks and recovery metadata writes/flushes use non-detached blocking
+  sections, preserving root leases without occupying async executor workers.
   New live directories are picked up between engine iterations, with periodic
   scans covering missed notifications. Read/access and metadata-only events, including
   ownership changes made by the daemon, are ignored; content changes remain
