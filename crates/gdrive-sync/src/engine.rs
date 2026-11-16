@@ -22,8 +22,9 @@ use crate::drive_client::{DriveClient, DriveFile, FOLDER_MIME_TYPE};
 use crate::error::SyncError;
 use crate::google_document;
 use crate::local_fs::{blocking_fs, LocalFs};
-use crate::local_watcher::{is_download_staging, path_key, LocalChange, LocalWatcher};
+use crate::local_watcher::{is_internal_path, path_key, LocalChange, LocalWatcher};
 use crate::ownership::resolve_owner;
+use crate::recovery::Recovery;
 use crate::state_db::{FileStateEntry, PendingUpload, StateDb};
 use crate::sync_status::{FolderRun, StatusTracker};
 
@@ -473,7 +474,7 @@ async fn run_folder(
         .unwrap_or_else(|| "root".to_string());
 
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Result<LocalChange, SyncError>>();
-    let _watcher = LocalWatcher::watch(
+    let mut watcher = LocalWatcher::watch(
         &folder.local_path,
         folder.id,
         Arc::clone(&state_db),
@@ -526,6 +527,20 @@ async fn run_folder(
     poll_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        let registration = watcher.refresh();
+        status.finish(
+            "local watch registrations",
+            registration
+                .as_ref()
+                .map(|_| ())
+                .map_err(ToString::to_string),
+        );
+        if let Err(error) = registration {
+            let _ = events.send(SyncEvent::Error {
+                folder_id: Some(folder.id),
+                message: error.to_string(),
+            });
+        }
         tokio::select! {
             Some(change) = local_rx.recv() => {
                 if !coalesce_local_notifications(change, &mut local_rx, folder.id, &events, status) {
@@ -583,6 +598,7 @@ fn coalesce_local_notifications(
 }
 
 async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
+    restore_local_intents(folder, state_db)?;
     queue_dirty_descendants(folder, state_db, &folder.local_path).await?;
     for existing in state_db.file_states(folder.id)? {
         if local_metadata(folder, &folder.local_path.join(&existing.local_rel_path))
@@ -592,6 +608,26 @@ async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(
             state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
         }
     }
+    Ok(())
+}
+
+fn restore_local_intents(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
+    Recovery::new(&folder.local_path, folder.id).restore_interrupted(
+        |path, expected_version| {
+            let relative = path
+                .strip_prefix(&folder.local_path)
+                .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))?;
+            let key = path_key(relative).map_err(std::io::Error::other)?;
+            state_db
+                .file_state_version(folder.id, &key)
+                .map(|version| {
+                    version.is_some()
+                        && expected_version
+                            .is_none_or(|expected| version.as_deref() == Some(expected))
+                })
+                .map_err(std::io::Error::other)
+        },
+    )?;
     Ok(())
 }
 
@@ -756,9 +792,11 @@ async fn preserve_local_path(
     let path = Path::new(key);
     let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
-    LocalFs(&folder.local_path).rename(
+    let version = state_db.file_state_version(folder.id, key)?;
+    Recovery::new(&folder.local_path, folder.id).move_with_intent(
         &folder.local_path.join(path),
         &folder.local_path.join(&conflict),
+        version.as_deref(),
     )?;
     state_db.queue_local_change(folder.id, &conflict_key)?;
     if LocalFs(&folder.local_path)
@@ -780,14 +818,58 @@ async fn atomic_download(
         .map(|_| ())
 }
 
+async fn download_tracked(
+    folder: &SyncFolder,
+    path: &Path,
+    content: &[u8],
+    existing: &FileStateEntry,
+) -> Result<bool, SyncError> {
+    let current = match LocalFs(&folder.local_path).read(path) {
+        Ok(current) => current,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            return Ok(false)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if existing.md5_checksum.as_ref() != Some(&format!("{:x}", md5::compute(&current))) {
+        return Ok(false);
+    }
+    atomic_download_checked(folder, path, content, Some(&current)).await
+}
+
 async fn atomic_download_checked(
     folder: &SyncFolder,
     path: &Path,
     content: &[u8],
     expected: Option<&[u8]>,
 ) -> Result<bool, SyncError> {
+    atomic_download_with(folder, path, content, expected, |_| Ok(())).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadPhase {
+    Staged,
+    Checked,
+    Archived,
+}
+
+async fn atomic_download_with(
+    folder: &SyncFolder,
+    path: &Path,
+    content: &[u8],
+    expected: Option<&[u8]>,
+    mut before_publish: impl FnMut(DownloadPhase) -> std::io::Result<()>,
+) -> Result<bool, SyncError> {
     use std::io::Write;
     let fs = LocalFs(&folder.local_path);
+    let recovery = Recovery::new(&folder.local_path, folder.id);
     let parent = path
         .parent()
         .ok_or_else(|| SyncError::Api("download has no parent".into()))?;
@@ -810,10 +892,20 @@ async fn atomic_download_checked(
             file.write_all(content)?;
             file.sync_all()
         })?;
+        before_publish(DownloadPhase::Staged)?;
         if let Some(expected) = expected {
             let unchanged = match fs.read(path) {
                 Ok(current) => current == expected,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::NotADirectory
+                            | std::io::ErrorKind::IsADirectory
+                    ) =>
+                {
+                    false
+                }
                 Err(error) => return Err(error.into()),
             };
             if !unchanged {
@@ -821,7 +913,18 @@ async fn atomic_download_checked(
                 return Ok(false);
             }
         }
-        fs.rename(&temporary, path)?;
+        before_publish(DownloadPhase::Checked)?;
+        let archived = recovery.archive_replacement(path)?;
+        if expected.is_some() && archived.is_none() {
+            fs.remove_file(&temporary)?;
+            return Ok(false);
+        }
+        before_publish(DownloadPhase::Archived)?;
+        fs.rename_no_replace(&temporary, path)?;
+        fs.sync_dir(parent)?;
+        if let Some(archived) = archived {
+            recovery.complete_replacement(&archived)?;
+        }
         Ok::<bool, SyncError>(true)
     }
     .await;
@@ -985,19 +1088,22 @@ async fn initial_pull(
                         continue;
                     }
                 } else {
-                    if local_file_changed(folder, &local_path, &at_path).await?
+                    let archived = if local_file_changed(folder, &local_path, &at_path).await?
                         || (at_path.is_folder
                             && queue_dirty_descendants(folder, state_db, &local_path).await?)
                     {
                         if LocalFs(&folder.local_path).try_exists(&local_path)? {
                             preserve_local_path(folder, state_db, &rel_path).await?;
                         }
-                    } else if at_path.is_folder {
-                        LocalFs(&folder.local_path).remove_dir_all(&local_path)?;
+                        None
                     } else {
-                        LocalFs(&folder.local_path).remove_file(&local_path)?;
-                    }
+                        Recovery::new(&folder.local_path, folder.id).archive_removal(&local_path)?
+                    };
                     state_db.remove_file_state(folder.id, &rel_path)?;
+                    if let Some(archived) = archived {
+                        Recovery::new(&folder.local_path, folder.id)
+                            .complete_replacement(&archived)?;
+                    }
                 }
             }
         }
@@ -1040,14 +1146,16 @@ async fn initial_pull(
             }
             let content = download_content(drive, &child).await?;
             if let Some(existing) = state_db.find_by_drive_id(folder.id, &child.id)? {
-                if local_file_changed(folder, &local_path, &existing).await? {
+                if !download_tracked(folder, &local_path, &content, &existing).await? {
                     state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
                     continue;
                 }
-            } else if LocalFs(&folder.local_path).try_exists(&local_path)? {
-                preserve_local_path(folder, state_db, &rel_path).await?;
+            } else {
+                if LocalFs(&folder.local_path).try_exists(&local_path)? {
+                    preserve_local_path(folder, state_db, &rel_path).await?;
+                }
+                atomic_download(folder, &local_path, &content).await?;
             }
-            atomic_download(folder, &local_path, &content).await?;
             LocalFs(&folder.local_path).chown(&local_path, owner_uid, owner_gid)?;
             record_state(folder.id, state_db, &rel_path, &child, false)?;
             *synced += 1;
@@ -1058,7 +1166,13 @@ async fn initial_pull(
 }
 
 fn validate_remote_name(name: &str) -> Result<(), SyncError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || is_internal_path(Path::new(name))
+        || name.contains('/')
+        || name.contains('\0')
+    {
         return Err(SyncError::Api(
             "Drive name cannot be represented safely as a local filename".into(),
         ));
@@ -1109,8 +1223,18 @@ async fn relocate_remote_entry(
     if let Some(parent) = new.parent() {
         LocalFs(&folder.local_path).create_dir_all(parent)?;
     }
-    LocalFs(&folder.local_path).rename(&old, &new)?;
+    let version = state_db.file_state_version(folder.id, &existing.local_rel_path)?;
+    let intent = match Recovery::new(&folder.local_path, folder.id).move_with_intent(
+        &old,
+        &new,
+        version.as_deref(),
+    ) {
+        Ok(intent) => intent,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, rel_path)?;
+    Recovery::new(&folder.local_path, folder.id).complete_replacement(&intent)?;
     Ok(true)
 }
 
@@ -1230,9 +1354,13 @@ async fn queue_dirty_descendants(
         };
         for entry in entries {
             let (name, file_type) = entry?;
-            let path = directory.join(name);
+            let path = directory.join(&name);
+            if name == crate::recovery::DIRECTORY {
+                Recovery::new(&folder.local_path, folder.id).validate(&path)?;
+                continue;
+            }
             let relative = path.strip_prefix(&folder.local_path)?;
-            if is_download_staging(relative) {
+            if is_internal_path(relative) {
                 continue;
             }
             let key = path_key(relative)?;
@@ -1655,6 +1783,7 @@ async fn poll_remote_changes(
     let Some(page_token) = state_db.get_page_token(folder.id)? else {
         return Ok(());
     };
+    restore_local_intents(folder, state_db)?;
 
     let (changes, new_token) = drive.list_changes(&page_token).await?;
     let mut classified = Vec::new();
@@ -1803,14 +1932,12 @@ async fn poll_remote_changes(
 
         if deleted {
             status.active();
-            if LocalFs(&folder.local_path).try_exists(&local_path)? {
-                if existing.is_folder {
-                    LocalFs(&folder.local_path).remove_dir_all(&local_path)?;
-                } else {
-                    LocalFs(&folder.local_path).remove_file(&local_path)?;
-                }
-            }
+            let archived =
+                Recovery::new(&folder.local_path, folder.id).archive_removal(&local_path)?;
             state_db.remove_file_state(folder.id, &existing.local_rel_path)?;
+            if let Some(archived) = archived {
+                Recovery::new(&folder.local_path, folder.id).complete_replacement(&archived)?;
+            }
             continue;
         }
 
@@ -1829,12 +1956,11 @@ async fn poll_remote_changes(
             }
             status.active();
             let content = download_content(drive, &remote_file).await?;
-            if local_file_changed(folder, &local_path, &existing).await? {
+            if !download_tracked(folder, &local_path, &content, &existing).await? {
                 state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
                 deferred = true;
                 continue;
             }
-            atomic_download(folder, &local_path, &content).await?;
             LocalFs(&folder.local_path).chown(&local_path, owner_uid, owner_gid)?;
             record_state(
                 folder.id,
@@ -2645,6 +2771,300 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_directory_replacing_a_tracked_file_is_queued_not_a_fatal_download_error() {
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        let path = folder.local_path.join("file.txt");
+        let existing = engine
+            .state_db
+            .find_by_local_path(folder.id, "file.txt")
+            .unwrap()
+            .unwrap();
+        engine
+            .state_db
+            .complete_local_change(folder.id, "file.txt")
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(!download_tracked(&folder, &path, b"remote", &existing)
+            .await
+            .unwrap());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"old").unwrap();
+        assert!(
+            !atomic_download_with(&folder, &path, b"remote", Some(b"old"), |phase| {
+                if phase == DownloadPhase::Staged {
+                    std::fs::remove_file(&path)?;
+                    std::fs::create_dir(&path)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap()
+        );
+        scan_local_changes(&folder, &engine.state_db).await.unwrap();
+        assert!(engine
+            .state_db
+            .has_pending_local_change(folder.id, "file.txt")
+            .unwrap());
+        assert!(path.is_dir());
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_publication_keeps_late_writes_and_never_replaces_a_new_destination() {
+        use std::io::Write;
+        let server = Server::start(vec![]);
+        let (root, folder, engine) = local_fixture(&server, b"old").await;
+        let path = folder.local_path.join("file.txt");
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        atomic_download_with(&folder, &path, b"remote", Some(b"old"), |phase| {
+            if phase == DownloadPhase::Archived {
+                writer.write_all(b"-late")?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"remote");
+        let recovery = path.parent().unwrap().join(crate::recovery::DIRECTORY);
+        let entries: Vec<_> = std::fs::read_dir(&recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry.is_dir() && entry.file_name() != Some(std::ffi::OsStr::new("pending"))
+            })
+            .collect();
+        assert_eq!(
+            std::fs::read(entries[0].join("file.txt")).unwrap(),
+            b"old-late"
+        );
+        let error = atomic_download_with(&folder, &path, b"new remote", Some(b"remote"), |phase| {
+            if phase == DownloadPhase::Archived {
+                std::fs::write(&path, b"new local")?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, SyncError::Io(ref source)
+            if source.kind() == std::io::ErrorKind::AlreadyExists));
+        assert_eq!(std::fs::read(&path).unwrap(), b"new local");
+        assert!(
+            !atomic_download_with(&folder, &path, b"remote", Some(b"new local"), |phase| {
+                if phase == DownloadPhase::Checked {
+                    std::fs::remove_file(&path)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap()
+        );
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".gdrive-download-")));
+        queue_dirty_descendants(&folder, &engine.state_db, &folder.local_path)
+            .await
+            .unwrap();
+        assert!(engine
+            .state_db
+            .pending_local_paths(folder.id)
+            .unwrap()
+            .iter()
+            .all(|key| !key.contains(crate::recovery::DIRECTORY)));
+        assert!(validate_remote_name(crate::recovery::DIRECTORY).is_err());
+        drop(engine);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_publication_restores_before_local_retry_can_trash_drive() {
+        for fail_during_publish in [false, true] {
+            let server = Server::start(vec![]);
+            let (root, folder, mut engine) = local_fixture(&server, b"old").await;
+            let path = folder.local_path.join("file.txt");
+            if fail_during_publish {
+                assert!(
+                    atomic_download_with(&folder, &path, b"remote", Some(b"old"), |phase| {
+                        if phase == DownloadPhase::Archived {
+                            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .is_err()
+                );
+            } else {
+                Recovery::new(&folder.local_path, folder.id)
+                    .archive_replacement(&path)
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(!path.exists());
+            engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+            let status = engine.status.start(folder.id, 1);
+            sync_local_changes(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root",
+                (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                &engine.events,
+                &status,
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"old");
+            assert_eq!(server.requests.try_iter().count(), 0);
+            assert!(engine
+                .state_db
+                .pending_local_paths(folder.id)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_local_path(folder.id, "file.txt")
+                    .unwrap()
+                    .unwrap()
+                    .drive_file_id
+                    .as_deref(),
+                Some("old-id")
+            );
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_removals_and_moves_reconcile_against_committed_state() {
+        for moved in [false, true] {
+            for committed in [false, true] {
+                let server = Server::start(vec![]);
+                let (root, folder, mut engine) = local_fixture(&server, b"old").await;
+                let original = folder.local_path.join("file.txt");
+                let target = folder.local_path.join("renamed.txt");
+                if moved {
+                    let version = engine
+                        .state_db
+                        .file_state_version(folder.id, "file.txt")
+                        .unwrap();
+                    Recovery::new(&folder.local_path, folder.id)
+                        .move_with_intent(&original, &target, version.as_deref())
+                        .unwrap();
+                } else {
+                    Recovery::new(&folder.local_path, folder.id)
+                        .archive_removal(&original)
+                        .unwrap()
+                        .unwrap();
+                }
+                if committed {
+                    if moved {
+                        engine
+                            .state_db
+                            .relocate_file_state(folder.id, "file.txt", "renamed.txt")
+                            .unwrap();
+                    } else {
+                        engine
+                            .state_db
+                            .remove_file_state(folder.id, "file.txt")
+                            .unwrap();
+                    }
+                }
+                engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+                let status = engine.status.start(folder.id, 1);
+                sync_local_changes(
+                    &folder,
+                    &engine.drive,
+                    &engine.state_db,
+                    "root",
+                    (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                    &engine.events,
+                    &status,
+                )
+                .await
+                .unwrap();
+                assert_eq!(original.exists(), !committed);
+                assert_eq!(target.exists(), moved && committed);
+                assert_eq!(server.requests.try_iter().count(), 0);
+                assert!(engine
+                    .state_db
+                    .pending_local_paths(folder.id)
+                    .unwrap()
+                    .is_empty());
+                drop(engine);
+                tokio::fs::remove_dir_all(root).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_rebindings_do_not_restore_conflicts_over_a_user_deletion() {
+        for (original_mapping, same_drive_id) in [(false, false), (true, false), (true, true)] {
+            let server = Server::start(vec![Reply::json("{}")]);
+            let (root, folder, mut engine) = local_fixture(&server, b"old").await;
+            let path = folder.local_path.join("file.txt");
+            let mut replacement = engine
+                .state_db
+                .find_by_local_path(folder.id, "file.txt")
+                .unwrap()
+                .unwrap();
+            if !original_mapping {
+                engine
+                    .state_db
+                    .remove_file_state(folder.id, "file.txt")
+                    .unwrap();
+            }
+            let conflict = preserve_local_path(&folder, &engine.state_db, "file.txt")
+                .await
+                .unwrap();
+            std::fs::write(&path, b"replacement").unwrap();
+            let id = if same_drive_id { "old-id" } else { "new-id" };
+            replacement.drive_file_id = Some(id.into());
+            engine.state_db.upsert_file_state(&replacement).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+            scan_local_changes(&folder, &engine.state_db).await.unwrap();
+            assert!(!path.exists());
+            assert_eq!(
+                std::fs::read(folder.local_path.join(conflict)).unwrap(),
+                b"old"
+            );
+            let status = engine.status.start(folder.id, 1);
+            assert!(handle_local_change(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root",
+                &LocalChange {
+                    path,
+                    kind: crate::local_watcher::LocalChangeKind::Modified
+                },
+                nix::unistd::Uid::current(),
+                nix::unistd::Gid::current(),
+                &status,
+            )
+            .await
+            .unwrap());
+            let requests: Vec<_> = server.requests.try_iter().collect();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with(&format!("PATCH /files/{id} ")));
+            assert!(requests[0].contains(r#""trashed":true"#));
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn staged_downloads_preserve_restricted_and_executable_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let server = Server::start(vec![]);
@@ -2866,7 +3286,10 @@ mod tests {
 
     #[tokio::test]
     async fn coalescing_notifications_retains_watcher_errors() {
-        let server = Server::start(vec![]);
+        let server = Server::start(vec![
+            Reply::json(r#"{"startPageToken":"start"}"#),
+            Reply::json(r#"{"files":[]}"#),
+        ]);
         let (root, folder, engine) = local_fixture(&server, b"old").await;
         let status = engine.status.start(folder.id, 1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2892,6 +3315,41 @@ mod tests {
             .errors
             .iter()
             .any(|message| message.contains("watcher persistence failed")));
+        status.finish(
+            "local watch registrations",
+            Err("registration failed".into()),
+        );
+        let mut events = engine.subscribe();
+        let worker = tokio::spawn({
+            let folder = folder.clone();
+            let state_db = Arc::clone(&engine.state_db);
+            let drive = Arc::clone(&engine.drive);
+            let events = engine.events.clone();
+            async move {
+                run_folder(
+                    folder,
+                    state_db,
+                    drive,
+                    events,
+                    Duration::from_secs(60),
+                    &status,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await.unwrap(),
+                SyncEvent::InitialSyncComplete { .. }
+            ) {}
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        let errors = &engine.sync_status().folders[0].errors;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("watcher persistence failed"));
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

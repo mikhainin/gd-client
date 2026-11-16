@@ -241,15 +241,30 @@ feature in packaged binaries.
   Only a confirmed HTTP 404 is treated as an absent recovery target or an
   already-removed Trash target; other failures remain errors.
 - `local_watcher` — filesystem change notifications (via `notify`) for a
-  sync folder's local path. Read/access and metadata-only events, including
+  sync folder's local path. Individual nonrecursive registrations cover live
+  directories only; registration refreshes exclude recovery/staging trees and
+  remove watches when directories move into history. Device/inode changes also
+  replace stale registrations when a new live directory reuses the same path.
+  Enumeration rejects descendant symlinks; registrations retain validated
+  directory descriptors and translate descriptor-based events back to live paths.
+  A failed inspection removes registrations absent from its verified prefix.
+  Refresh retains existing pins rather than duplicating the full descriptor set.
+  All folder watchers share at most one quarter of the process's soft file
+  descriptor limit (capped at 4096 pins); additional directories use periodic
+  scans and report an explicit watch-budget status instead of stopping sync.
+  Refresh walks and recovery metadata writes/flushes use non-detached blocking
+  sections, preserving root leases without occupying async executor workers.
+  New live directories are picked up between engine iterations, with periodic
+  scans covering missed notifications. Read/access and metadata-only events, including
   ownership changes made by the daemon, are ignored; content changes remain
   queued and reconciled. The watcher callback persists paths independently of
   the transfer loop, before sending a wake-up notification. Queue revisions
   prevent finishing an older attempt from deleting newer events for that path.
   Paths retain literal filename characters, including Linux backslashes.
   The text-backed path store accepts UTF-8 names; unsupported byte sequences
-  are explicit watcher errors, never lossy aliases to another file. Watcher
-  errors and persistence failures remain visible until stop/restart.
+  are explicit watcher errors, never lossy aliases to another file. Callback
+  errors and persistence failures remain visible until stop/restart; registration
+  errors clear only after a successful registration refresh.
   Downloads are staged and atomically renamed; `.gdrive-download-` filename
   prefixes are reserved internal staging paths and excluded from watching/scans.
   Filtering is relative to the sync root. Staging preserves destination permission
@@ -276,12 +291,59 @@ Office/PDF exports; other native Google file types and Drive shortcuts are not
 implemented.
 
 Uploads are not resumable; uploads and downloads buffer whole files in memory.
-Remote metadata writes are not conditional transactions, and filesystem
-checks are not atomic with the subsequent write/removal. Replacement retention
+Local replacement downloads and clean remote removals retain the displaced
+file/directory in its parent's `.gdrive-recovery/<entry-id>/<original-name>`.
+Renames retain the original inode, including subsequent writes through existing
+open handles; publication and remote moves use Linux `RENAME_NOREPLACE` and fail
+closed rather than overwriting a concurrently created destination. Detected dirty
+paths still use the visible conflict-copy workflow described above.
+A tracked file replaced by a directory during download or staging is deferred
+to the local-change queue rather than stopping the startup worker.
+Replacement/removal/move intent is synced before changing paths. Scans and remote
+polls reconcile it before processing missing tracked paths: restore an absent
+original without overwrite, or keep an already-published/new destination.
+Replay flushes both publication and archive parent names before clearing an
+intent, including already-present destinations and no-restore decisions.
+If a parent was removed, its nearest surviving ancestor is flushed; flush
+failures preserve the intent for a later retry.
+Removals and relocations consult committed database mappings so completed
+operations are not undone or reuploaded after a crash. Move journals capture the
+original mapping's unique state version; each metadata upsert/relocation changes
+that version atomically, so a newly rebound path is never mistaken for the old
+mapping, even when its Drive ID and metadata are unchanged. SQLite uses
+full-synchronous WAL commits. Traversal skips vanished queued descendants after
+a directory restore but reports a missing root and other I/O failures.
+Restores verify recorded
+device/inode identity and fail explicitly if the expected source changed or
+disappeared. A daemon stop or failed publication is not inferred as user deletion
+of the live Drive item. Marker/journal reads reject non-regular files.
+Move intents exceeding the bounded reader's 8192-byte format limit are rejected
+before creating recovery entries or moving data, rather than publishing an
+unreadable pending journal.
+Recovery operations use the same descriptor-rooted, no-symlink filesystem
+operations as live synchronization, including bounded regular-file metadata reads.
+Unsupported or inaccessible destinations remain errors and do not clear intents.
+Each store's owner marker includes the configured folder UUID; moving a store
+between bindings fails explicitly rather than interpreting its root-relative
+journals against another binding's mappings.
+Recovery directories are private, excluded from scans/uploads, and never cleaned
+automatically. Restore entries manually to an ordinary path after pausing sync.
+The owner marker is synced in an excluded `.gdrive-recovery-init-<id>` staging
+directory before no-replace publication; an interrupted/failed initialization
+cannot publish an incomplete recovery store or block later retries.
+The name `.gdrive-recovery` is reserved at every depth: unmanaged existing paths
+and remote items with that name cause an explicit error, not silent adoption.
+The `.gdrive-download-` and `.gdrive-recovery-init-` prefixes are likewise reserved
+for internal staging and rejected in remote names.
+Unsupported no-replace renames and cross-filesystem moves are errors, never
+copy-and-delete fallbacks. Recovery consumes local disk and is not an independent
+backup or protection against disk failure.
+
+Remote metadata writes are not conditional transactions. Replacement retention
 avoids the check-then-Trash content race without relying on unsupported v3
 conditional-write headers or the v2 API.
 Concurrent renames can still cause naming conflicts, which are reported rather
 than resolved by choosing an arbitrary ID. Explicit local deletions still trash
 their tracked remote items and are not transactional multi-client arbitration.
-Remote deletions remove unchanged local items; detected local edits are preserved
+Remote deletions move unchanged local items into recovery; detected local edits are preserved
 as conflict copies. Drive Trash and retained history are not independent backups.

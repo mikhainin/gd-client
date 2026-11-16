@@ -1,14 +1,18 @@
 //! Watches a local directory tree for filesystem changes using the
 //! `notify` crate (inotify on Linux, kqueue on BSD/macOS).
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SyncError;
+use crate::local_fs::{blocking_fs, Directory, LocalFs};
 use crate::state_db::StateDb;
 use uuid::Uuid;
 
@@ -34,50 +38,229 @@ pub enum LocalChangeKind {
 pub struct LocalWatcher {
     // Kept alive for as long as we want to keep receiving events; dropping
     // it stops the underlying OS watch.
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
+    root: PathBuf,
+    watched: HashMap<PathBuf, WatchedDirectory>,
+    paths: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    budget: Arc<Semaphore>,
+}
+
+struct WatchedDirectory {
+    directory: Directory,
+    identity: (u64, u64),
+    _permit: OwnedSemaphorePermit,
+}
+
+impl WatchedDirectory {
+    fn watch_path(&self) -> PathBuf {
+        self.directory.path(OsStr::new("."))
+    }
+}
+
+fn watch_budget() -> std::io::Result<Arc<Semaphore>> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    if let Some(budget) = BUDGET.get() {
+        return Ok(Arc::clone(budget));
+    }
+    let mut limit = std::mem::MaybeUninit::<nix::libc::rlimit>::uninit();
+    if unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let limit = unsafe { limit.assume_init() };
+    let permits = (limit.rlim_cur.min(16_384) / 4) as usize;
+    Ok(Arc::clone(
+        BUDGET.get_or_init(|| Arc::new(Semaphore::new(permits))),
+    ))
 }
 
 impl LocalWatcher {
-    /// Starts watching `root` recursively, sending [`LocalChange`] events to
-    /// `sender` as they occur.
+    /// Watches live directories without registering internal recovery/staging trees.
     pub fn watch(
         root: &Path,
         folder_id: Uuid,
         state_db: Arc<StateDb>,
         sender: mpsc::UnboundedSender<Result<LocalChange, SyncError>>,
     ) -> Result<Self, SyncError> {
+        Self::watch_with_budget(root, folder_id, state_db, sender, watch_budget()?)
+    }
+
+    fn watch_with_budget(
+        root: &Path,
+        folder_id: Uuid,
+        state_db: Arc<StateDb>,
+        sender: mpsc::UnboundedSender<Result<LocalChange, SyncError>>,
+        budget: Arc<Semaphore>,
+    ) -> Result<Self, SyncError> {
         let watched_root = root.to_path_buf();
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<Event>| match res {
-                Ok(event) => {
-                    let Some(kind) = classify(&event.kind) else {
-                        return;
+        let paths = Arc::new(Mutex::new(HashMap::<PathBuf, PathBuf>::new()));
+        let event_paths = Arc::clone(&paths);
+        let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+            Ok(event) => {
+                let Some(kind) = classify(&event.kind) else {
+                    return;
+                };
+                for event_path in &event.paths {
+                    let path = {
+                        let paths = event_paths.lock().unwrap();
+                        paths.iter().find_map(|(registered, logical)| {
+                            event_path
+                                .strip_prefix(registered)
+                                .ok()
+                                .map(|relative| logical.join(relative))
+                        })
                     };
-                    for path in event.paths.clone() {
-                        let Ok(relative) = path.strip_prefix(&watched_root) else {
-                            continue;
-                        };
-                        if relative.as_os_str().is_empty() || is_download_staging(relative) {
-                            continue;
+                    let Some(path) = path else { continue };
+                    let Ok(relative) = path.strip_prefix(&watched_root) else {
+                        continue;
+                    };
+                    if relative.as_os_str().is_empty() || is_internal_path(relative) {
+                        continue;
+                    }
+                    let result = path_key(relative)
+                        .and_then(|key| state_db.queue_local_change(folder_id, &key))
+                        .map(|()| LocalChange { path, kind });
+                    if let Err(error) = &result {
+                        tracing::warn!("could not persist filesystem change: {error}");
+                    }
+                    let _ = sender.send(result);
+                }
+            }
+            Err(err) => {
+                tracing::warn!("local filesystem watch error: {err}");
+                let _ = sender.send(Err(err.into()));
+            }
+        })?;
+
+        let mut watcher = Self {
+            watcher,
+            root: root.to_path_buf(),
+            watched: HashMap::new(),
+            paths,
+            budget,
+        };
+        match watcher.refresh() {
+            Ok(()) => {}
+            Err(error @ SyncError::WatchLimit(_)) => tracing::warn!(%error),
+            Err(error) => return Err(error),
+        }
+        Ok(watcher)
+    }
+
+    /// Reconcile live-directory registrations after topology or inode changes.
+    pub fn refresh(&mut self) -> Result<(), SyncError> {
+        self.refresh_with(|_| Ok(()))
+    }
+
+    fn refresh_with(
+        &mut self,
+        mut before_open: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<(), SyncError> {
+        blocking_fs(|| {
+            let mut desired = HashMap::new();
+            let mut directories = vec![self.root.clone()];
+            let inspection = (|| {
+                while let Some(directory) = directories.pop() {
+                    before_open(&directory)?;
+                    let mut items = match LocalFs(&self.root).read_dir(&directory) {
+                        Ok(items) => items,
+                        Err(error)
+                            if directory != self.root
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::NotADirectory
+                                ) =>
+                        {
+                            continue
                         }
-                        let result = path_key(relative)
-                            .and_then(|key| state_db.queue_local_change(folder_id, &key))
-                            .map(|()| LocalChange { path, kind });
-                        if let Err(error) = &result {
-                            tracing::warn!("could not persist filesystem change: {error}");
+                        Err(error) => return Err(error.into()),
+                    };
+                    for item in items.by_ref() {
+                        let (name, file_type) = item?;
+                        let path = directory.join(name);
+                        if file_type.is_dir() && !is_internal_path(path.strip_prefix(&self.root)?) {
+                            directories.push(path);
                         }
-                        let _ = sender.send(result);
+                    }
+                    let metadata = items.into_directory().metadata()?;
+                    desired.insert(directory, (metadata.dev(), metadata.ino()));
+                }
+                Ok::<_, SyncError>(())
+            })();
+            for path in self
+                .watched
+                .iter()
+                .filter(|(path, watched)| {
+                    desired
+                        .get(*path)
+                        .is_none_or(|current| *current != watched.identity)
+                })
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>()
+            {
+                let registered = self.watched[&path].watch_path();
+                match self.watcher.unwatch(&registered) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind,
+                            notify::ErrorKind::WatchNotFound | notify::ErrorKind::PathNotFound
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                self.paths.lock().unwrap().remove(&registered);
+                self.watched.remove(&path);
+            }
+            inspection?;
+            let mut exhausted = None;
+            for (path, identity) in desired {
+                if self.watched.contains_key(&path) {
+                    continue;
+                }
+                let permit = match Arc::clone(&self.budget).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        exhausted.get_or_insert(SyncError::WatchLimit(error));
+                        continue;
+                    }
+                };
+                let directory = match LocalFs(&self.root).read_dir(&path) {
+                    Ok(items) => items.into_directory(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let metadata = directory.metadata()?;
+                if (metadata.dev(), metadata.ino()) != identity {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "directory identity changed before watch registration; retry",
+                    )
+                    .into());
+                }
+                let watched = WatchedDirectory {
+                    directory,
+                    identity,
+                    _permit: permit,
+                };
+                let registered = watched.watch_path();
+                self.paths
+                    .lock()
+                    .unwrap()
+                    .insert(registered.clone(), path.clone());
+                match self.watcher.watch(&registered, RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        self.watched.insert(path, watched);
+                    }
+                    Err(error) => {
+                        self.paths.lock().unwrap().remove(&registered);
+                        if !matches!(error.kind, notify::ErrorKind::PathNotFound) {
+                            return Err(error.into());
+                        }
                     }
                 }
-                Err(err) => {
-                    tracing::warn!("local filesystem watch error: {err}");
-                    let _ = sender.send(Err(err.into()));
-                }
-            })?;
-
-        watcher.watch(root, RecursiveMode::Recursive)?;
-
-        Ok(Self { _watcher: watcher })
+            }
+            exhausted.map_or(Ok(()), Err)
+        })
     }
 }
 
@@ -85,12 +268,13 @@ pub(crate) fn path_key(path: &Path) -> Result<String, SyncError> {
     Ok(std::str::from_utf8(path.as_os_str().as_bytes())?.to_owned())
 }
 
-pub(crate) fn is_download_staging(path: &Path) -> bool {
+pub(crate) fn is_internal_path(path: &Path) -> bool {
     path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| name.starts_with(".gdrive-download-"))
+        component.as_os_str().to_str().is_some_and(|name| {
+            name.starts_with(".gdrive-download-")
+                || name.starts_with(crate::recovery::INITIALIZING_PREFIX)
+                || name == crate::recovery::DIRECTORY
+        })
     })
 }
 
@@ -108,6 +292,191 @@ fn classify(kind: &EventKind) -> Option<LocalChangeKind> {
 mod tests {
     use super::*;
     use notify::event::{AccessKind, DataChange, MetadataKind, ModifyKind};
+    use std::collections::HashSet;
+
+    #[test]
+    fn descriptor_budget_preserves_existing_pins_and_allows_polling_fallback() {
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        for index in 0..12 {
+            std::fs::create_dir_all(root.join(index.to_string())).unwrap();
+        }
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let budget = Arc::new(Semaphore::new(4));
+        let mut watcher = LocalWatcher::watch_with_budget(
+            &root,
+            Uuid::new_v4(),
+            state,
+            sender,
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        assert_eq!(watcher.watched.len(), 4);
+        assert_eq!(budget.available_permits(), 0);
+        let pins: HashMap<_, _> = watcher
+            .watched
+            .iter()
+            .map(|(path, watched)| (path.clone(), watched.watch_path()))
+            .collect();
+        assert!(matches!(watcher.refresh(), Err(SyncError::WatchLimit(_))));
+        for (path, registered) in pins {
+            assert_eq!(watcher.watched[&path].watch_path(), registered);
+        }
+        drop(watcher);
+        assert_eq!(budget.available_permits(), 4);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn queued_symlink_swaps_cannot_watch_another_tree_or_leave_history_watched() {
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        let other = fixture.join("other/deep");
+        std::fs::create_dir_all(root.join("live/deep")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir(root.join(crate::recovery::DIRECTORY)).unwrap();
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut watcher = LocalWatcher::watch(&root, Uuid::new_v4(), state, sender).unwrap();
+        let archived = root.join(crate::recovery::DIRECTORY).join("moved");
+        assert!(watcher
+            .refresh_with(|path| {
+                if path == root.join("live") {
+                    std::fs::rename(path, &archived)?;
+                    std::os::unix::fs::symlink(other.parent().unwrap(), path)?;
+                }
+                Ok(())
+            })
+            .is_err());
+        let watches = kernel_watch_inodes();
+        for path in [
+            &other,
+            other.parent().unwrap(),
+            &archived,
+            &archived.join("deep"),
+        ] {
+            assert!(!watches.contains(&std::fs::metadata(path).unwrap().ino()));
+        }
+        drop(watcher);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stalled_refresh_does_not_occupy_the_only_async_worker() {
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let mut watcher = LocalWatcher::watch(&root, Uuid::new_v4(), state, sender).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (resume, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let mut started = Some(started);
+            watcher.refresh_with(|_| {
+                if let Some(started) = started.take() {
+                    started.send(()).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            })
+        });
+        ready.await.unwrap();
+        assert!(!task.is_finished());
+        resume.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn recovery_entries_and_download_staging_never_enter_the_upload_queue() {
+        for key in [
+            ".gdrive-recovery/id/file",
+            "folder/.gdrive-recovery/id/child",
+            "folder/.gdrive-download-id",
+            "folder/.gdrive-recovery-init-id/owner",
+        ] {
+            assert!(is_internal_path(Path::new(key)));
+        }
+        assert!(!is_internal_path(Path::new("recovery/file")));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kernel_watch_inodes() -> HashSet<u64> {
+        let mut inodes = HashSet::new();
+        for entry in std::fs::read_dir("/proc/self/fdinfo").unwrap() {
+            let contents = match std::fs::read_to_string(entry.unwrap().path()) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("cannot inspect owned inotify watches: {error}"),
+            };
+            for line in contents.lines().filter(|line| line.starts_with("inotify ")) {
+                let inode = line
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("ino:"))
+                    .unwrap();
+                inodes.insert(u64::from_str_radix(inode, 16).unwrap());
+            }
+        }
+        inodes
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kernel_watches_exclude_history_and_refresh_replaced_live_directories() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = std::env::temp_dir().join(format!("gdrive-watches-{}", Uuid::new_v4()));
+        let root = fixture.join("local");
+        let live = root.join("live/deep");
+        std::fs::create_dir_all(&live).unwrap();
+        let saved = root.join("saved");
+        std::fs::write(&saved, b"history").unwrap();
+        crate::recovery::Recovery::new(&root, uuid::Uuid::nil())
+            .archive(&saved)
+            .unwrap()
+            .unwrap();
+        let recovery = root.join(crate::recovery::DIRECTORY);
+        let history = recovery.join("older/deep");
+        std::fs::create_dir_all(&history).unwrap();
+        let state = Arc::new(StateDb::open(&fixture.join("state.sqlite")).unwrap());
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut watcher = LocalWatcher::watch(&root, Uuid::new_v4(), state, sender).unwrap();
+        let watches = kernel_watch_inodes();
+        assert!(watches.contains(&std::fs::metadata(&root).unwrap().ino()));
+        for path in [&recovery, &history] {
+            assert!(!watches.contains(&std::fs::metadata(path).unwrap().ino()));
+        }
+        std::fs::rename(root.join("live"), recovery.join("moved")).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        watcher.refresh().unwrap();
+        let watches = kernel_watch_inodes();
+        assert!(watches.contains(&std::fs::metadata(&live).unwrap().ino()));
+        assert!(!watches.contains(&std::fs::metadata(recovery.join("moved")).unwrap().ino()));
+        assert!(!watches.contains(
+            &std::fs::metadata(recovery.join("moved/deep"))
+                .unwrap()
+                .ino()
+        ));
+        let new = root.join("new/deep");
+        std::fs::create_dir_all(&new).unwrap();
+        watcher.refresh().unwrap();
+        let file = new.join("file");
+        std::fs::write(&file, b"changed").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if receiver.recv().await.unwrap().unwrap().path == file {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("new nested live directories must still emit events");
+        drop(watcher);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
 
     #[test]
     fn non_utf8_paths_fail_explicitly_instead_of_aliasing_another_file() {

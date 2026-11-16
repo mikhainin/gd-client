@@ -16,8 +16,9 @@ local edits upload replacements and retain previous copies under distinct
 `.remote-history-<id-digest>` sibling names instead of trashing them.
 Retained versions sync locally and consume storage; there is no automatic cleanup.
 Detected concurrent remote edits are preserved in local conflict copies; new remote
-items and moves/renames are reconciled. Remote deletions remove unchanged local
-copies. Native Google Docs/Sheets/Slides appear
+items and moves/renames are reconciled. Displaced local versions and clean remote
+removals are retained in excluded `.gdrive-recovery` directories without automatic
+cleanup. Native Google Docs/Sheets/Slides appear
 as browser-link files, not offline document copies. Google document export, resumable
 uploads, and transactional multi-client arbitration remain unsupported; see
 [sync limitations](crates/gdrive-sync/README.md#current-limitations).
