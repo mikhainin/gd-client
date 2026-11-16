@@ -17,6 +17,12 @@ struct Mount {
     point: PathBuf,
 }
 
+struct Region {
+    logical: PathBuf,
+    backing: BackingRoot,
+    covered: Vec<PathBuf>,
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -110,48 +116,67 @@ fn from_mounts(
     let relative = path
         .strip_prefix(&mount.point)
         .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
-    let mut backing = vec![BackingRoot {
-        device: mount.device.clone(),
-        path: mount.root.join(relative),
+    let mut regions = vec![Region {
+        logical: path.to_path_buf(),
+        backing: BackingRoot {
+            device: mount.device.clone(),
+            path: mount.root.join(relative),
+        },
+        covered: Vec::new(),
     }];
     let mut nested_mounts: Vec<_> = mounts
         .iter()
         .filter(|mount| mount.point != path && mount.point.starts_with(path))
         .collect();
     nested_mounts.sort_by_key(|mount| mount.point.components().count());
-    let mut visible_parents = vec![mount];
     for nested in nested_mounts {
         match visible(&nested.point) {
             Ok(id) if id == nested.id => {
-                let parent = visible_parents
-                    .iter()
-                    .filter(|parent| nested.point.starts_with(&parent.point))
-                    .max_by_key(|parent| parent.point.components().count())
+                let parent = regions
+                    .iter_mut()
+                    .filter(|parent| nested.point.starts_with(&parent.logical))
+                    .max_by_key(|parent| parent.logical.components().count())
                     .unwrap();
-                let relative = nested.point.strip_prefix(&parent.point).unwrap();
-                if nested.device != parent.device || nested.root != parent.root.join(relative) {
-                    backing.push(BackingRoot {
+                let relative = nested.point.strip_prefix(&parent.logical).unwrap();
+                parent.covered.push(parent.backing.path.join(relative));
+                regions.push(Region {
+                    logical: nested.point.clone(),
+                    backing: BackingRoot {
                         device: nested.device.clone(),
                         path: nested.root.clone(),
-                    });
-                }
-                visible_parents.push(nested);
+                    },
+                    covered: Vec::new(),
+                });
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    for (index, first) in backing.iter().enumerate() {
-        if backing[index + 1..].iter().any(|second| {
-            first.device == second.device && super::overlap(&first.path, &second.path)
+    for (index, first) in regions.iter().enumerate() {
+        if regions[index + 1..].iter().any(|second| {
+            if first.backing.device != second.backing.device
+                || !super::overlap(&first.backing.path, &second.backing.path)
+            {
+                return false;
+            }
+            let intersection = if first.backing.path.starts_with(&second.backing.path) {
+                &first.backing.path
+            } else {
+                &second.backing.path
+            };
+            !first
+                .covered
+                .iter()
+                .chain(&second.covered)
+                .any(|covered| intersection.starts_with(covered))
         }) {
             return Err(invalid(
                 "local sync root contains overlapping mount aliases",
             ));
         }
     }
-    Ok(backing)
+    Ok(regions.into_iter().map(|region| region.backing).collect())
 }
 
 pub(super) fn footprints(path: &Path) -> io::Result<Vec<BackingRoot>> {
@@ -214,6 +239,36 @@ mod tests {
             })
         })
         .is_ok());
+    }
+
+    #[test]
+    fn a_covered_source_has_only_one_visible_alias_without_weakening_cross_root_checks() {
+        let mounts = parse(
+            b"1 0 8:1 / / rw - ext4 /dev/fixture rw\n\
+            2 1 8:1 /data/sub /data/alias rw - ext4 /dev/fixture rw\n\
+            3 1 8:2 / /data/sub rw - ext4 /dev/other rw\n\
+            4 1 8:1 /data/sub /outside rw - ext4 /dev/fixture rw\n",
+        )
+        .unwrap();
+        let visible = |candidate: &Path| {
+            Ok(match candidate.to_str().unwrap() {
+                "/data/alias" => 2,
+                "/data/sub" => 3,
+                "/outside" => 4,
+                _ => 1,
+            })
+        };
+        let root = ResolvedRoot {
+            path: "/data".into(),
+            backing: from_mounts(Path::new("/data"), &mounts, visible).unwrap(),
+        };
+        let other = ResolvedRoot {
+            path: "/outside".into(),
+            backing: from_mounts(Path::new("/outside"), &mounts, visible).unwrap(),
+        };
+        assert!(root.overlaps(&other));
+        let uncovered: Vec<_> = mounts.into_iter().filter(|mount| mount.id != 3).collect();
+        assert!(from_mounts(Path::new("/data"), &uncovered, visible).is_err());
     }
 
     #[test]
