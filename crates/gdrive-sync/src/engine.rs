@@ -327,6 +327,7 @@ fn coalesce_local_notifications(
 }
 
 async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
+    restore_local_intents(folder, state_db)?;
     queue_dirty_descendants(folder, state_db, &folder.local_path).await?;
     for existing in state_db.file_states(folder.id)? {
         if local_metadata(&folder.local_path.join(&existing.local_rel_path))
@@ -336,6 +337,20 @@ async fn scan_local_changes(folder: &SyncFolder, state_db: &StateDb) -> Result<(
             state_db.queue_local_change(folder.id, &existing.local_rel_path)?;
         }
     }
+    Ok(())
+}
+
+fn restore_local_intents(folder: &SyncFolder, state_db: &StateDb) -> Result<(), SyncError> {
+    crate::recovery::restore_interrupted(&folder.local_path, |path| {
+        let relative = path
+            .strip_prefix(&folder.local_path)
+            .map_err(|source| std::io::Error::new(std::io::ErrorKind::InvalidData, source))?;
+        let key = path_key(relative).map_err(std::io::Error::other)?;
+        state_db
+            .find_by_local_path(folder.id, &key)
+            .map(|entry| entry.is_some())
+            .map_err(std::io::Error::other)
+    })?;
     Ok(())
 }
 
@@ -500,7 +515,8 @@ async fn preserve_local_path(
     let path = Path::new(key);
     let conflict = conflict_path(key, "local", &Uuid::new_v4().to_string())?;
     let conflict_key = path_key(&conflict)?;
-    crate::recovery::rename_no_replace(
+    crate::recovery::move_with_intent(
+        &folder.local_path,
         &folder.local_path.join(path),
         &folder.local_path.join(&conflict),
     )?;
@@ -604,7 +620,7 @@ async fn atomic_download_with(
             }
         }
         before_publish(DownloadPhase::Checked)?;
-        let archived = crate::recovery::archive(path)?;
+        let archived = crate::recovery::archive_replacement(path)?;
         if expected.is_some() && archived.is_none() {
             tokio::fs::remove_file(&temporary).await?;
             return Ok(false);
@@ -612,6 +628,9 @@ async fn atomic_download_with(
         before_publish(DownloadPhase::Archived)?;
         crate::recovery::rename_no_replace(&temporary, path)?;
         std::fs::File::open(parent)?.sync_all()?;
+        if let Some(archived) = archived {
+            crate::recovery::complete_replacement(&archived)?;
+        }
         Ok::<bool, SyncError>(true)
     }
     .await;
@@ -775,17 +794,21 @@ async fn initial_pull(
                         continue;
                     }
                 } else {
-                    if local_file_changed(&local_path, &at_path).await?
+                    let archived = if local_file_changed(&local_path, &at_path).await?
                         || (at_path.is_folder
                             && queue_dirty_descendants(folder, state_db, &local_path).await?)
                     {
                         if tokio::fs::try_exists(&local_path).await? {
                             preserve_local_path(folder, state_db, &rel_path).await?;
                         }
+                        None
                     } else {
-                        crate::recovery::archive(&local_path)?;
-                    }
+                        crate::recovery::archive_removal(&local_path)?
+                    };
                     state_db.remove_file_state(folder.id, &rel_path)?;
+                    if let Some(archived) = archived {
+                        crate::recovery::complete_replacement(&archived)?;
+                    }
                 }
             }
         }
@@ -905,12 +928,13 @@ async fn relocate_remote_entry(
     if let Some(parent) = new.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    match crate::recovery::rename_no_replace(&old, &new) {
-        Ok(()) => {}
+    let intent = match crate::recovery::move_with_intent(&folder.local_path, &old, &new) {
+        Ok(intent) => intent,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(error) => return Err(error.into()),
-    }
+    };
     state_db.relocate_file_state(folder.id, &existing.local_rel_path, rel_path)?;
+    crate::recovery::complete_replacement(&intent)?;
     Ok(true)
 }
 
@@ -1443,6 +1467,7 @@ async fn poll_remote_changes(
     let Some(page_token) = state_db.get_page_token(folder.id)? else {
         return Ok(());
     };
+    restore_local_intents(folder, state_db)?;
 
     let (changes, new_token) = drive.list_changes(&page_token).await?;
     let mut classified = Vec::new();
@@ -1586,8 +1611,11 @@ async fn poll_remote_changes(
 
         if deleted {
             status.active();
-            crate::recovery::archive(&local_path)?;
+            let archived = crate::recovery::archive_removal(&local_path)?;
             state_db.remove_file_state(folder.id, &existing.local_rel_path)?;
+            if let Some(archived) = archived {
+                crate::recovery::complete_replacement(&archived)?;
+            }
             continue;
         }
 
@@ -2121,7 +2149,9 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&recovery)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|entry| entry.is_dir())
+            .filter(|entry| {
+                entry.is_dir() && entry.file_name() != Some(std::ffi::OsStr::new("pending"))
+            })
             .collect();
         assert_eq!(
             std::fs::read(entries[0].join("file.txt")).unwrap(),
@@ -2168,6 +2198,120 @@ mod tests {
         assert!(validate_remote_name(crate::recovery::DIRECTORY).is_err());
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupted_publication_restores_before_local_retry_can_trash_drive() {
+        for fail_during_publish in [false, true] {
+            let server = Server::start(vec![]);
+            let (root, folder, mut engine) = local_fixture(&server, b"old").await;
+            let path = folder.local_path.join("file.txt");
+            if fail_during_publish {
+                assert!(
+                    atomic_download_with(&path, b"remote", Some(b"old"), |phase| {
+                        if phase == DownloadPhase::Archived {
+                            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .is_err()
+                );
+            } else {
+                crate::recovery::archive_replacement(&path)
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(!path.exists());
+            engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+            let status = engine.status.start(folder.id, 1);
+            sync_local_changes(
+                &folder,
+                &engine.drive,
+                &engine.state_db,
+                "root",
+                (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                &engine.events,
+                &status,
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"old");
+            assert_eq!(server.requests.try_iter().count(), 0);
+            assert!(engine
+                .state_db
+                .pending_local_paths(folder.id)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                engine
+                    .state_db
+                    .find_by_local_path(folder.id, "file.txt")
+                    .unwrap()
+                    .unwrap()
+                    .drive_file_id
+                    .as_deref(),
+                Some("old-id")
+            );
+            drop(engine);
+            tokio::fs::remove_dir_all(root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_removals_and_moves_reconcile_against_committed_state() {
+        for moved in [false, true] {
+            for committed in [false, true] {
+                let server = Server::start(vec![]);
+                let (root, folder, mut engine) = local_fixture(&server, b"old").await;
+                let original = folder.local_path.join("file.txt");
+                let target = folder.local_path.join("renamed.txt");
+                if moved {
+                    crate::recovery::move_with_intent(&folder.local_path, &original, &target)
+                        .unwrap();
+                } else {
+                    crate::recovery::archive_removal(&original)
+                        .unwrap()
+                        .unwrap();
+                }
+                if committed {
+                    if moved {
+                        engine
+                            .state_db
+                            .relocate_file_state(folder.id, "file.txt", "renamed.txt")
+                            .unwrap();
+                    } else {
+                        engine
+                            .state_db
+                            .remove_file_state(folder.id, "file.txt")
+                            .unwrap();
+                    }
+                }
+                engine.state_db = Arc::new(StateDb::open(&root.join("state.sqlite")).unwrap());
+                let status = engine.status.start(folder.id, 1);
+                sync_local_changes(
+                    &folder,
+                    &engine.drive,
+                    &engine.state_db,
+                    "root",
+                    (nix::unistd::Uid::current(), nix::unistd::Gid::current()),
+                    &engine.events,
+                    &status,
+                )
+                .await
+                .unwrap();
+                assert_eq!(original.exists(), !committed);
+                assert_eq!(target.exists(), moved && committed);
+                assert_eq!(server.requests.try_iter().count(), 0);
+                assert!(engine
+                    .state_db
+                    .pending_local_paths(folder.id)
+                    .unwrap()
+                    .is_empty());
+                drop(engine);
+                tokio::fs::remove_dir_all(root).await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

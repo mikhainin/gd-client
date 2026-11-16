@@ -236,6 +236,14 @@ Renames retain the original inode, including subsequent writes through existing
 open handles; publication and remote moves use Linux `RENAME_NOREPLACE` and fail
 closed rather than overwriting a concurrently created destination. Detected dirty
 paths still use the visible conflict-copy workflow described above.
+Replacement/removal/move intent is synced before changing paths. Scans and remote
+polls reconcile it before processing missing tracked paths: restore an absent
+original without overwrite, or keep an already-published/new destination.
+Removals and relocations consult committed database mappings so completed
+operations are not undone or reuploaded after a crash. Restores verify recorded
+device/inode identity and fail explicitly if the expected source changed or
+disappeared. A daemon stop or failed publication is not inferred as user deletion
+of the live Drive item. Marker/journal reads reject non-regular files.
 Recovery directories are private, excluded from scans/uploads, and never cleaned
 automatically. Restore entries manually to an ordinary path after pausing sync.
 The name `.gdrive-recovery` is reserved at every depth: unmanaged existing paths
