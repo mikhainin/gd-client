@@ -93,7 +93,8 @@ pub trait GDrive1 {
     /// URL in the user's default browser and returns immediately (it does
     /// *not* wait for the flow to finish, since that can take an arbitrary
     /// amount of time). Successful completion emits
-    /// [`Self::authentication_changed`]. Once signed in, the currently enabled
+    /// [`Self::authentication_changed`]; asynchronous failure emits
+    /// [`Self::sign_in_failed`]. Once signed in, the currently enabled
     /// sync folders are started.
     fn sign_in(&self) -> zbus::Result<()>;
 
@@ -104,6 +105,10 @@ pub trait GDrive1 {
     /// Fetch [`Self::is_authenticated`] for initial state and after reconnecting.
     #[zbus(signal)]
     fn authentication_changed(&self, authenticated: bool) -> zbus::Result<()>;
+
+    /// A current asynchronous sign-in failed; the message contains no credentials.
+    #[zbus(signal)]
+    fn sign_in_failed(&self, message: &str) -> zbus::Result<()>;
 
     /// Lists the direct sub-folders of a Google Drive folder, for the
     /// "browse Drive folder" picker in the UI. Pass an empty string (or

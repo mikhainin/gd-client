@@ -9,6 +9,8 @@ Shared types and utilities used by `gdrived`, `gdrive-ui`, and `gdrive-sync`:
   `~/.config/gdrive-client/config.toml` and `~/.local/share/gdrive-client/`
   containing `sync-state.sqlite3` and `oauth-token.json`. Resolving a data
   path also creates the data directory.
+- `local_roots` — read-only root resolution and overlap diagnostics shared by
+  configuration validation and worker admission.
 - `error` — `CommonError` covers missing home directories, I/O, and TOML
   parsing/serialization, preserving underlying error sources.
 
@@ -24,17 +26,39 @@ Older configurations without a path remain loadable, and absent paths are
 omitted when saving. Stored paths do not track remote moves or renames.
 
 `AppConfig::load`/`save` use the standard config location; `load_from`/`save_to`
-accept explicit paths. Saving creates parent directories and non-atomically
-overwrites the file as pretty TOML; a failed write may leave it truncated or
-partially written. Loading a missing file returns `AppConfig::default()`;
+accept explicit paths. Saving writes pretty TOML to a private, same-directory
+temporary file, syncs it, atomically replaces the configuration, and syncs the
+parent directory. Failures before replacement leave the previous file intact;
+a directory-sync failure after replacement is reported, but the file is already
+the complete new configuration. Loading a missing file returns `AppConfig::default()`;
 malformed or unreadable files return errors rather than being reset.
 These helpers perform deserialization, not semantic validation of paths,
-ownership, folder overlap, or polling values.
+ownership, folder overlap, or polling values. `validate_local_roots` separately
+rejects equal/nested enabled roots, including symlink and bind-mount aliases,
+and duplicate enabled folder UUIDs even when their paths are disjoint.
+Linux mount information and descriptor mount IDs map each root and any nested
+mounts to their backing filesystem paths; unavailable or inconsistent mount
+information fails closed. Mount paths are decoded as raw filesystem bytes, so
+an unrelated non-UTF-8 mount name does not prevent validation. Descriptor mount
+inspection uses `O_PATH`, never a data-reading open that could block on a FIFO.
+Existing directory
+components are canonicalized before normalizing `..`; missing suffixes are
+allowed without creating anything. Dangling symlinks, non-directory components,
+and inaccessible paths fail explicitly with a preserved I/O source. Disabled
+bindings may overlap but must pass validation before they can be enabled.
+Case-insensitive aliases are not assumed distinct: existing directory components
+must be on the verified ext2/ext3/ext4, Btrfs, or tmpfs baseline, without the
+kernel casefold flag. FAT/exFAT, casefolded directories, and unverified
+filesystems are rejected explicitly, including canonical symlink-target
+ancestors and ancestors of missing suffixes.
+Directory-attribute inspection failures fail closed; older tmpfs kernels that
+lack both casefolding and the attribute ioctl are recognized separately.
+Runtime filesystem operations share these checks, including directories created
+or encountered below an admitted root. Validation never creates case-probe files.
 
 Omitted TOML `sync_folders` defaults to an empty list and omitted
-`poll_interval_secs` defaults to 60. Note that the derived
-`AppConfig::default()` instead sets the interval to **0**, including on first
-load when no file exists; the sync engine clamps polling to at least 5 seconds.
+`poll_interval_secs` defaults to 60, also for `AppConfig::default()` and a missing
+configuration file. The sync engine clamps explicit intervals to at least 5 seconds.
 Other than the optional Drive ID/path, folder fields must be present in TOML.
 
 ## D-Bus contract
@@ -45,7 +69,8 @@ Other than the optional Drive ID/path, folder fields must be present in TOML.
   service separately, so both sides must match
   [the shared signatures](src/dbus_api.rs); zbus does not check this across
   independent crates at compile time. The contract includes
-  `AuthenticationChanged(b)` after successful sign-in/out. Clients query
+  `AuthenticationChanged(b)` after successful sign-in/out and `SignInFailed(s)`
+  for asynchronous sign-in failure, with a credential-free retry message. Clients query
   `IsAuthenticated` for initial/reconnected cached-token state, not a live
   credential-validity check. The workspace uses zbus 6's asynchronous
   proxy/service APIs on Tokio. The shared trait does not configure call

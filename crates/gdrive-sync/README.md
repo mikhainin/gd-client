@@ -19,6 +19,44 @@ feature in packaged binaries.
   polls Drive's Changes API for remote changes, including newly created items.
   Transfers are sequential within each folder; enabled folders have separate
   workers. A missing Drive folder ID selects "My Drive" (`root`).
+  Enabled local roots must not overlap, including symlink/bind-mount aliases
+  and backing trees reachable through nested mounts. Enabled folder UUIDs must
+  also be unique, even for disjoint roots.
+  The supported filesystem baseline is non-casefolded ext2/ext3/ext4, Btrfs,
+  and tmpfs, including root ancestors; other filesystems fail explicitly rather
+  than guessing filename equivalence. Descendant symlinks and special files are
+  unsupported. Root-level aliases are resolved before worker admission.
+  Startup blocks every affected binding before filesystem or Drive mutations,
+  reports per-folder errors, and leaves unrelated bindings runnable. Root leases
+  also reject overlapping direct `start_folder` calls and remain held until
+  cancelled workers drop. Generations are registered before root resolution,
+  so a stop during inspection prevents subsequent admission or mutation.
+  Read-only worker resolution shares one inspection slot and a three-second
+  queueing/execution deadline. A timed-out or cancelled lookup retains that slot
+  until its blocking read exits, but cannot admit a root or mutate files.
+  Local mutations use non-detached blocking sections,
+  yielding a multithreaded runtime's worker thread without allowing cancellation
+  to release the root before the syscall finishes. Replacement workers wait in
+  bounded two-second attempts for retiring roots, reporting timeouts and retrying
+  at the polling interval. Removing/disabling a startup conflict rechecks only
+  root-blocked bindings, without restarting unrelated workers or failures.
+  A remaining enabled binding with a duplicate configured UUID retains its
+  root-blocked retry marker when another occurrence is disabled.
+  The daemon prepares root diagnostics off-lock and uses
+  `start_all_inspected`/`reconcile_roots_inspected` to apply them under its
+  configuration lock without filesystem inspection. Those callers must
+  revalidate the inspected snapshot before applying it. Direct `start_all`
+  and `reconcile_blocked_roots` inspect synchronously.
+  Workers use the resolved local root. Local reads, directory creation, staging,
+  publication, relocation, removal, and ownership changes walk pinned directory
+  descriptors with Linux `openat2` no-symlink/beneath resolution. Parent-path
+  replacement cannot redirect a subsequent syscall through a symlink.
+  File reads pin and validate regular-file identity before opening data;
+  ownership changes use the pinned inode. This requires Linux 5.6 or newer and
+  accessible `/proc/self/fd`; there is no unsafe path-based fallback.
+  Disable sync before moving a root, changing its ancestors, mount topology,
+  or directory casefold settings. Descriptor pinning is not a filesystem
+  transaction or coordination with external directory moves.
   Live parent metadata resolves subtree membership, including moves into/out of
   the sync root; directory moves relocate descendant mappings together.
   Failed polls retain their cursor for replay after reconnect or restart.
@@ -140,8 +178,13 @@ feature in packaged binaries.
   `OAuthConfig::from_env` in `src/auth.rs`. Runtime overrides must supply both
   values; otherwise the build-time pair is used. Interactive sign-in uses
   PKCE, the full Drive scope, and a loopback redirect at `127.0.0.1:8734`.
-  The daemon bounds the whole flow to ten minutes; direct callers of
-  `authorize`/`authenticate` must bound the redirect wait themselves.
+  The redirect listener is bound before opening the browser, has an eight-minute
+  consent deadline and five-second request/response I/O deadlines, validates
+  the generated state, and decodes exactly one authorization code. Incomplete
+  and oversized HTTP requests are rejected without ending consent. Failed,
+  idle and invalid-state connections do not cancel sign-in; only errors carrying
+  the matching state terminate it. The daemon additionally bounds
+  the whole flow to ten minutes.
   The authorization-code exchange has a 15-second connection timeout and
   30-second request/body timeout, separate from refresh deadlines below.
   Note: `oauth2`'s bundled `reqwest` HTTP client is disabled
@@ -181,7 +224,8 @@ feature in packaged binaries.
   failures do not log credentials or response bodies.
   Transport and deadline failures retain their source errors; OAuth connection,
   response, and body timeouts during refresh retain timeout classification
-  through D-Bus; this does not describe the interactive code-exchange error path.
+  through D-Bus. Interactive code exchange also retains timeout classifications
+  and underlying sources without including token-response bodies in its message.
   Drive JSON parsing happens only after the complete body is transferred:
   interrupted bodies retain a retryable transport classification, while invalid
   JSON/schema responses are non-transport errors (fatal during initialization).

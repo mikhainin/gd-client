@@ -4,6 +4,7 @@
 pub mod config;
 pub mod dbus_api;
 pub mod error;
+pub mod local_roots;
 pub mod paths;
 
 pub use config::{AppConfig, SyncFolder};

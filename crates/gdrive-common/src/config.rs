@@ -1,6 +1,8 @@
 //! Application configuration: the set of synchronised folders and
 //! global settings, persisted as TOML under the user's config directory.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -68,7 +70,7 @@ impl SyncFolder {
 
 /// Top-level application configuration, persisted at
 /// `$XDG_CONFIG_HOME/gdrive-client/config.toml` (see [`paths::config_file`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     /// All configured local<->Drive folder synchronisations.
     #[serde(default)]
@@ -83,7 +85,27 @@ fn default_poll_interval_secs() -> u64 {
     60
 }
 
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            sync_folders: Vec::new(),
+            poll_interval_secs: default_poll_interval_secs(),
+        }
+    }
+}
+
 impl AppConfig {
+    /// Validate enabled roots without creating directories or changing configuration.
+    pub fn validate_local_roots(&self) -> Result<(), CommonError> {
+        match crate::local_roots::errors(&self.sync_folders)
+            .into_iter()
+            .next()
+        {
+            Some((_, error)) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Loads the configuration from the default location, returning a
     /// default (empty) configuration if the file does not exist yet.
     pub fn load() -> Result<Self, CommonError> {
@@ -92,10 +114,13 @@ impl AppConfig {
     }
 
     pub fn load_from(path: &Path) -> Result<Self, CommonError> {
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = std::fs::read_to_string(path)?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error.into()),
+        };
         let config = toml::from_str(&text)?;
         Ok(config)
     }
@@ -108,13 +133,42 @@ impl AppConfig {
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), CommonError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(path, text)?;
-        Ok(())
+        atomic_save(path, |file| file.write_all(text.as_bytes()))
     }
+}
+
+fn atomic_save(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), CommonError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".gdrive-config-{}.tmp", Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = (|| {
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if result.is_err() {
+        if let Err(error) = std::fs::remove_file(&temporary) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, "could not remove incomplete configuration save");
+            }
+        }
+    }
+    Ok(result?)
 }
 
 #[cfg(test)]
@@ -138,6 +192,11 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let loaded = AppConfig::load_from(&path).unwrap();
         assert_eq!(cfg, loaded);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -168,5 +227,38 @@ mod tests {
         let loaded =
             AppConfig::load_from(Path::new("/nonexistent/gdrive-client/config.toml")).unwrap();
         assert_eq!(loaded, AppConfig::default());
+        assert_eq!(loaded, toml::from_str::<AppConfig>("").unwrap());
+    }
+
+    #[test]
+    fn failed_partial_write_preserves_previous_configuration_and_source() {
+        let dir = std::env::temp_dir().join(format!("gdrive-config-test-{}", Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        let original = AppConfig::default();
+        original.save_to(&path).unwrap();
+        let error = atomic_save(&path, |file| {
+            file.write_all(b"poll_interval_secs = ")?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })
+        .unwrap_err();
+        assert!(matches!(error, CommonError::Io(ref source)
+            if source.kind() == std::io::ErrorKind::StorageFull));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(AppConfig::load_from(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_publication_cleans_temporary_file_without_touching_destination() {
+        let dir = std::env::temp_dir().join(format!("gdrive-config-test-{}", Uuid::new_v4()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep").unwrap();
+        assert!(AppConfig::default().save_to(&path).is_err());
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert!(AppConfig::load_from(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
