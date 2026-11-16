@@ -199,17 +199,17 @@ feature in packaged binaries.
   directories only; registration refreshes exclude recovery/staging trees and
   remove watches when directories move into history. Device/inode changes also
   replace stale registrations when a new live directory reuses the same path.
-  New live directories are
-  picked up between engine iterations, with periodic scans covering missed
-  notifications. Read/access and metadata-only events, including
+  New live directories are picked up between engine iterations, with periodic
+  scans covering missed notifications. Read/access and metadata-only events, including
   ownership changes made by the daemon, are ignored; content changes remain
   queued and reconciled. The watcher callback persists paths independently of
   the transfer loop, before sending a wake-up notification. Queue revisions
   prevent finishing an older attempt from deleting newer events for that path.
   Paths retain literal filename characters, including Linux backslashes.
   The text-backed path store accepts UTF-8 names; unsupported byte sequences
-  are explicit watcher errors, never lossy aliases to another file. Watcher
-  errors and persistence failures remain visible until stop/restart.
+  are explicit watcher errors, never lossy aliases to another file. Callback
+  errors and persistence failures remain visible until stop/restart; registration
+  errors clear only after a successful registration refresh.
   Downloads are staged and atomically renamed; `.gdrive-download-` filename
   prefixes are reserved internal staging paths and excluded from watching/scans.
   Filtering is relative to the sync root. Staging preserves destination permission

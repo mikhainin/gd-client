@@ -272,7 +272,7 @@ async fn run_folder(
     loop {
         let registration = watcher.refresh();
         status.finish(
-            "local watcher",
+            "local watch registrations",
             registration
                 .as_ref()
                 .map(|_| ())
@@ -2624,7 +2624,10 @@ mod tests {
 
     #[tokio::test]
     async fn coalescing_notifications_retains_watcher_errors() {
-        let server = Server::start(vec![]);
+        let server = Server::start(vec![
+            Reply::json(r#"{"startPageToken":"start"}"#),
+            Reply::json(r#"{"files":[]}"#),
+        ]);
         let (root, folder, engine) = local_fixture(&server, b"old").await;
         let status = engine.status.start(folder.id, 1);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2650,6 +2653,41 @@ mod tests {
             .errors
             .iter()
             .any(|message| message.contains("watcher persistence failed")));
+        status.finish(
+            "local watch registrations",
+            Err("registration failed".into()),
+        );
+        let mut events = engine.subscribe();
+        let worker = tokio::spawn({
+            let folder = folder.clone();
+            let state_db = Arc::clone(&engine.state_db);
+            let drive = Arc::clone(&engine.drive);
+            let events = engine.events.clone();
+            async move {
+                run_folder(
+                    folder,
+                    state_db,
+                    drive,
+                    events,
+                    Duration::from_secs(60),
+                    &status,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                events.recv().await.unwrap(),
+                SyncEvent::InitialSyncComplete { .. }
+            ) {}
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        let errors = &engine.sync_status().folders[0].errors;
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("watcher persistence failed"));
         drop(engine);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
